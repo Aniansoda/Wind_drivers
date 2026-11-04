@@ -107,10 +107,10 @@ jobs:
               /tmp/gki-prebuilt
             cp /tmp/gki-prebuilt/Module.symvers ./Module.symvers
           else
-            # 主线/无预构建: 只编译 vmlinux.o 并 modpost 生成符号表。
-            # 不用 make vmlinux —— 完整 vmlinux 的 SORTTAB 步骤在 CI 上会失败,
-            # 且符号表在 modpost(vmlinux.symvers) 阶段已生成。
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux.symvers
+            # 主线/无预构建: make modpost 只生成符号表 (vmlinux.o + modpost),
+            # 跳过 vmlinux 链接/BTF/kallsyms/SORTTAB (这些会拖时间且 SORTTAB 会失败)。
+            # modpost 输出 vmlinux.symvers, 复制成 Module.symvers 供外部模块编译。
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
             cp vmlinux.symvers Module.symvers
           fi
           test -s Module.symvers
