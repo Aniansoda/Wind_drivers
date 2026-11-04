@@ -1,0 +1,106 @@
+name: build-khack-ko
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Android GKI 分支 (gki_defconfig) ----
+          - name: android11-5.4
+            repo: aosp-mirror/kernel_common
+            ref: android11-5.4
+            config: gki_defconfig
+          - name: android12-5.10
+            repo: aosp-mirror/kernel_common
+            ref: android12-5.10
+            config: gki_defconfig
+          - name: android13-5.15
+            repo: aosp-mirror/kernel_common
+            ref: android13-5.15
+            config: gki_defconfig
+          - name: android14-6.1
+            repo: aosp-mirror/kernel_common
+            ref: android14-6.1
+            config: gki_defconfig
+          - name: android15-6.6
+            repo: aosp-mirror/kernel_common
+            ref: android15-6.6
+            config: gki_defconfig
+          # ---- 主线内核 (arm64 defconfig) ----
+          - name: mainline-6.12
+            repo: torvalds/linux
+            ref: v6.12
+            config: defconfig
+          - name: mainline-6.18
+            repo: torvalds/linux
+            ref: v6.18
+            config: defconfig
+
+    steps:
+      - name: Checkout driver source
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            bc flex bison \
+            libssl-dev libelf-dev \
+            dwarves kmod
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth 1 --branch "${{ matrix.ref }}" \
+            "https://github.com/${{ matrix.repo }}.git" kernel-src
+
+      - name: Configure kernel
+        run: |
+          cd kernel-src
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ${{ matrix.config }}
+
+      - name: Enable required configs
+        run: |
+          cd kernel-src
+          # 必要 config 兜底 (GKI/主线 defconfig 默认已开, 这里显式确保)
+          ./scripts/config \
+            --enable CONFIG_KPROBES \
+            --enable CONFIG_KRETPROBES \
+            --enable CONFIG_PERF_EVENTS \
+            --enable CONFIG_HW_BREAKPOINT \
+            --enable CONFIG_MISC_DEVICES || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      - name: Prepare kernel modules
+        run: |
+          cd kernel-src
+          # 编译 vmlinux + Module.symvers (GKI 含 BTF, 耗时最长, 约 20~40 分钟)
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
+
+      - name: Build khack module
+        run: |
+          mkdir -p kernel-src/drivers/khack
+          cp -r kernel/* kernel-src/drivers/khack/
+          cd kernel-src
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" M=drivers/khack modules
+
+      - name: Show module info
+        run: |
+          file kernel-src/drivers/khack/khack.ko
+          modinfo kernel-src/drivers/khack/khack.ko || true
+          ls -lh kernel-src/drivers/khack/khack.ko
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: khack-${{ matrix.name }}
+          path: kernel-src/drivers/khack/khack.ko
+          if-no-files-found: error
