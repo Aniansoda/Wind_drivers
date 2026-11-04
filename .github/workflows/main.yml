@@ -18,24 +18,28 @@ jobs:
             config: defconfig
             prebuild: ""
             cc: ""
+            llvmver: ""
           - name: mainline-6.6
             repo: gregkh/linux
             ref: v6.6.57
             config: defconfig
             prebuild: ""
             cc: ""
+            llvmver: ""
           - name: android16-6.12
             repo: aosp-mirror/kernel_common
             ref: android16-6.12
             config: gki_defconfig
             prebuild: "6.12"
             cc: "LLVM=-19"
+            llvmver: "19"
           - name: android17-6.18
             repo: aosp-mirror/kernel_common
             ref: android17-6.18
             config: gki_defconfig
             prebuild: ""
-            cc: "LLVM=-19"
+            cc: "LLVM=-21"
+            llvmver: "21"
 
     steps:
       - name: Checkout driver source
@@ -51,11 +55,13 @@ jobs:
             libssl-dev libelf-dev \
             dwarves kmod \
             wget gnupg
-          # GKI 内核强制 CONFIG_CC_IS_CLANG, 不能用 gcc 交叉编译,
-          # 装 LLVM 19 (clang-19 + lld-19 + llvm-19) 对齐 Android 16/17 工具链。
+          # GKI 内核强制 CONFIG_CC_IS_CLANG, 不能用 gcc 交叉编译。
+          # 按版本装 LLVM: 6.12 -> clang-19, 6.18 -> clang-21 (对齐 Android 工具链)。
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19 all
+          if [ -n "${{ matrix.llvmver }}" ]; then
+            sudo /tmp/llvm.sh "${{ matrix.llvmver }}" all
+          fi
 
       - name: Clone kernel source
         run: |
@@ -81,13 +87,22 @@ jobs:
             --disable CONFIG_CFI_CLANG \
             --disable CONFIG_AUTOFDO_CLANG \
             --disable CONFIG_DEBUG_INFO_BTF \
+            --disable CONFIG_HEADERS_INSTALL \
             || true
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
       - name: Prepare kernel modules
         run: |
           cd kernel-src
-          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
+          echo "== CC =="
+          if [ -n "${{ matrix.llvmver }}" ]; then
+            clang-${{ matrix.llvmver }} --version | head -1
+          else
+            aarch64-linux-gnu-gcc --version | head -1
+          fi
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" -O modules_prepare \
+            > /tmp/prepare.log 2>&1 \
+            || { echo "=== prepare FAILED, tail 120 lines ==="; tail -120 /tmp/prepare.log; exit 1; }
 
       - name: Get Module.symvers
         run: |
