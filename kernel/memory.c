@@ -100,7 +100,7 @@ static bool write_physical_direct(phys_addr_t pa, const void __user *buffer, siz
 	 * 写回主存并失效对应 cache 行, 保证 GPU/ION/非 cache 映射观察者可见,
 	 * 修复 mm cache 别名导致的图形缓冲不一致 (黑屏)。
 	 */
-	__flush_dcache_area(dst, size);
+	kh_flush_dcache(dst, size);
 	return true;
 }
 
@@ -109,7 +109,7 @@ static bool write_physical_direct(phys_addr_t pa, const void __user *buffer, siz
  * =================================================================== */
 static bool read_physical_nocache(phys_addr_t pa, void __user *buffer, size_t size)
 {
-	void *mapped = ioremap_nocache(pa, size);
+	void *mapped = kh_ioremap_nocache(pa, size);
 	if (!mapped)
 		return false;
 	if (copy_to_user(buffer, mapped, size)) {
@@ -122,14 +122,14 @@ static bool read_physical_nocache(phys_addr_t pa, void __user *buffer, size_t si
 
 static bool write_physical_nocache(phys_addr_t pa, const void __user *buffer, size_t size)
 {
-	void *mapped = ioremap_nocache(pa, size);
+	void *mapped = kh_ioremap_nocache(pa, size);
 	if (!mapped)
 		return false;
 	if (copy_from_user(mapped, buffer, size)) {
 		iounmap(mapped);
 		return false;
 	}
-	__flush_dcache_area(mapped, size);
+	kh_flush_dcache(mapped, size);
 	iounmap(mapped);
 	return true;
 }

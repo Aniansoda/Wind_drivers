@@ -25,6 +25,7 @@
 #include <linux/sched.h>
 #include <asm/ioctl.h>
 #include <asm/ptrace.h>
+#include "kgsl.h"
 
 #define MAX_HIDDEN_PIDS 64
 
