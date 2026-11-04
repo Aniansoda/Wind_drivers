@@ -75,7 +75,13 @@ jobs:
             --enable CONFIG_KRETPROBES \
             --enable CONFIG_PERF_EVENTS \
             --enable CONFIG_HW_BREAKPOINT \
-            --enable CONFIG_MISC_DEVICES || true
+            --enable CONFIG_MISC_DEVICES \
+            --disable CONFIG_LTO_CLANG \
+            --disable CONFIG_LTO_CLANG_THIN \
+            --disable CONFIG_CFI_CLANG \
+            --disable CONFIG_AUTOFDO_CLANG \
+            --disable CONFIG_DEBUG_INFO_BTF \
+            || true
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
       - name: Prepare kernel modules
