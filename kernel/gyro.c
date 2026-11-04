@@ -9,8 +9,8 @@
  *   5. 断点命中时拦截 sensors_event_t 数组, 篡改陀螺仪角速度
  *
  * 断点回调运行在目标进程上下文 (perf overflow handler, 中断上下文),
- * 不能睡眠, 因此数据篡改走 translate_linear_address 页表翻译 +
- * phys_to_virt 直读直写 (非睡眠路径), 复用 memory.c 的翻译函数。
+ * current = 目标进程, 不能睡眠。用户态地址 events 直接用 copy_*_user_nofault
+ * 读写 (nofault 缺页安全, 中断上下文可用), 不依赖 phys_to_virt。
  *
  * 未验证项 (版本相关, 需按目标 Android 版本核对):
  *   1. sensors_event_t 布局: type@0x08, data@0x18 (gyro x/y/z = data[0..2])。
@@ -61,60 +61,21 @@ static bool gyro_enabled;
 static u32 gyro_rx, gyro_ry, gyro_rz; /* 目标角速度, float 位模式 (rad/s) */
 
 /* ===================================================================
- * 非睡眠内存读写: 页表翻译 + phys_to_virt 直读直写。
- * 逐页分段, 支持跨页读写。中断上下文安全 (不睡眠)。
+ * 非睡眠内存读写: 断点回调运行在目标进程上下文 (current = 目标进程),
+ * 用户态地址 events 直接 copy_*_user_nofault, 无需页表遍历, 也不依赖
+ * phys_to_virt (GKI 拿不到 memstart_addr)。nofault 版本在缺页时返回
+ * 错误而非崩溃 (中断上下文安全)。
  * =================================================================== */
 static bool gyro_read_mem(struct mm_struct *mm, uintptr_t va, void *buf, size_t size)
 {
-	uint8_t *dst = buf;
-
-	while (size > 0)
-	{
-		phys_addr_t pa = translate_linear_address(mm, va);
-		void *kva;
-		size_t chunk;
-
-		if (!pa)
-			return false;
-		chunk = PAGE_SIZE - (va & (PAGE_SIZE - 1));
-		if (chunk > size)
-			chunk = size;
-		kva = wind_phys_to_virt(pa);
-		if (!kva)
-			return false;
-		memcpy(dst, kva, chunk);
-		dst += chunk;
-		va += chunk;
-		size -= chunk;
-	}
-	return true;
+	(void)mm;
+	return copy_from_user_nofault(buf, (void __user *)va, size) == 0;
 }
 
 static bool gyro_write_mem(struct mm_struct *mm, uintptr_t va, const void *buf, size_t size)
 {
-	const uint8_t *src = buf;
-
-	while (size > 0)
-	{
-		phys_addr_t pa = translate_linear_address(mm, va);
-		void *kva;
-		size_t chunk;
-
-		if (!pa)
-			return false;
-		chunk = PAGE_SIZE - (va & (PAGE_SIZE - 1));
-		if (chunk > size)
-			chunk = size;
-		kva = wind_phys_to_virt(pa);
-		if (!kva)
-			return false;
-		memcpy(kva, src, chunk);
-		kh_flush_dcache(kva, chunk);
-		src += chunk;
-		va += chunk;
-		size -= chunk;
-	}
-	return true;
+	(void)mm;
+	return copy_to_user_nofault((void __user *)va, buf, size) == 0;
 }
 
 /* ===================================================================

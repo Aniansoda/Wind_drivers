@@ -1,12 +1,8 @@
 #include "sym.h"
 #include <linux/module.h>
-#include <linux/kallsyms.h>
+#include <linux/kprobes.h>
 #include <linux/uaccess.h>
-#include <linux/memblock.h>
-#include <asm/memory.h>
-
-u64 wind_memstart_addr = 0;
-u64 wind_mem_end_addr = 0;
+#include <linux/string.h>
 
 /* contpte_ptep_get: arm64 6.12 contpte 机制的 PTE 读取 (ptep_get 展开引用) */
 typedef pte_t (*contpte_ptep_get_fn)(pte_t *);
@@ -22,32 +18,25 @@ static set_memory_fn g_set_memory_rw = NULL;
 static set_memory_fn g_set_memory_ro = NULL;
 
 /*
- * 重写 phys_to_virt: arm64 linear map 下
- *   virt = phys - memstart_addr + PAGE_OFFSET
- * PAGE_OFFSET 是编译期宏 (asm/memory.h), memstart_addr 运行时解析。
- * 解析失败返回 NULL, 调用方走 ioremap 安全路径。
+ * 用 register_kprobe 按符号名解析函数地址。
+ * kallsyms_lookup_name 的 export 被 GKI 移除, 不能直接调用;
+ * register_kprobe 是白名单符号, 内部走内核 kallsyms 解析符号名。
+ * 只适用于函数符号 (代码段), 数据符号 (如 memstart_addr) 拿不到。
  */
-void *wind_phys_to_virt(phys_addr_t pa)
+static unsigned long wind_kprobe_resolve(const char *name)
 {
-	if (unlikely(!wind_memstart_addr))
-		return NULL;
-	return (void *)((unsigned long)pa - wind_memstart_addr + PAGE_OFFSET);
-}
+	struct kprobe kp;
+	unsigned long addr;
+	int ret;
 
-/*
- * 重写 pfn_valid: 判断物理页帧是否落在 DRAM 范围。
- * 解析失败时保守返回 false, 调用方走 ioremap 安全路径 (慢但正确)。
- */
-bool wind_pfn_valid(unsigned long pfn)
-{
-	phys_addr_t pa;
-
-	if (!wind_mem_end_addr)
-		return false;
-	pa = (phys_addr_t)pfn << PAGE_SHIFT;
-	if (pa < wind_memstart_addr)
-		return false;
-	return pa < wind_mem_end_addr;
+	memset(&kp, 0, sizeof(kp));
+	kp.symbol_name = name;
+	ret = register_kprobe(&kp);
+	if (ret < 0)
+		return 0;
+	addr = (unsigned long)kp.addr;
+	unregister_kprobe(&kp);
+	return addr;
 }
 
 /*
@@ -66,12 +55,14 @@ pte_t wind_ptep_get(pte_t *ptep)
  */
 unsigned long wind_clear_user(void __user *to, unsigned long n)
 {
+	unsigned long i;
+	char __user *p;
+
 	if (g_arch_clear_user)
 		return g_arch_clear_user(to, n);
 
 	/* fallback: 内核态逐字节写 0, 等价 clear_user 语义 */
-	unsigned long i;
-	char __user *p = (char __user *)to;
+	p = (char __user *)to;
 	for (i = 0; i < n; i++) {
 		if (put_user(0, p + i))
 			return n - i;
@@ -95,29 +86,12 @@ int wind_set_memory_ro(unsigned long addr, int numpages)
 
 int wind_sym_init(void)
 {
-	u64 *p_memstart;
+	g_contpte_ptep_get = (contpte_ptep_get_fn)wind_kprobe_resolve("contpte_ptep_get");
+	g_arch_clear_user = (arch_clear_user_fn)wind_kprobe_resolve("__arch_clear_user");
+	g_set_memory_rw = (set_memory_fn)wind_kprobe_resolve("set_memory_rw");
+	g_set_memory_ro = (set_memory_fn)wind_kprobe_resolve("set_memory_ro");
 
-	/* memstart_addr: arm64 物理内存起始 */
-	p_memstart = (u64 *)kallsyms_lookup_name("memstart_addr");
-	if (p_memstart)
-		wind_memstart_addr = *p_memstart;
-
-	/* 物理内存结束: 用 totalram_pages (EXPORT_SYMBOL) 估算, 保守安全 */
-	if (wind_memstart_addr)
-		wind_mem_end_addr = wind_memstart_addr + (u64)totalram_pages * PAGE_SIZE;
-
-	/* contpte_ptep_get */
-	g_contpte_ptep_get = (contpte_ptep_get_fn)kallsyms_lookup_name("contpte_ptep_get");
-
-	/* __arch_clear_user */
-	g_arch_clear_user = (arch_clear_user_fn)kallsyms_lookup_name("__arch_clear_user");
-
-	/* set_memory_rw / set_memory_ro */
-	g_set_memory_rw = (set_memory_fn)kallsyms_lookup_name("set_memory_rw");
-	g_set_memory_ro = (set_memory_fn)kallsyms_lookup_name("set_memory_ro");
-
-	pr_info("wind: sym memstart=0x%llx memend=0x%llx contpte=%px clear_user=%px set_mem=%px/%px\n",
-		wind_memstart_addr, wind_mem_end_addr,
+	pr_info("wind: sym contpte=%px clear_user=%px set_mem=%px/%px\n",
 		(void *)g_contpte_ptep_get, (void *)g_arch_clear_user,
 		(void *)g_set_memory_rw, (void *)g_set_memory_ro);
 
@@ -126,8 +100,6 @@ int wind_sym_init(void)
 
 void wind_sym_exit(void)
 {
-	wind_memstart_addr = 0;
-	wind_mem_end_addr = 0;
 	g_contpte_ptep_get = NULL;
 	g_arch_clear_user = NULL;
 	g_set_memory_rw = NULL;

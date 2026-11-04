@@ -26,7 +26,8 @@
  * 这里手动实现各级偏移, 不用 p4d_offset/pud_offset/pmd_offset/
  * pte_offset_kernel 内核宏 —— 它们的 *_page_vaddr 展开会引用 __va,
  * 进而引用 arm64_use_ng_mappings / physvirt_offset 等非白名单符号,
- * GKI 下报 modpost undefined。改用 wind_phys_to_virt (sym.c 重写)。
+ * GKI 下报 modpost undefined。页表项物理地址用 ioremap_cache 映射
+ * (cacheable, 等价 __va, 不依赖 memstart_addr)。
  * =================================================================== */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
@@ -34,84 +35,92 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
-
 	phys_addr_t pa;
+	void __iomem *map;
 
 	pgd = pgd_offset(mm, va);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return 0;
 
-	/* p4d 折叠: p4d_t 即 pgd_t, p4d_offset 是 no-op */
+	/* 页表项物理地址 -> ioremap_cache (cacheable, 等价 __va, 不依赖 memstart_addr) */
 	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
-	pud = (pud_t *)wind_phys_to_virt(pa);
-	if (!pud)
+	map = ioremap_cache(pa, PAGE_SIZE);
+	if (!map)
 		return 0;
-	pud += pud_index(va);
-	if (pud_none(*pud) || pud_bad(*pud))
+	pud = (pud_t *)map + pud_index(va);
+	if (pud_none(*pud) || pud_bad(*pud)) {
+		iounmap(map);
 		return 0;
+	}
 
 	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
-	pmd = (pmd_t *)wind_phys_to_virt(pa);
-	if (!pmd)
+	iounmap(map);
+	map = ioremap_cache(pa, PAGE_SIZE);
+	if (!map)
 		return 0;
-	pmd += pmd_index(va);
-	if (pmd_none(*pmd))
+	pmd = (pmd_t *)map + pmd_index(va);
+	if (pmd_none(*pmd)) {
+		iounmap(map);
 		return 0;
+	}
 
 	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
-	pte = (pte_t *)wind_phys_to_virt(pa);
-	if (!pte)
+	iounmap(map);
+	map = ioremap_cache(pa, PAGE_SIZE);
+	if (!map)
 		return 0;
-	pte += pte_index(va);
+	pte = (pte_t *)map + pte_index(va);
 
-	if (pte_none(wind_ptep_get(pte)))
+	if (pte_none(wind_ptep_get(pte))) {
+		iounmap(map);
 		return 0;
-	if (!pte_present(wind_ptep_get(pte)))
+	}
+	if (!pte_present(wind_ptep_get(pte))) {
+		iounmap(map);
 		return 0;
+	}
 
-	return (phys_addr_t)(pte_pfn(wind_ptep_get(pte)) << PAGE_SHIFT) +
-	       (va & (PAGE_SIZE - 1));
+	pa = (phys_addr_t)(pte_pfn(wind_ptep_get(pte)) << PAGE_SHIFT) +
+	     (va & (PAGE_SIZE - 1));
+	iounmap(map);
+	return pa;
 }
 
 /* ===================================================================
- * 物理地址校验: 判断是否落在 kernel 线性映射区 (可 phys_to_virt 直接访问)。
- * arm64 用 pfn_valid 判断物理页是否有效。valid_phys_addr_range 是 x86 专用
- * API (arm64 无此导出符号), 不引入。普通 RAM 走 phys_to_virt 直读, 与进程
- * 页表同为 WB cache, PIPT 物理索引, 天然 coherent, 无 ioremap 别名。
- * =================================================================== */
-static inline bool is_direct_map(phys_addr_t pa, size_t size)
-{
-	(void)size;
-	return wind_pfn_valid((unsigned long)(pa >> PAGE_SHIFT));
-}
-
-/* ===================================================================
- * 快速路径: phys_to_virt + memcpy (cache coherent, 高性能低发热)
+ * 快速路径: ioremap_cache + copy (cacheable, 等价 phys_to_virt 直读)。
+ * GKI 拿不到 memstart_addr, 无法重写 phys_to_virt, 改用 ioremap_cache。
+ * 进程上下文 (ioctl) 可睡眠, ioremap 合法。
  * =================================================================== */
 static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t size)
 {
-	void *src = wind_phys_to_virt(pa);
+	void *src = ioremap_cache(pa, size);
 
 	if (!src)
 		return false;
-	if (copy_to_user(buffer, src, size))
+	if (copy_to_user(buffer, src, size)) {
+		iounmap(src);
 		return false;
+	}
+	iounmap(src);
 	return true;
 }
 
 static bool write_physical_direct(phys_addr_t pa, const void __user *buffer, size_t size)
 {
-	void *dst = wind_phys_to_virt(pa);
+	void *dst = ioremap_cache(pa, size);
 
 	if (!dst)
 		return false;
-	if (copy_from_user(dst, buffer, size))
+	if (copy_from_user(dst, buffer, size)) {
+		iounmap(dst);
 		return false;
+	}
 	/*
 	 * 写回主存并失效对应 cache 行, 保证 GPU/ION/非 cache 映射观察者可见,
 	 * 修复 mm cache 别名导致的图形缓冲不一致 (黑屏)。
 	 */
 	kh_flush_dcache(dst, size);
+	iounmap(dst);
 	return true;
 }
 
@@ -150,20 +159,14 @@ bool read_physical_address(phys_addr_t pa, void __user *buffer, size_t size, int
 {
 	if (mode == MODE_SAFE)
 		return read_physical_nocache(pa, buffer, size);
-
-	if (is_direct_map(pa, size))
-		return read_physical_direct(pa, buffer, size);
-	return read_physical_nocache(pa, buffer, size);
+	return read_physical_direct(pa, buffer, size);
 }
 
 bool write_physical_address(phys_addr_t pa, const void __user *buffer, size_t size, int mode)
 {
 	if (mode == MODE_SAFE)
 		return write_physical_nocache(pa, buffer, size);
-
-	if (is_direct_map(pa, size))
-		return write_physical_direct(pa, buffer, size);
-	return write_physical_nocache(pa, buffer, size);
+	return write_physical_direct(pa, buffer, size);
 }
 
 /* ===================================================================

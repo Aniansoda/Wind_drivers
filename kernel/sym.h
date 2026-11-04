@@ -4,11 +4,15 @@
 /*
  * sym.h — GKI 非白名单符号运行时解析层
  *
- * GKI 冻结 KMI, vendor 模块只能引用白名单符号。驱动用到的 arch 内部符号
- * (phys_to_virt / pfn_valid / ptep_get / clear_user 展开引用的 memstart_addr /
- * mem_section / contpte_ptep_get / __arch_clear_user 等) 不在白名单, 编译期
- * 直接引用会报 modpost undefined。这里用 kallsyms_lookup_name 运行时解析,
- * 并重写对应的内联逻辑, 绕开编译期 CRC 检查。
+ * GKI 冻结 KMI, vendor 模块只能引用白名单符号。驱动用到的 arch 内部函数
+ * (contpte_ptep_get / __arch_clear_user / set_memory_rw / set_memory_ro)
+ * 不在白名单, 且 kallsyms_lookup_name 的 export 被 GKI 移除, 不能用它
+ * 解析。这里改用 register_kprobe (EXPORT_SYMBOL_GPL, 白名单内) 按符号名
+ * 取函数地址, 绕开编译期 CRC 检查。
+ *
+ * phys_to_virt / pfn_valid 依赖的 memstart_addr 是数据符号, kprobe 拿不到,
+ * 故不再重写, 改用 ioremap_cache (memory.c 进程上下文) 与 copy_from_user
+ * (gyro.c 目标进程上下文) 替代, 彻底不依赖 memstart_addr。
  */
 
 #include <linux/types.h>
@@ -16,13 +20,7 @@
 #include <asm/page.h>
 #include <asm/pgtable.h>
 
-/* 运行时解析出的物理内存布局 (由 wind_sym_init 填充) */
-extern u64 wind_memstart_addr;
-extern u64 wind_mem_end_addr;
-
 /* 重写的 arch 内联逻辑 */
-void *wind_phys_to_virt(phys_addr_t pa);
-bool wind_pfn_valid(unsigned long pfn);
 pte_t wind_ptep_get(pte_t *ptep);
 unsigned long wind_clear_user(void __user *to, unsigned long n);
 
