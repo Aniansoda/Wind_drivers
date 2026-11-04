@@ -8,7 +8,7 @@
  * 目标: 减少 ioctl 调用次数, 支持批量读写与会话缓存, 双模式读取
  */
 
-#define DEVICE_NAME "TomieNian"
+#define DEVICE_NAME "TomieNian-阿念"
 
 /* ---- 操作码 ---- */
 enum OPERATIONS
@@ -28,6 +28,10 @@ enum OPERATIONS
 	OP_BRK_CLEAR    = 0x80C, /* 清除硬件断点 */
 	OP_KGSL_HIDE    = 0x80D, /* kgsl 隐藏 pid */
 	OP_KGSL_HOOK    = 0x80E, /* 安装 kgsl hook */
+	OP_GYRO_INSTALL = 0x80F, /* 安装陀螺仪 hook (pid, 对齐 hookmod 控制方式) */
+	OP_GYRO_REMOVE  = 0x810, /* 卸载陀螺仪 hook */
+	OP_GYRO_SET     = 0x811, /* 设置目标角速度 (rad/s) */
+	OP_GYRO_ENABLE  = 0x812, /* 开关陀螺仪篡改 */
 };
 
 /* ---- 读取模式 ---- */
@@ -90,6 +94,12 @@ typedef struct _BRK_REQUEST
 	uintptr_t addr;
 	uint32_t type;  /* HW_BREAKPOINT_X / _R / _W / _RW */
 } BRK_REQUEST, *PBRK_REQUEST;
+
+/* ---- 陀螺仪 ---- */
+typedef struct _GYRO_REQUEST
+{
+	float rx, ry, rz;  /* 目标三轴角速度 (rad/s) */
+} GYRO_REQUEST, *PGYRO_REQUEST;
 
 /*
  * ---- mmap 映射约定 ----

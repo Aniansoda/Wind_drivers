@@ -10,6 +10,7 @@
 #include "process.h"
 #include "breakpoint.h"
 #include "kgsl.h"
+#include "gyro.h"
 
 static struct driver_session *file_session(struct file *file)
 {
@@ -186,6 +187,22 @@ static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		return kgsl_hide_pid((pid_t)arg);
 	case OP_KGSL_HOOK:
 		return kgsl_hook_install();
+	case OP_GYRO_INSTALL:
+		return gyro_install((pid_t)arg);
+	case OP_GYRO_REMOVE:
+		gyro_remove();
+		return 0;
+	case OP_GYRO_SET:
+	{
+		GYRO_REQUEST gr;
+		if (copy_from_user(&gr, (void __user *)arg, sizeof(gr)) != 0)
+			return -EFAULT;
+		gyro_set_velocity(gr.rx, gr.ry, gr.rz);
+		return 0;
+	}
+	case OP_GYRO_ENABLE:
+		gyro_set_enabled((bool)arg);
+		return 0;
 	default:
 		return -ENOTTY;
 	}
@@ -216,12 +233,14 @@ static int __init driver_entry(void)
 static void __exit driver_unload(void)
 {
 	printk("[+] driver_unload");
+	gyro_remove();
+	kgsl_hook_remove();
 	misc_deregister(&misc);
 }
 
 module_init(driver_entry);
 module_exit(driver_unload);
 
-MODULE_DESCRIPTION("Linux kernel drivers by all the authors");
-MODULE_LICENSE("Keep");
-MODULE_AUTHOR("TomieNian");
+MODULE_DESCRIPTION("Wind Linux driver - kernel driver for all devices.");
+MODULE_LICENSE("Wind");
+MODULE_AUTHOR("TomieNian-阿念");
