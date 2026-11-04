@@ -15,6 +15,7 @@
 #include <linux/io.h>
 #include <linux/sched.h>
 #include <asm/cacheflush.h>
+#include <asm/cache.h>
 
 /* ---- mmap 读锁 ----
  * 5.8 起 mmap_sem 重命名为 mmap_lock, 并新增 mmap_read_lock() 辅助函数。
@@ -70,18 +71,26 @@
 #endif
 
 /* ---- arm64 D-cache 维护 ----
- * 5.11 起 arm64 重命名 cache 维护函数:
- *   __flush_dcache_area(addr, size) -> dcache_clean_inval_poc(start, end)
- * 语义一致: clean + invalidate D-cache 到 Point of Coherency。
- * 5.4/5.10 用旧名, 5.15+ 用新名。目标版本里 5.10 为旧 API。
+ * 5.11 起 __flush_dcache_area 改名 dcache_clean_inval_poc 且不再 EXPORT_SYMBOL,
+ * 模块不可直接引用。这里用内联 dc civac 指令 + cache_line_size() 统一实现
+ * clean+invalidate 到 PoC, 跨 5.4~6.18 一致, 不依赖任何导出符号。
  */
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0))
-#define kh_flush_dcache(addr, size) \
-	dcache_clean_inval_poc((unsigned long)(addr), (unsigned long)(addr) + (size))
-#else
-#define kh_flush_dcache(addr, size) \
-	__flush_dcache_area((addr), (size))
-#endif
+static inline void kh_dcache_clean_inval_poc(void *addr, size_t size)
+{
+	unsigned long start = (unsigned long)addr;
+	unsigned long end = start + size;
+	unsigned long line = cache_line_size();
+
+	/* 向下/向上对齐到 cache line 边界, 完整覆盖 [addr, addr+size) */
+	start &= ~(line - 1);
+	end = (end + line - 1) & ~(line - 1);
+
+	for (; start < end; start += line)
+		asm volatile("dc civac, %0" : : "r" (start) : "memory");
+	asm volatile("dsb sy" : : : "memory");
+}
+
+#define kh_flush_dcache(addr, size) kh_dcache_clean_inval_poc((addr), (size))
 
 /* ---- ioremap_nocache ----
  * arm64 的 ioremap 默认即 non-cacheable device memory (PROT_DEVICE_nGnRE),
