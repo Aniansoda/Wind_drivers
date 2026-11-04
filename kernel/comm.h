@@ -8,7 +8,7 @@
  * 目标: 减少 ioctl 调用次数, 支持批量读写与会话缓存, 双模式读取
  */
 
-#define DEVICE_NAME "JiangNight"
+#define DEVICE_NAME "TomieNian"
 
 /* ---- 操作码 ---- */
 enum OPERATIONS

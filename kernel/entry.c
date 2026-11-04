@@ -222,6 +222,6 @@ static void __exit driver_unload(void)
 module_init(driver_entry);
 module_exit(driver_unload);
 
-MODULE_DESCRIPTION("Linux Kernel.");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("JiangNight");
+MODULE_DESCRIPTION("Linux kernel drivers by all the authors");
+MODULE_LICENSE("Keep");
+MODULE_AUTHOR("TomieNian");
