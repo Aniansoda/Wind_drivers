@@ -1,4 +1,4 @@
-name: build-khack-ko
+name: build-wind-ko
 
 on:
   workflow_dispatch:
@@ -12,46 +12,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- Android GKI 分支 (gki_defconfig) ----
-          # 只有 5.10 的 git prebuilt 直接发布 Module.symvers (CRC 和真机一致)。
-          # 5.4/5.15/6.1/6.6 的 prebuilt 只发 abi 符号列表, 无 Module.symvers,
-          # 暂退回自编译 vmlinux (CRC 对不上真机, 需 ci.android.com 按 build ID 下载符号表)。
-          - name: android11-5.4
-            repo: aosp-mirror/kernel_common
-            ref: android11-5.4
-            config: gki_defconfig
-            prebuild: ""
-          - name: android12-5.10
-            repo: aosp-mirror/kernel_common
-            ref: android12-5.10
-            config: gki_defconfig
-            prebuild: "5.10"
-          - name: android13-5.15
-            repo: aosp-mirror/kernel_common
-            ref: android13-5.15
-            config: gki_defconfig
-            prebuild: ""
-          - name: android14-6.1
-            repo: aosp-mirror/kernel_common
-            ref: android14-6.1
-            config: gki_defconfig
-            prebuild: ""
-          - name: android15-6.6
-            repo: aosp-mirror/kernel_common
-            ref: android15-6.6
-            config: gki_defconfig
-            prebuild: ""
-          # ---- 主线内核 (arm64 defconfig) ----
-          # 主线无官方预构建符号表, 自编译 vmlinux 生成 Module.symvers。
-          - name: mainline-6.12
+          # ---- 主线 6.1 / 6.6 (对齐 hookmod 参考驱动的内核源码) ----
+          # hookmod 的 6.1.sh(主线 6.1.112) / 6.6.sh(主线 6.6.57) vermagic 无
+          # android 后缀, 即用 torvalds/linux 主线编译。这里用精确 tag + defconfig
+          # + 自编译 vmlinux.symvers, 与参考驱动一致。
+          - name: mainline-6.1
             repo: torvalds/linux
-            ref: v6.12
+            ref: v6.1.112
             config: defconfig
             prebuild: ""
-          - name: mainline-6.18
+          - name: mainline-6.6
             repo: torvalds/linux
-            ref: v6.18
+            ref: v6.6.57
             config: defconfig
+            prebuild: ""
+          # ---- Android GKI 6.12 / 6.18 (对齐 hookmod 参考驱动的内核源码) ----
+          # hookmod 的 6.12.sh = android16-6.12, 6.18.sh = android17-6.18 (GKI)。
+          # 6.12: prebuilt 已有 .ko, 用 extract_symvers.py 提取冻结 KMI CRC。
+          # 6.18: prebuilt 仍是空仓库, 用自编译 vmlinux.symvers (make modpost)。
+          - name: android16-6.12
+            repo: aosp-mirror/kernel_common
+            ref: android16-6.12
+            config: gki_defconfig
+            prebuild: "6.12"
+          - name: android17-6.18
+            repo: aosp-mirror/kernel_common
+            ref: android17-6.18
+            config: gki_defconfig
             prebuild: ""
 
     steps:
@@ -81,7 +68,6 @@ jobs:
       - name: Enable required configs
         run: |
           cd kernel-src
-          # 必要 config 兜底 (GKI/主线 defconfig 默认已开, 这里显式确保)
           ./scripts/config \
             --enable CONFIG_KPROBES \
             --enable CONFIG_KRETPROBES \
@@ -93,45 +79,41 @@ jobs:
       - name: Prepare kernel modules
         run: |
           cd kernel-src
-          # 生成头文件 + modpost 工具 (不编译 vmlinux)
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
 
       - name: Get Module.symvers
         run: |
           cd kernel-src
           if [ -n "${{ matrix.prebuild }}" ]; then
-            # GKI: 下载 Google 预构建符号表 (CRC 和真机 GKI 一致, 才能 insmod)
-            # 自编译 vmlinux 的符号表 CRC 对不上真机, 会报 "disagrees about version of symbol"
+            # GKI: 从官方 prebuilt .ko 提取冻结 KMI CRC (等价官方 Module.symvers)
             git clone --depth 1 \
               "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/prebuilts/${{ matrix.prebuild }}/arm64/" \
               /tmp/gki-prebuilt
-            cp /tmp/gki-prebuilt/Module.symvers ./Module.symvers
+            python3 ../extract_symvers.py /tmp/gki-prebuilt ./Module.symvers
           else
-            # 主线/无预构建: make modpost 只生成符号表 (vmlinux.o + modpost),
-            # 跳过 vmlinux 链接/BTF/kallsyms/SORTTAB (这些会拖时间且 SORTTAB 会失败)。
-            # modpost 输出 vmlinux.symvers, 复制成 Module.symvers 供外部模块编译。
+            # 主线: make modpost 生成 vmlinux.symvers
             make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
             cp vmlinux.symvers Module.symvers
           fi
           test -s Module.symvers
           wc -l Module.symvers
 
-      - name: Build khack module
+      - name: Build wind module
         run: |
-          mkdir -p kernel-src/drivers/khack
-          cp -r kernel/* kernel-src/drivers/khack/
+          mkdir -p kernel-src/drivers/wind
+          cp -r kernel/* kernel-src/drivers/wind/
           cd kernel-src
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" M=drivers/khack modules
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" M=drivers/wind modules
 
       - name: Show module info
         run: |
-          file kernel-src/drivers/khack/khack.ko
-          modinfo kernel-src/drivers/khack/khack.ko || true
-          ls -lh kernel-src/drivers/khack/khack.ko
+          file kernel-src/drivers/wind/wind.ko
+          modinfo kernel-src/drivers/wind/wind.ko || true
+          ls -lh kernel-src/drivers/wind/wind.ko
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
-          name: khack-${{ matrix.name }}
-          path: kernel-src/drivers/khack/khack.ko
+          name: wind-${{ matrix.name }}
+          path: kernel-src/drivers/wind/wind.ko
           if-no-files-found: error
