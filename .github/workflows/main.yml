@@ -13,35 +13,46 @@ jobs:
       matrix:
         include:
           # ---- Android GKI 分支 (gki_defconfig) ----
+          # 只有 5.10 的 git prebuilt 直接发布 Module.symvers (CRC 和真机一致)。
+          # 5.4/5.15/6.1/6.6 的 prebuilt 只发 abi 符号列表, 无 Module.symvers,
+          # 暂退回自编译 vmlinux (CRC 对不上真机, 需 ci.android.com 按 build ID 下载符号表)。
           - name: android11-5.4
             repo: aosp-mirror/kernel_common
             ref: android11-5.4
             config: gki_defconfig
+            prebuild: ""
           - name: android12-5.10
             repo: aosp-mirror/kernel_common
             ref: android12-5.10
             config: gki_defconfig
+            prebuild: 5.10
           - name: android13-5.15
             repo: aosp-mirror/kernel_common
             ref: android13-5.15
             config: gki_defconfig
+            prebuild: ""
           - name: android14-6.1
             repo: aosp-mirror/kernel_common
             ref: android14-6.1
             config: gki_defconfig
+            prebuild: ""
           - name: android15-6.6
             repo: aosp-mirror/kernel_common
             ref: android15-6.6
             config: gki_defconfig
+            prebuild: ""
           # ---- 主线内核 (arm64 defconfig) ----
+          # 主线无官方预构建符号表, 自编译 vmlinux 生成 Module.symvers。
           - name: mainline-6.12
             repo: torvalds/linux
             ref: v6.12
             config: defconfig
+            prebuild: ""
           - name: mainline-6.18
             repo: torvalds/linux
             ref: v6.18
             config: defconfig
+            prebuild: ""
 
     steps:
       - name: Checkout driver source
@@ -79,14 +90,28 @@ jobs:
             --enable CONFIG_MISC_DEVICES || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      - name: Prepare kernel + build vmlinux
+      - name: Prepare kernel modules
         run: |
           cd kernel-src
-          # 1) 生成头文件 + modpost 工具 (不编译 vmlinux)
+          # 生成头文件 + modpost 工具 (不编译 vmlinux)
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
-          # 2) 编译 vmlinux 生成 $srctree/Module.symvers
-          #    外部模块 modpost 依赖它解析 misc_deregister/iounmap/memcpy 等导出符号
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
+
+      - name: Get Module.symvers
+        run: |
+          cd kernel-src
+          if [ -n "${{ matrix.prebuild }}" ]; then
+            # GKI: 下载 Google 预构建符号表 (CRC 和真机 GKI 一致, 才能 insmod)
+            # 自编译 vmlinux 的符号表 CRC 对不上真机, 会报 "disagrees about version of symbol"
+            git clone --depth 1 \
+              "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/prebuilts/${{ matrix.prebuild }}/arm64/" \
+              /tmp/gki-prebuilt
+            cp /tmp/gki-prebuilt/Module.symvers ./Module.symvers
+          else
+            # 主线: 无官方预构建符号表, 编译 vmlinux 生成 Module.symvers
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
+          fi
+          test -s Module.symvers
+          wc -l Module.symvers
 
       - name: Build khack module
         run: |
