@@ -12,24 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ---- 主线 6.1 / 6.6 (对齐 hookmod 参考驱动的内核源码) ----
-          # hookmod 的 6.1.sh(主线 6.1.112) / 6.6.sh(主线 6.6.57) vermagic 无
-          # android 后缀, 即用 torvalds/linux 主线编译。这里用精确 tag + defconfig
-          # + 自编译 vmlinux.symvers, 与参考驱动一致。
           - name: mainline-6.1
-            repo: torvalds/linux
+            repo: gregkh/linux
             ref: v6.1.112
             config: defconfig
             prebuild: ""
           - name: mainline-6.6
-            repo: torvalds/linux
+            repo: gregkh/linux
             ref: v6.6.57
             config: defconfig
             prebuild: ""
-          # ---- Android GKI 6.12 / 6.18 (对齐 hookmod 参考驱动的内核源码) ----
-          # hookmod 的 6.12.sh = android16-6.12, 6.18.sh = android17-6.18 (GKI)。
-          # 6.12: prebuilt 已有 .ko, 用 extract_symvers.py 提取冻结 KMI CRC。
-          # 6.18: prebuilt 仍是空仓库, 用自编译 vmlinux.symvers (make modpost)。
           - name: android16-6.12
             repo: aosp-mirror/kernel_common
             ref: android16-6.12
