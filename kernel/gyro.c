@@ -57,7 +57,7 @@ static pid_t gyro_pid;                  /* 目标进程 */
 static unsigned long gyro_addr;         /* sendObjects 运行时地址 */
 static bool gyro_active;
 static bool gyro_enabled;
-static float gyro_rx, gyro_ry, gyro_rz; /* 目标角速度 (rad/s) */
+static u32 gyro_rx, gyro_ry, gyro_rz; /* 目标角速度, float 位模式 (rad/s) */
 
 /* ===================================================================
  * 非睡眠内存读写: 页表翻译 + phys_to_virt 直读直写。
@@ -317,14 +317,14 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 	{
 		uintptr_t ev = events + (uintptr_t)i * SENSOR_EVENT_SIZE;
 		int32_t type;
-		float v[3];
+		u32 v[3];
 
 		if (!gyro_read_mem(mm, ev + SENSOR_EVENT_TYPE_OFF, &type, sizeof(type)))
 			continue;
 		if (type != SENSOR_TYPE_GYROSCOPE)
 			continue;
 
-		/* 篡改 gyro x/y/z = data[0..2] (rad/s) */
+		/* 篡改 gyro x/y/z = data[0..2] (float 位模式, 不做 FP 运算) */
 		v[0] = gyro_rx;
 		v[1] = gyro_ry;
 		v[2] = gyro_rz;
@@ -405,7 +405,7 @@ void gyro_remove(void)
 	printk(KERN_INFO "gyro: unregistered\n");
 }
 
-void gyro_set_velocity(float rx, float ry, float rz)
+void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 {
 	gyro_rx = rx;
 	gyro_ry = ry;

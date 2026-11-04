@@ -28,8 +28,8 @@
 int  gyro_install(pid_t pid);
 void gyro_remove(void);
 
-/* 目标角速度 (rad/s) 与开关 */
-void gyro_set_velocity(float rx, float ry, float rz);
+/* 目标角速度 (rad/s, 传 float 位模式 IEEE 754) 与开关 */
+void gyro_set_velocity(u32 rx, u32 ry, u32 rz);
 void gyro_set_enabled(bool enabled);
 
 #endif /* _GYRO_H_ */

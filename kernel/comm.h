@@ -11,27 +11,31 @@
 #define DEVICE_NAME "TomieNian-阿念"
 
 /* ---- 操作码 ---- */
+/* 独家编码: 高 16 位 = 0x574E ("WN" = wind), 低 16 位 = 序号。
+ * 不用通用 0x800 系列, 避免与示例驱动 / 其它模块 opcode 撞车。 */
+#define WIND_OP_BASE 0x574E0000
+
 enum OPERATIONS
 {
-	OP_BIND         = 0x800, /* 绑定目标 pid, 缓存 task/mm (open 后先调用一次) */
-	OP_UNBIND       = 0x801, /* 解绑并释放缓存 */
-	OP_READ_MEM     = 0x802, /* 单次读 (兼容旧协议) */
-	OP_WRITE_MEM    = 0x803, /* 单次写 (兼容旧协议) */
-	OP_READ_BATCH   = 0x804, /* 批量读, 一次 ioctl 读多个离散地址 */
-	OP_WRITE_BATCH  = 0x805, /* 批量写 */
-	OP_SET_MODE     = 0x806, /* 切换读取模式 (安全/快速) */
-	OP_MODULE_BASE  = 0x807, /* 取模块基址 */
-	OP_HIDE_FILE    = 0x808, /* 隐藏文件 (按 basename) */
-	OP_HIDE_PROCESS = 0x809, /* 隐藏进程 */
-	OP_UNHIDE_ALL   = 0x80A, /* 撤销所有隐藏 */
-	OP_BRK_SET      = 0x80B, /* 设置硬件断点 */
-	OP_BRK_CLEAR    = 0x80C, /* 清除硬件断点 */
-	OP_KGSL_HIDE    = 0x80D, /* kgsl 隐藏 pid */
-	OP_KGSL_HOOK    = 0x80E, /* 安装 kgsl hook */
-	OP_GYRO_INSTALL = 0x80F, /* 安装陀螺仪 hook (pid, 对齐 hookmod 控制方式) */
-	OP_GYRO_REMOVE  = 0x810, /* 卸载陀螺仪 hook */
-	OP_GYRO_SET     = 0x811, /* 设置目标角速度 (rad/s) */
-	OP_GYRO_ENABLE  = 0x812, /* 开关陀螺仪篡改 */
+	OP_BIND         = WIND_OP_BASE + 0x01, /* 绑定目标 pid, 缓存 task/mm (open 后先调用一次) */
+	OP_UNBIND       = WIND_OP_BASE + 0x02, /* 解绑并释放缓存 */
+	OP_READ_MEM     = WIND_OP_BASE + 0x03, /* 单次读 (兼容旧协议) */
+	OP_WRITE_MEM    = WIND_OP_BASE + 0x04, /* 单次写 (兼容旧协议) */
+	OP_READ_BATCH   = WIND_OP_BASE + 0x05, /* 批量读, 一次 ioctl 读多个离散地址 */
+	OP_WRITE_BATCH  = WIND_OP_BASE + 0x06, /* 批量写 */
+	OP_SET_MODE     = WIND_OP_BASE + 0x07, /* 切换读取模式 (安全/快速) */
+	OP_MODULE_BASE  = WIND_OP_BASE + 0x08, /* 取模块基址 */
+	OP_HIDE_FILE    = WIND_OP_BASE + 0x09, /* 隐藏文件 (按 basename) */
+	OP_HIDE_PROCESS = WIND_OP_BASE + 0x0A, /* 隐藏进程 */
+	OP_UNHIDE_ALL   = WIND_OP_BASE + 0x0B, /* 撤销所有隐藏 */
+	OP_BRK_SET      = WIND_OP_BASE + 0x0C, /* 设置硬件断点 */
+	OP_BRK_CLEAR    = WIND_OP_BASE + 0x0D, /* 清除硬件断点 */
+	OP_KGSL_HIDE    = WIND_OP_BASE + 0x0E, /* kgsl 隐藏 pid */
+	OP_KGSL_HOOK    = WIND_OP_BASE + 0x0F, /* 安装 kgsl hook */
+	OP_GYRO_INSTALL = WIND_OP_BASE + 0x10, /* 安装陀螺仪 hook (pid, 对齐 hookmod 控制方式) */
+	OP_GYRO_REMOVE  = WIND_OP_BASE + 0x11, /* 卸载陀螺仪 hook */
+	OP_GYRO_SET     = WIND_OP_BASE + 0x12, /* 设置目标角速度 (rad/s) */
+	OP_GYRO_ENABLE  = WIND_OP_BASE + 0x13, /* 开关陀螺仪篡改 */
 };
 
 /* ---- 读取模式 ---- */
@@ -98,7 +102,7 @@ typedef struct _BRK_REQUEST
 /* ---- 陀螺仪 ---- */
 typedef struct _GYRO_REQUEST
 {
-	float rx, ry, rz;  /* 目标三轴角速度 (rad/s) */
+	u32 rx, ry, rz;  /* 目标三轴角速度, float 位模式 (IEEE 754)。内核态禁用 FP 寄存器 */
 } GYRO_REQUEST, *PGYRO_REQUEST;
 
 /*
