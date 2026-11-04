@@ -59,23 +59,15 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 }
 
 /* ===================================================================
- * 物理地址校验
+ * 物理地址校验: 判断是否落在 kernel 线性映射区 (可 phys_to_virt 直接访问)。
+ * arm64 用 pfn_valid 判断物理页是否有效。valid_phys_addr_range 是 x86 专用
+ * API (arm64 无此导出符号), 不引入。普通 RAM 走 phys_to_virt 直读, 与进程
+ * 页表同为 WB cache, PIPT 物理索引, 天然 coherent, 无 ioremap 别名。
  * =================================================================== */
-#ifndef ARCH_HAS_VALID_PHYS_ADDR_RANGE
-static inline int valid_phys_addr_range(phys_addr_t addr, size_t count)
-{
-	return addr + count <= __pa(high_memory);
-}
-#endif
-
-/*
- * 判断物理地址是否落在 kernel 线性映射区 (可 phys_to_virt 直接访问)。
- * 普通 RAM 走 phys_to_virt 直读, 与进程页表同为 WB cache, PIPT 物理索引,
- * 天然 coherent, 无 ioremap 别名, 避免黑屏与反复 ioremap 开销。
- */
 static inline bool is_direct_map(phys_addr_t pa, size_t size)
 {
-	return pfn_valid(__phys_to_pfn(pa)) && valid_phys_addr_range(pa, size);
+	(void)size;
+	return pfn_valid(__phys_to_pfn(pa));
 }
 
 /* ===================================================================
