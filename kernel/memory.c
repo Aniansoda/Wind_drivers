@@ -48,12 +48,12 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	if (pmd_none(*pmd))
 		return 0;
 	pte = pte_offset_kernel(pmd, va);
-	if (pte_none(ptep_get(pte)))
+	if (pte_none(kh_ptep_get(pte)))
 		return 0;
-	if (!pte_present(ptep_get(pte)))
+	if (!pte_present(kh_ptep_get(pte)))
 		return 0;
 
-	page_addr = (phys_addr_t)(pte_pfn(ptep_get(pte)) << PAGE_SHIFT);
+	page_addr = (phys_addr_t)(pte_pfn(kh_ptep_get(pte)) << PAGE_SHIFT);
 	page_offset = va & (PAGE_SIZE - 1);
 	return page_addr + page_offset;
 }

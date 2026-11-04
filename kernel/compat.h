@@ -13,6 +13,7 @@
 #include <linux/mm.h>
 #include <linux/rwsem.h>
 #include <linux/io.h>
+#include <linux/sched.h>
 #include <asm/cacheflush.h>
 
 /* ---- mmap 读锁 ----
@@ -35,6 +36,16 @@
  */
 #define KH_HAVE_P4D 1
 
+/* ---- arm64 ptep_get ----
+ * arm64 5.10 引入 PTE 保护并随之上游 ptep_get(ptep); 5.4 无此宏, 直接
+ * *ptep 解引用 (5.4 的 pte_t 无保护位, 解引用即真实值)。
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0))
+#define kh_ptep_get(ptep) ptep_get(ptep)
+#else
+#define kh_ptep_get(ptep) (*(ptep))
+#endif
+
 /* ---- VMA 遍历 ----
  * 6.1 起引入 maple tree, 提供 vma_iterator / vma_iter_init / for_each_vma。
  * 6.1 之前用 mm->mmap 链表。
@@ -42,16 +53,16 @@
 #define KH_HAVE_VMA_ITER (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
 
 /* ---- get_user_pages_remote ----
- * 6.5 起移除 vmas 参数 (commit "mm/gup: remove vmas parameter"):
- *   5.4~6.1: (mm, start, nr, flags, pages, vmas, locked)
- *   6.5~6.18: (mm, start, nr, flags, pages, locked)
+ * 完整签名首参是 tsk (struct task_struct *), 用 current 填充:
+ *   5.4~6.1: (tsk, mm, start, nr, flags, pages, vmas, locked)
+ *   6.5~6.18: (tsk, mm, start, nr, flags, pages, locked)  (6.5 移除 vmas)
  */
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))
 #define kh_get_user_pages_remote(mm, start, nr, flags, pages) \
-	get_user_pages_remote(mm, start, nr, flags, pages, NULL)
+	get_user_pages_remote(current, mm, start, nr, flags, pages, NULL)
 #else
 #define kh_get_user_pages_remote(mm, start, nr, flags, pages) \
-	get_user_pages_remote(mm, start, nr, flags, pages, NULL, NULL)
+	get_user_pages_remote(current, mm, start, nr, flags, pages, NULL, NULL)
 #endif
 
 /* ---- arm64 D-cache 维护 ----
