@@ -53,7 +53,7 @@ jobs:
             binutils-aarch64-linux-gnu \
             bc flex bison \
             libssl-dev libelf-dev \
-            dwarves kmod \
+            dwarves libdwarf-dev kmod \
             wget gnupg
           # GKI 内核强制 CONFIG_CC_IS_CLANG, 不能用 gcc 交叉编译。
           # 按版本装 LLVM: 6.12 -> clang-19, 6.18 -> clang-21 (对齐 Android 工具链)。
@@ -88,6 +88,7 @@ jobs:
             --disable CONFIG_AUTOFDO_CLANG \
             --disable CONFIG_DEBUG_INFO_BTF \
             --disable CONFIG_HEADERS_INSTALL \
+            --disable CONFIG_GENDWARFKSYMS \
             || true
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
