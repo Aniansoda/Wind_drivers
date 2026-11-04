@@ -38,6 +38,7 @@
 #include <asm/ptrace.h>
 #include <asm/page.h>
 #include <asm/memory.h>
+#include "sym.h"
 #include "gyro.h"
 #include "memory.h"
 #include "compat.h"
@@ -70,6 +71,7 @@ static bool gyro_read_mem(struct mm_struct *mm, uintptr_t va, void *buf, size_t 
 	while (size > 0)
 	{
 		phys_addr_t pa = translate_linear_address(mm, va);
+		void *kva;
 		size_t chunk;
 
 		if (!pa)
@@ -77,7 +79,10 @@ static bool gyro_read_mem(struct mm_struct *mm, uintptr_t va, void *buf, size_t 
 		chunk = PAGE_SIZE - (va & (PAGE_SIZE - 1));
 		if (chunk > size)
 			chunk = size;
-		memcpy(dst, phys_to_virt(pa), chunk);
+		kva = wind_phys_to_virt(pa);
+		if (!kva)
+			return false;
+		memcpy(dst, kva, chunk);
 		dst += chunk;
 		va += chunk;
 		size -= chunk;
@@ -100,7 +105,9 @@ static bool gyro_write_mem(struct mm_struct *mm, uintptr_t va, const void *buf, 
 		chunk = PAGE_SIZE - (va & (PAGE_SIZE - 1));
 		if (chunk > size)
 			chunk = size;
-		kva = phys_to_virt(pa);
+		kva = wind_phys_to_virt(pa);
+		if (!kva)
+			return false;
 		memcpy(kva, src, chunk);
 		kh_flush_dcache(kva, chunk);
 		src += chunk;

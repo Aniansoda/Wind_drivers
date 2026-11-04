@@ -14,6 +14,7 @@
 #include "breakpoint.h"
 #include "kgsl.h"
 #include "gyro.h"
+#include "sym.h"
 
 /*
  * entry.c — 通讯通道 (hook /dev/null fops, 不注册 dev 节点)
@@ -52,13 +53,13 @@ static inline bool is_wind_cmd(unsigned int cmd)
 static int fops_unlock(void)
 {
 	unsigned long page = (unsigned long)g_null_fops & PAGE_MASK;
-	return set_memory_rw(page, 1);
+	return wind_set_memory_rw(page, 1);
 }
 
 static void fops_relock(void)
 {
 	unsigned long page = (unsigned long)g_null_fops & PAGE_MASK;
-	if (set_memory_ro(page, 1))
+	if (wind_set_memory_ro(page, 1))
 		printk(KERN_WARNING "wind: set_memory_ro failed (page left rw)\n");
 }
 
@@ -301,9 +302,14 @@ static int __init driver_entry(void)
 	int ret;
 
 	printk("[+] wind driver_entry");
-	ret = hook_install();
+	ret = wind_sym_init();
 	if (ret)
 		return ret;
+	ret = hook_install();
+	if (ret) {
+		wind_sym_exit();
+		return ret;
+	}
 	return 0;
 }
 
@@ -317,6 +323,7 @@ static void __exit driver_unload(void)
 		session_destroy(g_sess);
 		g_sess = NULL;
 	}
+	wind_sym_exit();
 }
 
 module_init(driver_entry);

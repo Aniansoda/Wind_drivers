@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "compat.h"
+#include "sym.h"
 #include <linux/tty.h>
 #include <linux/io.h>
 #include <linux/mm.h>
@@ -20,42 +21,56 @@
 #include <asm/cacheflush.h>
 
 /* ===================================================================
- * 页表翻译: 5.4~6.18 统一走 p4d 分支。
- * p4d_offset 自 4.17 起可用, arm64 4-level 下 p4d 折叠 (p4d_t 即 pgd_t),
- * p4d_offset 是 no-op, 因此对所有目标内核版本均正确。
+ * 页表翻译: 5.4~6.18 统一走 p4d 折叠分支 (arm64 4-level, p4d == pgd)。
+ *
+ * 这里手动实现各级偏移, 不用 p4d_offset/pud_offset/pmd_offset/
+ * pte_offset_kernel 内核宏 —— 它们的 *_page_vaddr 展开会引用 __va,
+ * 进而引用 arm64_use_ng_mappings / physvirt_offset 等非白名单符号,
+ * GKI 下报 modpost undefined。改用 wind_phys_to_virt (sym.c 重写)。
  * =================================================================== */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
 	pgd_t *pgd;
-	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
 
-	phys_addr_t page_addr;
-	uintptr_t page_offset;
+	phys_addr_t pa;
 
 	pgd = pgd_offset(mm, va);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return 0;
-	p4d = p4d_offset(pgd, va);
-	if (p4d_none(*p4d) || p4d_bad(*p4d))
+
+	/* p4d 折叠: p4d_t 即 pgd_t, p4d_offset 是 no-op */
+	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
+	pud = (pud_t *)wind_phys_to_virt(pa);
+	if (!pud)
 		return 0;
-	pud = pud_offset(p4d, va);
+	pud += pud_index(va);
 	if (pud_none(*pud) || pud_bad(*pud))
 		return 0;
-	pmd = pmd_offset(pud, va);
+
+	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
+	pmd = (pmd_t *)wind_phys_to_virt(pa);
+	if (!pmd)
+		return 0;
+	pmd += pmd_index(va);
 	if (pmd_none(*pmd))
 		return 0;
-	pte = pte_offset_kernel(pmd, va);
-	if (pte_none(kh_ptep_get(pte)))
+
+	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
+	pte = (pte_t *)wind_phys_to_virt(pa);
+	if (!pte)
 		return 0;
-	if (!pte_present(kh_ptep_get(pte)))
+	pte += pte_index(va);
+
+	if (pte_none(wind_ptep_get(pte)))
+		return 0;
+	if (!pte_present(wind_ptep_get(pte)))
 		return 0;
 
-	page_addr = (phys_addr_t)(pte_pfn(kh_ptep_get(pte)) << PAGE_SHIFT);
-	page_offset = va & (PAGE_SIZE - 1);
-	return page_addr + page_offset;
+	return (phys_addr_t)(pte_pfn(wind_ptep_get(pte)) << PAGE_SHIFT) +
+	       (va & (PAGE_SIZE - 1));
 }
 
 /* ===================================================================
@@ -67,7 +82,7 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 static inline bool is_direct_map(phys_addr_t pa, size_t size)
 {
 	(void)size;
-	return pfn_valid(__phys_to_pfn(pa));
+	return wind_pfn_valid((unsigned long)(pa >> PAGE_SHIFT));
 }
 
 /* ===================================================================
@@ -75,8 +90,10 @@ static inline bool is_direct_map(phys_addr_t pa, size_t size)
  * =================================================================== */
 static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t size)
 {
-	void *src = phys_to_virt(pa);
+	void *src = wind_phys_to_virt(pa);
 
+	if (!src)
+		return false;
 	if (copy_to_user(buffer, src, size))
 		return false;
 	return true;
@@ -84,8 +101,10 @@ static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t siz
 
 static bool write_physical_direct(phys_addr_t pa, const void __user *buffer, size_t size)
 {
-	void *dst = phys_to_virt(pa);
+	void *dst = wind_phys_to_virt(pa);
 
+	if (!dst)
+		return false;
 	if (copy_from_user(dst, buffer, size))
 		return false;
 	/*
@@ -208,7 +227,7 @@ static bool __read_mm(struct mm_struct *mm, uintptr_t addr, void __user *buffer,
 				if (!find_vma(mm, addr))
 					break;
 				chunk = min(size, (size_t)(PAGE_SIZE - (addr & (PAGE_SIZE - 1))));
-				if (clear_user(buffer, chunk) != 0)
+				if (wind_clear_user(buffer, chunk) != 0)
 					break;
 				addr += chunk;
 				buffer += chunk;
