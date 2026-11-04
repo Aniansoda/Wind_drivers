@@ -25,7 +25,7 @@ jobs:
             repo: aosp-mirror/kernel_common
             ref: android12-5.10
             config: gki_defconfig
-            prebuild: 5.10
+            prebuild: "5.10"
           - name: android13-5.15
             repo: aosp-mirror/kernel_common
             ref: android13-5.15
@@ -107,8 +107,11 @@ jobs:
               /tmp/gki-prebuilt
             cp /tmp/gki-prebuilt/Module.symvers ./Module.symvers
           else
-            # 主线: 无官方预构建符号表, 编译 vmlinux 生成 Module.symvers
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
+            # 主线/无预构建: 只编译 vmlinux.o 并 modpost 生成符号表。
+            # 不用 make vmlinux —— 完整 vmlinux 的 SORTTAB 步骤在 CI 上会失败,
+            # 且符号表在 modpost(vmlinux.symvers) 阶段已生成。
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux.symvers
+            cp vmlinux.symvers Module.symvers
           fi
           test -s Module.symvers
           wc -l Module.symvers
