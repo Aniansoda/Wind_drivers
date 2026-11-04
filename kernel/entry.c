@@ -11,7 +11,7 @@
 #include "breakpoint.h"
 #include "kgsl.h"
 
-#define DEVICE_NAME "JiangNight"
+#define DEVICE_NAME "WindNian"
 
 static struct driver_session *file_session(struct file *file)
 {
@@ -224,6 +224,6 @@ void __exit driver_unload(void)
 module_init(driver_entry);
 module_exit(driver_unload);
 
-MODULE_DESCRIPTION("Linux Kernel.");
+MODULE_DESCRIPTION("Wind-Driven Linux.");
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("JiangNight");
+MODULE_AUTHOR("WindNian");
