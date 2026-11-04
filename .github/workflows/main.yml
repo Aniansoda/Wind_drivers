@@ -17,21 +17,25 @@ jobs:
             ref: v6.1.112
             config: defconfig
             prebuild: ""
+            cc: ""
           - name: mainline-6.6
             repo: gregkh/linux
             ref: v6.6.57
             config: defconfig
             prebuild: ""
+            cc: ""
           - name: android16-6.12
             repo: aosp-mirror/kernel_common
             ref: android16-6.12
             config: gki_defconfig
             prebuild: "6.12"
+            cc: "LLVM=-19"
           - name: android17-6.18
             repo: aosp-mirror/kernel_common
             ref: android17-6.18
             config: gki_defconfig
             prebuild: ""
+            cc: "LLVM=-19"
 
     steps:
       - name: Checkout driver source
@@ -45,7 +49,13 @@ jobs:
             binutils-aarch64-linux-gnu \
             bc flex bison \
             libssl-dev libelf-dev \
-            dwarves kmod
+            dwarves kmod \
+            wget gnupg
+          # GKI 内核强制 CONFIG_CC_IS_CLANG, 不能用 gcc 交叉编译,
+          # 装 LLVM 19 (clang-19 + lld-19 + llvm-19) 对齐 Android 16/17 工具链。
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19 all
 
       - name: Clone kernel source
         run: |
@@ -55,7 +65,7 @@ jobs:
       - name: Configure kernel
         run: |
           cd kernel-src
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ${{ matrix.config }}
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- ${{ matrix.config }}
 
       - name: Enable required configs
         run: |
@@ -66,12 +76,12 @@ jobs:
             --enable CONFIG_PERF_EVENTS \
             --enable CONFIG_HW_BREAKPOINT \
             --enable CONFIG_MISC_DEVICES || true
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
       - name: Prepare kernel modules
         run: |
           cd kernel-src
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
 
       - name: Get Module.symvers
         run: |
@@ -84,7 +94,7 @@ jobs:
             python3 ../extract_symvers.py /tmp/gki-prebuilt ./Module.symvers
           else
             # 主线: make modpost 生成 vmlinux.symvers
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
+            make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
             cp vmlinux.symvers Module.symvers
           fi
           test -s Module.symvers
@@ -95,7 +105,7 @@ jobs:
           mkdir -p kernel-src/drivers/wind
           cp -r kernel/* kernel-src/drivers/wind/
           cd kernel-src
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" M=drivers/wind modules
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" M=drivers/wind modules
 
       - name: Show module info
         run: |
