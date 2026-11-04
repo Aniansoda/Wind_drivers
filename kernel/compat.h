@@ -12,6 +12,8 @@
 #include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/rwsem.h>
+#include <linux/io.h>
+#include <asm/cacheflush.h>
 
 /* ---- mmap 读锁 ----
  * 5.8 起 mmap_sem 重命名为 mmap_lock, 并新增 mmap_read_lock() 辅助函数。
@@ -51,5 +53,25 @@
 #define kh_get_user_pages_remote(mm, start, nr, flags, pages) \
 	get_user_pages_remote(mm, start, nr, flags, pages, NULL, NULL)
 #endif
+
+/* ---- arm64 D-cache 维护 ----
+ * 5.11 起 arm64 重命名 cache 维护函数:
+ *   __flush_dcache_area(addr, size) -> dcache_clean_inval_poc(start, end)
+ * 语义一致: clean + invalidate D-cache 到 Point of Coherency。
+ * 5.4/5.10 用旧名, 5.15+ 用新名。目标版本里 5.10 为旧 API。
+ */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0))
+#define kh_flush_dcache(addr, size) \
+	dcache_clean_inval_poc((unsigned long)(addr), (unsigned long)(addr) + (size))
+#else
+#define kh_flush_dcache(addr, size) \
+	__flush_dcache_area((addr), (size))
+#endif
+
+/* ---- ioremap_nocache ----
+ * arm64 的 ioremap 默认即 non-cacheable device memory (PROT_DEVICE_nGnRE),
+ * 没有 ioremap_nocache 变体 (那是 x86 的 API)。统一映射到 ioremap。
+ */
+#define kh_ioremap_nocache(addr, size) ioremap((addr), (size))
 
 #endif /* _KH_COMPAT_H_ */

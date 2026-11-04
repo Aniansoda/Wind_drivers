@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/limits.h>
 #include <asm/ptrace.h>
+#include "process.h"
 
 #define MAX_HIDDEN_FILES 16
 #define MAX_HIDDEN_PIDS  64

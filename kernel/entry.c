@@ -11,14 +11,12 @@
 #include "breakpoint.h"
 #include "kgsl.h"
 
-#define DEVICE_NAME "WindNian"
-
 static struct driver_session *file_session(struct file *file)
 {
 	return (struct driver_session *)file->private_data;
 }
 
-int dispatch_open(struct inode *node, struct file *file)
+static int dispatch_open(struct inode *node, struct file *file)
 {
 	struct driver_session *sess;
 
@@ -30,7 +28,7 @@ int dispatch_open(struct inode *node, struct file *file)
 	return 0;
 }
 
-int dispatch_close(struct inode *node, struct file *file)
+static int dispatch_close(struct inode *node, struct file *file)
 {
 	struct driver_session *sess = file_session(file);
 
@@ -90,7 +88,7 @@ out:
 	return ret;
 }
 
-long dispatch_ioctl(struct file *const file, unsigned int const cmd, unsigned long const arg)
+static long dispatch_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct driver_session *sess = file_session(file);
 	COPY_MEMORY cm;
@@ -207,7 +205,7 @@ struct miscdevice misc = {
 	.fops = &dispatch_functions,
 };
 
-int __init driver_entry(void)
+static int __init driver_entry(void)
 {
 	int ret;
 	printk("[+] driver_entry");
@@ -215,7 +213,7 @@ int __init driver_entry(void)
 	return ret;
 }
 
-void __exit driver_unload(void)
+static void __exit driver_unload(void)
 {
 	printk("[+] driver_unload");
 	misc_deregister(&misc);
@@ -224,6 +222,6 @@ void __exit driver_unload(void)
 module_init(driver_entry);
 module_exit(driver_unload);
 
-MODULE_DESCRIPTION("Wind-Driven Linux.");
+MODULE_DESCRIPTION("Linux Kernel.");
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("WindNian");
+MODULE_AUTHOR("JiangNight");

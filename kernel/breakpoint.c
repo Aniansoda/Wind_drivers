@@ -25,6 +25,7 @@
 #include <linux/sched/task.h>
 #include <linux/ptrace.h>
 #include <asm/ptrace.h>
+#include "breakpoint.h"
 
 struct brk_entry
 {
