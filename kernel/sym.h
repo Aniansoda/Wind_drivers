@@ -12,6 +12,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/compiler.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 
@@ -23,6 +24,7 @@ extern u64 wind_mem_end_addr;
 void *wind_phys_to_virt(phys_addr_t pa);
 bool wind_pfn_valid(unsigned long pfn);
 pte_t wind_ptep_get(pte_t *ptep);
+unsigned long wind_clear_user(void __user *to, unsigned long n);
 
 /* 重写的页表权限 (arm64 set_memory_* 非 EXPORT_SYMBOL) */
 int wind_set_memory_rw(unsigned long addr, int numpages);
