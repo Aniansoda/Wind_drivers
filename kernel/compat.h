@@ -53,13 +53,17 @@
 #define KH_HAVE_VMA_ITER (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
 
 /* ---- get_user_pages_remote ----
- * 完整签名首参是 tsk (struct task_struct *), 用 current 填充:
- *   5.4~6.1: (tsk, mm, start, nr, flags, pages, vmas, locked)
- *   6.5~6.18: (tsk, mm, start, nr, flags, pages, locked)  (6.5 移除 vmas)
+ * 签名演变 (mm/gup 系列, 首参不一直是 tsk):
+ *   5.4             : (tsk, mm, start, nr, flags, pages, vmas, locked)  8 参数
+ *   5.9 起移除 tsk  : (mm, start, nr, flags, pages, vmas, locked)       7 参数
+ *   6.5 起移除 vmas : (mm, start, nr, flags, pages, locked)             6 参数
  */
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))
 #define kh_get_user_pages_remote(mm, start, nr, flags, pages) \
-	get_user_pages_remote(current, mm, start, nr, flags, pages, NULL)
+	get_user_pages_remote(mm, start, nr, flags, pages, NULL)
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0))
+#define kh_get_user_pages_remote(mm, start, nr, flags, pages) \
+	get_user_pages_remote(mm, start, nr, flags, pages, NULL, NULL)
 #else
 #define kh_get_user_pages_remote(mm, start, nr, flags, pages) \
 	get_user_pages_remote(current, mm, start, nr, flags, pages, NULL, NULL)
