@@ -121,4 +121,3 @@ int brk_clear(pid_t pid, uintptr_t addr)
 	return -ENOENT;
 }
 EXPORT_SYMBOL(brk_clear);
-
