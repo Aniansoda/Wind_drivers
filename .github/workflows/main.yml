@@ -30,7 +30,7 @@ jobs:
             repo: aosp-mirror/kernel_common
             ref: android16-6.12
             config: gki_defconfig
-            prebuild: "6.12"
+            prebuild: ""
             cc: "LLVM=-19"
             llvmver: "19"
           - name: android17-6.18
