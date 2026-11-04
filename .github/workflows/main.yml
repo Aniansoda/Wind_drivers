@@ -79,11 +79,14 @@ jobs:
             --enable CONFIG_MISC_DEVICES || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      - name: Prepare kernel modules
+      - name: Prepare kernel + build vmlinux
         run: |
           cd kernel-src
-          # 编译 vmlinux + Module.symvers (GKI 含 BTF, 耗时最长, 约 20~40 分钟)
+          # 1) 生成头文件 + modpost 工具 (不编译 vmlinux)
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules_prepare
+          # 2) 编译 vmlinux 生成 $srctree/Module.symvers
+          #    外部模块 modpost 依赖它解析 misc_deregister/iounmap/memcpy 等导出符号
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" vmlinux
 
       - name: Build khack module
         run: |
