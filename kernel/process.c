@@ -1,5 +1,6 @@
 #include "process.h"
 #include "compat.h"
+#include "sym.h"
 #include <linux/sched.h>
 #include <linux/module.h>
 #include <linux/tty.h>
@@ -24,7 +25,7 @@ uintptr_t get_module_base(struct driver_session *sess, char *name)
 	if (!sess || !sess->task)
 		return 0;
 
-	mm = get_task_mm(sess->task);
+	mm = kh_get_task_mm(sess->task);
 	if (!mm)
 		return 0;
 
@@ -52,6 +53,6 @@ uintptr_t get_module_base(struct driver_session *sess, char *name)
 	}
 	kh_mmap_read_unlock(mm);
 
-	mmput(mm);
+	wind_mmput(mm);
 	return base_addr;
 }

@@ -14,6 +14,7 @@
 #include <linux/rwsem.h>
 #include <linux/io.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <asm/cacheflush.h>
 #include <asm/cache.h>
 
@@ -29,6 +30,24 @@
 #define kh_mmap_read_lock(mm)   down_read(&(mm)->mmap_sem)
 #define kh_mmap_read_unlock(mm) up_read(&(mm)->mmap_sem)
 #endif
+
+/* ---- get_task_mm 内联替代 ----
+ * get_task_mm 不在官方 prebuilt .ko 的 __versions 段里 (modpost undefined),
+ * 这里内联其等价逻辑 (task_lock + mmget, 均为 inline, 不依赖导出符号)。
+ */
+static inline struct mm_struct *kh_get_task_mm(struct task_struct *task)
+{
+	struct mm_struct *mm;
+
+	task_lock(task);
+	mm = task->mm;
+	if (mm && !(task->flags & PF_KTHREAD))
+		mmget(mm);
+	else
+		mm = NULL;
+	task_unlock(task);
+	return mm;
+}
 
 /* ---- p4d ----
  * 5-level 页表通用 API (p4d_offset/p4d_none/p4d_bad) 自 4.17 起可用,
@@ -72,30 +91,29 @@
 
 /* ---- arm64 D-cache 维护 ----
  * 5.11 起 __flush_dcache_area 改名 dcache_clean_inval_poc 且不再 EXPORT_SYMBOL,
- * 模块不可直接引用。这里用内联 dc civac 指令 + cache_line_size() 统一实现
- * clean+invalidate 到 PoC, 跨 5.4~6.18 一致, 不依赖任何导出符号。
+ * 模块不可直接引用。这里用内联 dc civac 指令统一实现 clean+invalidate 到 PoC,
+ * 跨 5.4~6.18 一致, 不依赖任何导出符号。
+ *
+ * cache_line_size() 是数据符号 (ctr_el0 解析), 不在官方 prebuilt .ko 的
+ * __versions 段里 (modpost undefined)。arm64 dc civac 按硬件实际 cache line
+ * 操作, 步进取保守值 64 字节即可完整覆盖 (不会漏刷)。
  */
+#define KH_DCACHE_LINE 64
+
 static inline void kh_dcache_clean_inval_poc(void *addr, size_t size)
 {
 	unsigned long start = (unsigned long)addr;
 	unsigned long end = start + size;
-	unsigned long line = cache_line_size();
 
-	/* 向下/向上对齐到 cache line 边界, 完整覆盖 [addr, addr+size) */
-	start &= ~(line - 1);
-	end = (end + line - 1) & ~(line - 1);
+	/* 向下/向上对齐到 64 字节 cache line 边界, 完整覆盖 [addr, addr+size) */
+	start &= ~(KH_DCACHE_LINE - 1);
+	end = (end + KH_DCACHE_LINE - 1) & ~(KH_DCACHE_LINE - 1);
 
-	for (; start < end; start += line)
+	for (; start < end; start += KH_DCACHE_LINE)
 		asm volatile("dc civac, %0" : : "r" (start) : "memory");
 	asm volatile("dsb sy" : : : "memory");
 }
 
 #define kh_flush_dcache(addr, size) kh_dcache_clean_inval_poc((addr), (size))
-
-/* ---- ioremap_nocache ----
- * arm64 的 ioremap 默认即 non-cacheable device memory (PROT_DEVICE_nGnRE),
- * 没有 ioremap_nocache 变体 (那是 x86 的 API)。统一映射到 ioremap。
- */
-#define kh_ioremap_nocache(addr, size) ioremap((addr), (size))
 
 #endif /* _KH_COMPAT_H_ */

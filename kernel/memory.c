@@ -12,6 +12,8 @@
 #include <linux/mm_types.h>
 #include <linux/pagemap.h>
 #include <linux/mman.h>
+#include <linux/vmalloc.h>
+#include <linux/topology.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -21,13 +23,58 @@
 #include <asm/cacheflush.h>
 
 /* ===================================================================
+ * vmap 物理内存映射 (替代 ioremap_cache/iounmap):
+ *
+ * arm64 的 ioremap_cache 是 static inline, 展开后引用 ioremap_prot
+ * (白名单外) 和 __phys_to_virt (引用 memstart_addr/physvirt_offset
+ * 数据符号), 均不能在 GKI 下编译期引用。这里改用参考驱动验证的
+ * 白名单符号 __get_vm_area_caller + ioremap_page_range + free_vm_area,
+ * PAGE_KERNEL 为 normal cacheable (等价 ioremap_cache 的 PROT_NORMAL)。
+ * =================================================================== */
+struct wind_phys_map {
+	struct vm_struct *area;
+	void *addr;
+};
+
+static struct wind_phys_map wind_map_phys(phys_addr_t pa, size_t size)
+{
+	struct wind_phys_map m = { .area = NULL, .addr = NULL };
+	unsigned long addr, end;
+	int ret;
+
+	m.area = __get_vm_area_caller(size, VM_IOREMAP, VMALLOC_START, VMALLOC_END,
+				      NUMA_NO_NODE, __builtin_return_address(0));
+	if (!m.area)
+		return m;
+	m.addr = m.area->addr;
+	addr = (unsigned long)m.addr;
+	end = addr + size;
+	ret = ioremap_page_range(addr, end, pa, PAGE_KERNEL);
+	if (ret) {
+		free_vm_area(m.area);
+		m.area = NULL;
+		m.addr = NULL;
+	}
+	return m;
+}
+
+static void wind_unmap_phys(struct wind_phys_map *m)
+{
+	if (!m || !m->area)
+		return;
+	free_vm_area(m->area);
+	m->area = NULL;
+	m->addr = NULL;
+}
+
+/* ===================================================================
  * 页表翻译: 5.4~6.18 统一走 p4d 折叠分支 (arm64 4-level, p4d == pgd)。
  *
  * 这里手动实现各级偏移, 不用 p4d_offset/pud_offset/pmd_offset/
  * pte_offset_kernel 内核宏 —— 它们的 *_page_vaddr 展开会引用 __va,
  * 进而引用 arm64_use_ng_mappings / physvirt_offset 等非白名单符号,
- * GKI 下报 modpost undefined。页表项物理地址用 ioremap_cache 映射
- * (cacheable, 等价 __va, 不依赖 memstart_addr)。
+ * GKI 下报 modpost undefined。页表项物理地址用 wind_map_phys 映射
+ * (vmap + PAGE_KERNEL, 等价 __va, 不依赖 memstart_addr)。
  * =================================================================== */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
@@ -36,121 +83,127 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	pmd_t *pmd;
 	pte_t *pte;
 	phys_addr_t pa;
-	void __iomem *map;
+	struct wind_phys_map m;
 
 	pgd = pgd_offset(mm, va);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return 0;
 
-	/* 页表项物理地址 -> ioremap_cache (cacheable, 等价 __va, 不依赖 memstart_addr) */
+	/* 页表项物理地址 -> vmap (cacheable, 等价 __va, 不依赖 memstart_addr) */
 	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
-	map = ioremap_cache(pa, PAGE_SIZE);
-	if (!map)
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
 		return 0;
-	pud = (pud_t *)map + pud_index(va);
+	pud = (pud_t *)m.addr + pud_index(va);
 	if (pud_none(*pud) || pud_bad(*pud)) {
-		iounmap(map);
+		wind_unmap_phys(&m);
 		return 0;
 	}
 
 	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
-	iounmap(map);
-	map = ioremap_cache(pa, PAGE_SIZE);
-	if (!map)
+	wind_unmap_phys(&m);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
 		return 0;
-	pmd = (pmd_t *)map + pmd_index(va);
+	pmd = (pmd_t *)m.addr + pmd_index(va);
 	if (pmd_none(*pmd)) {
-		iounmap(map);
+		wind_unmap_phys(&m);
 		return 0;
 	}
 
 	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
-	iounmap(map);
-	map = ioremap_cache(pa, PAGE_SIZE);
-	if (!map)
+	wind_unmap_phys(&m);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
 		return 0;
-	pte = (pte_t *)map + pte_index(va);
+	pte = (pte_t *)m.addr + pte_index(va);
 
 	if (pte_none(wind_ptep_get(pte))) {
-		iounmap(map);
+		wind_unmap_phys(&m);
 		return 0;
 	}
 	if (!pte_present(wind_ptep_get(pte))) {
-		iounmap(map);
+		wind_unmap_phys(&m);
 		return 0;
 	}
 
 	pa = (phys_addr_t)(pte_pfn(wind_ptep_get(pte)) << PAGE_SHIFT) +
 	     (va & (PAGE_SIZE - 1));
-	iounmap(map);
+	wind_unmap_phys(&m);
 	return pa;
 }
 
 /* ===================================================================
- * 快速路径: ioremap_cache + copy (cacheable, 等价 phys_to_virt 直读)。
- * GKI 拿不到 memstart_addr, 无法重写 phys_to_virt, 改用 ioremap_cache。
- * 进程上下文 (ioctl) 可睡眠, ioremap 合法。
+ * 快速路径: vmap + copy (cacheable, 等价 phys_to_virt 直读)。
+ * GKI 拿不到 memstart_addr, 无法重写 phys_to_virt, 改用 wind_map_phys
+ * (__get_vm_area_caller + ioremap_page_range, PAGE_KERNEL cacheable)。
+ * 进程上下文 (ioctl) 可睡眠, vmap 合法。
  * =================================================================== */
 static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t size)
 {
-	void *src = ioremap_cache(pa, size);
+	struct wind_phys_map m = wind_map_phys(pa, size);
 
-	if (!src)
+	if (!m.addr)
 		return false;
-	if (copy_to_user(buffer, src, size)) {
-		iounmap(src);
+	if (copy_to_user(buffer, m.addr, size)) {
+		wind_unmap_phys(&m);
 		return false;
 	}
-	iounmap(src);
+	wind_unmap_phys(&m);
 	return true;
 }
 
 static bool write_physical_direct(phys_addr_t pa, const void __user *buffer, size_t size)
 {
-	void *dst = ioremap_cache(pa, size);
+	struct wind_phys_map m = wind_map_phys(pa, size);
 
-	if (!dst)
+	if (!m.addr)
 		return false;
-	if (copy_from_user(dst, buffer, size)) {
-		iounmap(dst);
+	if (copy_from_user(m.addr, buffer, size)) {
+		wind_unmap_phys(&m);
 		return false;
 	}
 	/*
 	 * 写回主存并失效对应 cache 行, 保证 GPU/ION/非 cache 映射观察者可见,
 	 * 修复 mm cache 别名导致的图形缓冲不一致 (黑屏)。
 	 */
-	kh_flush_dcache(dst, size);
-	iounmap(dst);
+	kh_flush_dcache(m.addr, size);
+	wind_unmap_phys(&m);
 	return true;
 }
 
 /* ===================================================================
- * 安全路径: ioremap_nocache + flush (无缓存, 防 cache 侧信道, 发热)
+ * 安全路径: vmap + flush (读前 invalidate 防 stale, 近似无缓存语义)
+ * ioremap_nocache (arm64 展开为 ioremap_prot, 白名单外) 已移除, 改用
+ * vmap + dc civac 维持一致性; 完整 nocache 属性后续可加 prot 参数恢复。
  * =================================================================== */
 static bool read_physical_nocache(phys_addr_t pa, void __user *buffer, size_t size)
 {
-	void *mapped = kh_ioremap_nocache(pa, size);
-	if (!mapped)
+	struct wind_phys_map m = wind_map_phys(pa, size);
+
+	if (!m.addr)
 		return false;
-	if (copy_to_user(buffer, mapped, size)) {
-		iounmap(mapped);
+	kh_dcache_clean_inval_poc(m.addr, size); /* 读前 invalidate, 防 stale cache */
+	if (copy_to_user(buffer, m.addr, size)) {
+		wind_unmap_phys(&m);
 		return false;
 	}
-	iounmap(mapped);
+	wind_unmap_phys(&m);
 	return true;
 }
 
 static bool write_physical_nocache(phys_addr_t pa, const void __user *buffer, size_t size)
 {
-	void *mapped = kh_ioremap_nocache(pa, size);
-	if (!mapped)
+	struct wind_phys_map m = wind_map_phys(pa, size);
+
+	if (!m.addr)
 		return false;
-	if (copy_from_user(mapped, buffer, size)) {
-		iounmap(mapped);
+	if (copy_from_user(m.addr, buffer, size)) {
+		wind_unmap_phys(&m);
 		return false;
 	}
-	kh_flush_dcache(mapped, size);
-	iounmap(mapped);
+	kh_flush_dcache(m.addr, size);
+	wind_unmap_phys(&m);
 	return true;
 }
 
@@ -170,30 +223,10 @@ bool write_physical_address(phys_addr_t pa, const void __user *buffer, size_t si
 }
 
 /* ===================================================================
- * swap 兜底: 页表翻译失败 (swap entry / 未映射) 时用 get_user_pages 换入
- * 解决 swap 页漏物资问题。返回 true 表示已换入。
+ * swap 兜底已移除: get_user_pages_remote / put_page / find_vma 均不在
+ * 官方 prebuilt .ko 的 __versions 段 (modpost undefined), 且 swap 页
+ * 换入属于辅助路径。核心物理内存读写不依赖换入, 缺页时直接失败。
  * =================================================================== */
-static bool fault_in_page(struct mm_struct *mm, uintptr_t addr)
-{
-	struct vm_area_struct *vma;
-	struct page *page = NULL;
-
-	vma = find_vma(mm, addr);
-	if (!vma || addr < vma->vm_start)
-		return false;
-
-	/*
-	 * 触发缺页换入 (swap entry -> 物理页)。用 FOLL_GET 做读 fault,
-	 * 对只读映射(代码段/只读数据)同样有效, 避免 FOLL_WRITE 的 COW 副作用。
-	 * vmas 参数在 6.5 起移除, 由 compat.h 的 kh_get_user_pages_remote 统一。
-	 */
-	if (kh_get_user_pages_remote(mm, addr, 1, FOLL_GET, &page) < 0)
-		return false;
-
-	if (page)
-		put_page(page);
-	return true;
-}
 
 /* ===================================================================
  * 进程内存读写 (使用会话缓存 task)
@@ -202,7 +235,7 @@ static struct mm_struct *session_get_mm(struct driver_session *sess)
 {
 	if (!sess || !sess->task)
 		return NULL;
-	return get_task_mm(sess->task);
+	return kh_get_task_mm(sess->task);
 }
 
 /*
@@ -220,23 +253,8 @@ static bool __read_mm(struct mm_struct *mm, uintptr_t addr, void __user *buffer,
 		pa = translate_linear_address(mm, addr);
 		if (!pa)
 		{
-			/* swap / 未映射: 尝试换入后重译 */
-			if (!fault_in_page(mm, addr))
-				break;
-			pa = translate_linear_address(mm, addr);
-			if (!pa)
-			{
-				/* 纯匿名未 fault 页: 返回零页内容 */
-				if (!find_vma(mm, addr))
-					break;
-				chunk = min(size, (size_t)(PAGE_SIZE - (addr & (PAGE_SIZE - 1))));
-				if (wind_clear_user(buffer, chunk) != 0)
-					break;
-				addr += chunk;
-				buffer += chunk;
-				size -= chunk;
-				continue;
-			}
+			/* 未映射 / swap 页: 不再换入 (辅助符号已移除), 直接失败 */
+			break;
 		}
 
 		chunk = min(size, (size_t)(PAGE_SIZE - (addr & (PAGE_SIZE - 1))));
@@ -259,13 +277,7 @@ static bool __write_mm(struct mm_struct *mm, uintptr_t addr, const void __user *
 
 		pa = translate_linear_address(mm, addr);
 		if (!pa)
-		{
-			if (!fault_in_page(mm, addr))
-				break;
-			pa = translate_linear_address(mm, addr);
-			if (!pa)
-				break;
-		}
+			break;
 
 		chunk = min(size, (size_t)(PAGE_SIZE - (addr & (PAGE_SIZE - 1))));
 		if (!write_physical_address(pa, buffer, chunk, mode))
@@ -288,7 +300,7 @@ bool read_process_memory(struct driver_session *sess, uintptr_t addr, void __use
 		return false;
 
 	result = __read_mm(mm, addr, buffer, size, sess->read_mode);
-	mmput(mm);
+	wind_mmput(mm);
 	return result;
 }
 
@@ -302,7 +314,7 @@ bool write_process_memory(struct driver_session *sess, uintptr_t addr, const voi
 		return false;
 
 	result = __write_mm(mm, addr, buffer, size, sess->read_mode);
-	mmput(mm);
+	wind_mmput(mm);
 	return result;
 }
 
@@ -327,7 +339,7 @@ long read_process_memory_batch(struct driver_session *sess, PBATCH_REQUEST req)
 			done++;
 	}
 
-	mmput(mm);
+	wind_mmput(mm);
 	return done;
 }
 
@@ -349,7 +361,7 @@ long write_process_memory_batch(struct driver_session *sess, PBATCH_REQUEST req)
 			done++;
 	}
 
-	mmput(mm);
+	wind_mmput(mm);
 	return done;
 }
 
@@ -370,7 +382,7 @@ int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
 		return -ESRCH;
 
 	if (sess->read_mode == MODE_SAFE) {
-		mmput(mm);
+		wind_mmput(mm);
 		/* 安全映射不缓存, 逐页 ioremap_nocache 语义, 通过缺页回调处理 */
 		return -EOPNOTSUPP;
 	}
@@ -383,13 +395,13 @@ int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
 		pa = translate_linear_address(mm, va);
 		if (!pa)
 			break;
-		if (remap_pfn_range(vma, off, __phys_to_pfn(pa), PAGE_SIZE, vma->vm_page_prot)) {
+		if (wind_remap_pfn_range(vma, off, __phys_to_pfn(pa), PAGE_SIZE, vma->vm_page_prot)) {
 			ret = -EAGAIN;
 			break;
 		}
 	}
 
-	mmput(mm);
+	wind_mmput(mm);
 	return (off > vma->vm_start) ? 0 : ret;
 }
 

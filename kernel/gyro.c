@@ -217,7 +217,7 @@ static unsigned long gyro_find_module_base(struct task_struct *task, const char 
 #endif
 	struct vm_area_struct *vma;
 
-	mm = get_task_mm(task);
+	mm = kh_get_task_mm(task);
 	if (!mm)
 		return 0;
 
@@ -242,7 +242,7 @@ static unsigned long gyro_find_module_base(struct task_struct *task, const char 
 		}
 	}
 	kh_mmap_read_unlock(mm);
-	mmput(mm);
+	wind_mmput(mm);
 	return base;
 }
 
