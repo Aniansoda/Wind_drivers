@@ -10,8 +10,8 @@
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
 
-/* contpte_ptep_get: arm64 6.12 contpte 机制的 PTE 读取 (ptep_get 展开引用) */
-typedef pte_t (*contpte_ptep_get_fn)(pte_t *);
+/* contpte_ptep_get: arm64 contpte 机制的 PTE 读取 (ptep_get 展开引用), 2 参数 (ptep, orig_pte) */
+typedef pte_t (*contpte_ptep_get_fn)(pte_t *, pte_t);
 static contpte_ptep_get_fn g_contpte_ptep_get = NULL;
 
 /* __arch_clear_user: clear_user 展开引用, 返回未清零的字节数 */
@@ -91,14 +91,23 @@ static unsigned long wind_kprobe_resolve(const char *name)
 }
 
 /*
- * 重写 ptep_get: 优先用 contpte_ptep_get (正确处理 PTE 保护位与 contpte),
- * 解析失败则回退 READ_ONCE 直读 (CONFIG_ARM64_CONTPE=n 时 ptep_get 即此语义)。
+ * 重写 ptep_get: 模拟内核 ptep_get 逻辑 —— 先 READ_ONCE 读原始 PTE,
+ * 若为 contpte (VALID|CONT 位) 且 contpte_ptep_get 已解析, 走 2 参数
+ * contpte_ptep_get(ptep, orig_pte); 否则直接返回原始 PTE。
+ * CONFIG_ARM64_CONTPE=n 时 ptep_get 即 __ptep_get 语义 (纯 READ_ONCE)。
  */
+static inline bool wind_pte_valid_cont(pte_t pte)
+{
+	return (pte_val(pte) & PTE_VALID) && (pte_val(pte) & PTE_CONT);
+}
+
 pte_t wind_ptep_get(pte_t *ptep)
 {
-	if (g_contpte_ptep_get)
-		return g_contpte_ptep_get(ptep);
-	return READ_ONCE(*ptep);
+	pte_t pte = READ_ONCE(*ptep);
+
+	if (g_contpte_ptep_get && wind_pte_valid_cont(pte))
+		return g_contpte_ptep_get(ptep, pte);
+	return pte;
 }
 
 /*
