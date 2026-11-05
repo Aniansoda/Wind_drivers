@@ -112,86 +112,27 @@ jobs:
       - name: Get Module.symvers
         run: |
           cd kernel-src
+          # 方案 G: 自编译 vmlinux.symvers (genksyms CRC), 再用 abi_symbollist 白名单过滤。
+          # genksyms CRC 由源码 C 声明决定, 与 LTO/CFI/编译器版本无关,
+          # 对白名单符号等于 GKI 冻结 CRC。
+          # 旧方案 (官方 .ko 的 __versions 提取) 不完整 —— 缺白名单内但官方
+          # prebuilt .ko 未实际引用的符号 (register_kprobe / file_path / mas_find 等),
+          # 导致 modpost 把这些白名单符号误报为 undefined。
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
+          test -s vmlinux.symvers
+          cp vmlinux.symvers /tmp/full.symvers
           if [ -n "${{ matrix.prebuild }}" ]; then
-            # GKI: 从官方 prebuilt .ko 提取冻结 KMI CRC (等价官方 Module.symvers)
+            # GKI: 从官方 prebuilt 获取 abi_symbollist 白名单 (每行一个符号名)
             git clone --depth 1 --branch "${{ matrix.prebuild_ref }}" \
               "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/prebuilts/${{ matrix.prebuild }}/arm64/" \
               /tmp/gki-prebuilt
-            # 内联提取脚本, 不依赖仓库根目录的 extract_symvers.py 是否被提交
-            cat > /tmp/extract_symvers.py <<'PY'
-          import struct, sys, os, glob
-
-          def extract_versions(ko_path):
-              try:
-                  d = open(ko_path, 'rb').read()
-              except OSError:
-                  return []
-              if len(d) < 64 or d[:4] != b'\x7fELF':
-                  return []
-              try:
-                  e_shoff = struct.unpack('<Q', d[0x28:0x30])[0]
-                  e_shentsize = struct.unpack('<H', d[0x3a:0x3c])[0]
-                  e_shnum = struct.unpack('<H', d[0x3c:0x3e])[0]
-                  e_shstrndx = struct.unpack('<H', d[0x3e:0x40])[0]
-              except struct.error:
-                  return []
-              if e_shnum == 0 or e_shoff + e_shnum * e_shentsize > len(d):
-                  return []
-              shs = [d[e_shoff + i * e_shentsize : e_shoff + (i + 1) * e_shentsize]
-                     for i in range(e_shnum)]
-              if e_shstrndx >= len(shs):
-                  return []
-              shstr = shs[e_shstrndx]
-              shstr_off = struct.unpack('<Q', shstr[0x18:0x20])[0]
-              shstr_size = struct.unpack('<Q', shstr[0x20:0x28])[0]
-              shstr = d[shstr_off:shstr_off + shstr_size]
-
-              def sname(o):
-                  e = shstr.index(b'\x00', o)
-                  return shstr[o:e].decode('utf-8', 'replace')
-
-              out = []
-              for sh in shs:
-                  if sname(struct.unpack('<I', sh[0:4])[0]) != '__versions':
-                      continue
-                  off = struct.unpack('<Q', sh[0x18:0x20])[0]
-                  sz = struct.unpack('<Q', sh[0x20:0x28])[0]
-                  sec = d[off:off + sz]
-                  pos = 0
-                  while pos + 8 <= len(sec):
-                      crc = struct.unpack('<I', sec[pos:pos + 4])[0]
-                      ns = pos + 8
-                      if ns >= len(sec):
-                          break
-                      end = sec.find(b'\x00', ns, min(ns + 56, len(sec)))
-                      if end == -1:
-                          end = min(ns + 56, len(sec))
-                      nm = sec[ns:end].decode('utf-8', 'replace')
-                      if nm and crc != 0 and all(32 <= ord(c) < 127 or c == '.' for c in nm):
-                          out.append((nm, crc))
-                      pos += 64
-                  return out
-              return []
-
-          prebuilt_dir = sys.argv[1]
-          out_path = sys.argv[2] if len(sys.argv) > 2 else 'Module.symvers'
-          kos = sorted(glob.glob(os.path.join(prebuilt_dir, '*.ko')))
-          print('[+] %d .ko files' % len(kos), file=sys.stderr)
-          symvers = {}
-          for ko in kos:
-              for name, crc in extract_versions(ko):
-                  symvers.setdefault(name, crc)
-          print('[+] %d unique symbols' % len(symvers), file=sys.stderr)
-          with open(out_path, 'w') as f:
-              for name, crc in sorted(symvers.items()):
-                  f.write('0x%08x\t%s\tvmlinux\tEXPORT_SYMBOL\t\n' % (crc, name))
-          print('[+] wrote %s' % out_path, file=sys.stderr)
-          PY
-            python3 /tmp/extract_symvers.py /tmp/gki-prebuilt ./Module.symvers
+            test -s /tmp/gki-prebuilt/abi_symbollist
+            # 只保留白名单符号的 CRC; 模块引用白名单外符号会在 modpost 暴露 undefined
+            awk 'NR==FNR { whitelist[$1]=1; next } ($2 in whitelist) { print }' \
+              /tmp/gki-prebuilt/abi_symbollist /tmp/full.symvers > Module.symvers
           else
-            # 主线: make modpost 生成 vmlinux.symvers
-            make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
-            cp vmlinux.symvers Module.symvers
+            # 主线: 不过滤
+            cp /tmp/full.symvers Module.symvers
           fi
           test -s Module.symvers
           wc -l Module.symvers
