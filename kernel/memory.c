@@ -13,7 +13,6 @@
 #include <linux/pagemap.h>
 #include <linux/mman.h>
 #include <linux/vmalloc.h>
-#include <linux/topology.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -43,7 +42,7 @@ static struct wind_phys_map wind_map_phys(phys_addr_t pa, size_t size)
 	int ret;
 
 	m.area = __get_vm_area_caller(size, VM_IOREMAP, VMALLOC_START, VMALLOC_END,
-				      NUMA_NO_NODE, __builtin_return_address(0));
+				      __builtin_return_address(0));
 	if (!m.area)
 		return m;
 	m.addr = m.area->addr;
