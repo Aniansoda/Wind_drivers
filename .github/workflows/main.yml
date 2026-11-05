@@ -12,32 +12,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: mainline-6.1
-            repo: gregkh/linux
-            ref: v6.1.112
-            config: defconfig
-            prebuild: ""
-            cc: ""
-            llvmver: ""
-          - name: mainline-6.6
-            repo: gregkh/linux
-            ref: v6.6.57
-            config: defconfig
-            prebuild: ""
-            cc: ""
-            llvmver: ""
+          - name: android14-6.1
+            repo: aosp-mirror/kernel_common
+            ref: android14-6.1
+            config: gki_defconfig
+            prebuild: "6.1"
+            prebuild_ref: "main"
+            cc: "LLVM=-17"
+            llvmver: "17"
+          - name: android15-6.6
+            repo: aosp-mirror/kernel_common
+            ref: android15-6.6
+            config: gki_defconfig
+            prebuild: "6.6"
+            prebuild_ref: "main"
+            cc: "LLVM=-18"
+            llvmver: "18"
           - name: android16-6.12
             repo: aosp-mirror/kernel_common
             ref: android16-6.12
             config: gki_defconfig
             prebuild: "6.12"
+            prebuild_ref: "main"
             cc: "LLVM=-19"
             llvmver: "19"
           - name: android17-6.18
             repo: aosp-mirror/kernel_common
             ref: android17-6.18
             config: gki_defconfig
-            prebuild: ""
+            prebuild: "6.18"
+            prebuild_ref: "android17-release"
             cc: "LLVM=-21"
             llvmver: "21"
 
@@ -110,7 +114,7 @@ jobs:
           cd kernel-src
           if [ -n "${{ matrix.prebuild }}" ]; then
             # GKI: 从官方 prebuilt .ko 提取冻结 KMI CRC (等价官方 Module.symvers)
-            git clone --depth 1 \
+            git clone --depth 1 --branch "${{ matrix.prebuild_ref }}" \
               "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/prebuilts/${{ matrix.prebuild }}/arm64/" \
               /tmp/gki-prebuilt
             # 内联提取脚本, 不依赖仓库根目录的 extract_symvers.py 是否被提交
