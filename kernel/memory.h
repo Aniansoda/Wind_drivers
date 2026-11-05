@@ -23,6 +23,9 @@ struct driver_session
 /* ---- 页表翻译 ---- */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
 
+/* ---- 内核镜像 rodata 写保护绕过 (set_memory_rw 不接受内核镜像地址) ---- */
+int wind_force_kernel_page_rw(unsigned long va, bool writable);
+
 /* ---- 物理读写 (模式自适应) ---- */
 bool read_physical_address(phys_addr_t pa, void __user *buffer, size_t size, int mode);
 bool write_physical_address(phys_addr_t pa, const void __user *buffer, size_t size, int mode);
