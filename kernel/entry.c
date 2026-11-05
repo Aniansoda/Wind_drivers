@@ -257,7 +257,7 @@ static int hook_install(void)
 	struct file *f;
 	int ret;
 
-	f = filp_open(HOOK_PATH, O_RDONLY, 0);
+	f = wind_filp_open(HOOK_PATH, O_RDONLY, 0);
 	if (IS_ERR(f)) {
 		ret = PTR_ERR(f);
 		printk(KERN_ERR "wind: filp_open %s failed %d\n", HOOK_PATH, ret);

@@ -26,6 +26,7 @@
 #include <linux/ptrace.h>
 #include <asm/ptrace.h>
 #include "breakpoint.h"
+#include "sym.h"
 
 struct brk_entry
 {
@@ -92,7 +93,7 @@ int brk_set(pid_t pid, uintptr_t addr, int type)
 		if (!task)
 			return -ESRCH;
 
-		slot->bp = register_user_hw_breakpoint(&attr, brk_triggered, NULL, task);
+		slot->bp = wind_register_user_hw_breakpoint(&attr, brk_triggered, NULL, task);
 	}
 	if (IS_ERR(slot->bp))
 		return PTR_ERR(slot->bp);
@@ -114,7 +115,7 @@ int brk_clear(pid_t pid, uintptr_t addr)
 		if (brk_slots[i].active && brk_slots[i].pid == pid &&
 		    brk_slots[i].addr == addr)
 		{
-			unregister_hw_breakpoint(brk_slots[i].bp);
+			wind_unregister_hw_breakpoint(brk_slots[i].bp);
 			memset(&brk_slots[i], 0, sizeof(brk_slots[i]));
 			return 0;
 		}

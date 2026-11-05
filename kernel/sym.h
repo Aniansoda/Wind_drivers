@@ -22,6 +22,19 @@
 
 struct mm_struct;
 struct vm_area_struct;
+struct vm_struct;
+struct file;
+struct perf_event;
+struct perf_event_attr;
+struct perf_sample_data;
+struct pt_regs;
+struct task_struct;
+
+/* 内核 perf_overflow_handler_t 定义在 linux/perf_event.h, 这里 forward 声明等价签名;
+ * sym.c 内部用内核真实类型接收, breakpoint.c/gyro.c 的回调函数签名一致可隐式转换。 */
+typedef void (*wind_perf_overflow_handler_t)(struct perf_event *,
+					     struct perf_sample_data *,
+					     struct pt_regs *);
 
 /* 重写的 arch 内联逻辑 */
 pte_t wind_ptep_get(pte_t *ptep);
@@ -36,6 +49,28 @@ void wind_mmput(struct mm_struct *mm);
 void wind_iounmap(volatile void __iomem *addr);
 int wind_remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 			 unsigned long pfn, unsigned long size, pgprot_t prot);
+
+/* vmap 三件套 (白名单外, 运行时解析) */
+void wind_free_vm_area(struct vm_struct *area);
+struct vm_struct *wind_get_vm_area_caller(unsigned long size, unsigned long flags,
+					  unsigned long start, unsigned long end,
+					  const void *caller);
+int wind_ioremap_page_range(unsigned long addr, unsigned long end,
+			    phys_addr_t phys_addr, pgprot_t prot);
+
+/* 文件操作 (白名单外, 运行时解析) */
+struct file *wind_filp_open(const char *filename, int flags, umode_t mode);
+ssize_t wind_kernel_read(struct file *file, void *buf, size_t count, loff_t *pos);
+
+/* 硬件断点 (白名单外, 运行时解析) */
+struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr,
+						    wind_perf_overflow_handler_t triggered,
+						    void *context, struct task_struct *tsk);
+void wind_unregister_hw_breakpoint(struct perf_event *bp);
+
+/* nofault 拷贝 (白名单外, 运行时解析) */
+long wind_copy_from_user_nofault(void *dst, const void __user *src, size_t size);
+long wind_copy_to_user_nofault(void __user *dst, const void *src, size_t size);
 
 int wind_sym_init(void);
 void wind_sym_exit(void);

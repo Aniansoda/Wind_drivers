@@ -69,13 +69,13 @@ static u32 gyro_rx, gyro_ry, gyro_rz; /* 目标角速度, float 位模式 (rad/s
 static bool gyro_read_mem(struct mm_struct *mm, uintptr_t va, void *buf, size_t size)
 {
 	(void)mm;
-	return copy_from_user_nofault(buf, (void __user *)va, size) == 0;
+	return wind_copy_from_user_nofault(buf, (void __user *)va, size) == 0;
 }
 
 static bool gyro_write_mem(struct mm_struct *mm, uintptr_t va, const void *buf, size_t size)
 {
 	(void)mm;
-	return copy_to_user_nofault((void __user *)va, buf, size) == 0;
+	return wind_copy_to_user_nofault((void __user *)va, buf, size) == 0;
 }
 
 /* ===================================================================
@@ -95,12 +95,12 @@ static int gyro_resolve_symbol(unsigned long *out_offset)
 	int ret = -ENOENT;
 	int i;
 
-	f = filp_open(GYRO_LIBSENSOR_PATH, O_RDONLY, 0);
+	f = wind_filp_open(GYRO_LIBSENSOR_PATH, O_RDONLY, 0);
 	if (IS_ERR(f))
 		return PTR_ERR(f);
 
 	pos = 0;
-	if (kernel_read(f, &ehdr, sizeof(ehdr), &pos) != sizeof(ehdr))
+	if (wind_kernel_read(f, &ehdr, sizeof(ehdr), &pos) != sizeof(ehdr))
 	{
 		ret = -EIO;
 		goto out;
@@ -119,7 +119,7 @@ static int gyro_resolve_symbol(unsigned long *out_offset)
 		goto out;
 	}
 	pos = ehdr.e_shoff;
-	if (kernel_read(f, shdrs, ehdr.e_shnum * ehdr.e_shentsize, &pos) !=
+	if (wind_kernel_read(f, shdrs, ehdr.e_shnum * ehdr.e_shentsize, &pos) !=
 	    (ssize_t)(ehdr.e_shnum * ehdr.e_shentsize))
 	{
 		ret = -EIO;
@@ -136,7 +136,7 @@ static int gyro_resolve_symbol(unsigned long *out_offset)
 			goto out;
 		}
 		pos = sh->sh_offset;
-		if (kernel_read(f, shstrtab, sh->sh_size, &pos) != (ssize_t)sh->sh_size)
+		if (wind_kernel_read(f, shstrtab, sh->sh_size, &pos) != (ssize_t)sh->sh_size)
 		{
 			ret = -EIO;
 			goto out;
@@ -172,13 +172,13 @@ static int gyro_resolve_symbol(unsigned long *out_offset)
 		goto out;
 	}
 	pos = dynstr_off;
-	if (kernel_read(f, dynstr, dynstr_size, &pos) != (ssize_t)dynstr_size)
+	if (wind_kernel_read(f, dynstr, dynstr_size, &pos) != (ssize_t)dynstr_size)
 	{
 		ret = -EIO;
 		goto out;
 	}
 	pos = dynsym_off;
-	if (kernel_read(f, dynsym, dynsym_size, &pos) != (ssize_t)dynsym_size)
+	if (wind_kernel_read(f, dynsym, dynsym_size, &pos) != (ssize_t)dynsym_size)
 	{
 		ret = -EIO;
 		goto out;
@@ -344,7 +344,7 @@ int gyro_install(pid_t pid)
 	attr.bp_len = HW_BREAKPOINT_LEN_8; /* arm64 执行断点 */
 	attr.bp_type = HW_BREAKPOINT_X;
 
-	gyro_bp = register_user_hw_breakpoint(&attr, gyro_breakpoint_handler, NULL, task);
+	gyro_bp = wind_register_user_hw_breakpoint(&attr, gyro_breakpoint_handler, NULL, task);
 	if (IS_ERR(gyro_bp))
 	{
 		ret = PTR_ERR(gyro_bp);
@@ -364,7 +364,7 @@ void gyro_remove(void)
 {
 	if (gyro_bp)
 	{
-		unregister_hw_breakpoint(gyro_bp);
+		wind_unregister_hw_breakpoint(gyro_bp);
 		gyro_bp = NULL;
 	}
 	gyro_active = false;

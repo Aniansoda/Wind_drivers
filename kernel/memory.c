@@ -41,16 +41,16 @@ static struct wind_phys_map wind_map_phys(phys_addr_t pa, size_t size)
 	unsigned long addr, end;
 	int ret;
 
-	m.area = __get_vm_area_caller(size, VM_IOREMAP, VMALLOC_START, VMALLOC_END,
-				      __builtin_return_address(0));
+	m.area = wind_get_vm_area_caller(size, VM_IOREMAP, VMALLOC_START, VMALLOC_END,
+					__builtin_return_address(0));
 	if (!m.area)
 		return m;
 	m.addr = m.area->addr;
 	addr = (unsigned long)m.addr;
 	end = addr + size;
-	ret = ioremap_page_range(addr, end, pa, PAGE_KERNEL);
+	ret = wind_ioremap_page_range(addr, end, pa, PAGE_KERNEL);
 	if (ret) {
-		free_vm_area(m.area);
+		wind_free_vm_area(m.area);
 		m.area = NULL;
 		m.addr = NULL;
 	}
@@ -61,7 +61,7 @@ static void wind_unmap_phys(struct wind_phys_map *m)
 {
 	if (!m || !m->area)
 		return;
-	free_vm_area(m->area);
+	wind_free_vm_area(m->area);
 	m->area = NULL;
 	m->addr = NULL;
 }
