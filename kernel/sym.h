@@ -61,6 +61,7 @@ int wind_ioremap_page_range(unsigned long addr, unsigned long end,
 /* 文件操作 (白名单外, 运行时解析) */
 struct file *wind_filp_open(const char *filename, int flags, umode_t mode);
 ssize_t wind_kernel_read(struct file *file, void *buf, size_t count, loff_t *pos);
+char *wind_file_path(struct file *filp, char *buf, int buflen);
 
 /* 硬件断点 (白名单外, 运行时解析) */
 struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr,

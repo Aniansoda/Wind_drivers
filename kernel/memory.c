@@ -26,8 +26,9 @@
  *
  * arm64 的 ioremap_cache 是 static inline, 展开后引用 ioremap_prot
  * (白名单外) 和 __phys_to_virt (引用 memstart_addr/physvirt_offset
- * 数据符号), 均不能在 GKI 下编译期引用。这里改用参考驱动验证的
- * 白名单符号 __get_vm_area_caller + ioremap_page_range + free_vm_area,
+ * 数据符号), 均不能在 GKI 下编译期引用。这里改用 vmap 三件套
+ * __get_vm_area_caller + ioremap_page_range + free_vm_area, 三者均
+ * 白名单外, 由 sym.c 经 register_kprobe 运行时取地址 (wind_* 包装)。
  * PAGE_KERNEL 为 normal cacheable (等价 ioremap_cache 的 PROT_NORMAL)。
  * =================================================================== */
 struct wind_phys_map {
@@ -135,8 +136,8 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 /* ===================================================================
  * 快速路径: vmap + copy (cacheable, 等价 phys_to_virt 直读)。
  * GKI 拿不到 memstart_addr, 无法重写 phys_to_virt, 改用 wind_map_phys
- * (__get_vm_area_caller + ioremap_page_range, PAGE_KERNEL cacheable)。
- * 进程上下文 (ioctl) 可睡眠, vmap 合法。
+ * (wind_get_vm_area_caller + wind_ioremap_page_range, PAGE_KERNEL cacheable,
+ * 运行时解析)。进程上下文 (ioctl) 可睡眠, vmap 合法。
  * =================================================================== */
 static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t size)
 {
