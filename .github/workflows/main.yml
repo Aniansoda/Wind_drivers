@@ -90,6 +90,7 @@ jobs:
             --disable CONFIG_DEBUG_INFO_BTF \
             --disable CONFIG_HEADERS_INSTALL \
             --disable CONFIG_GENDWARFKSYMS \
+            --disable CONFIG_MEM_ALLOC_PROFILING \
             || true
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
