@@ -32,4 +32,8 @@ void gyro_remove(void);
 void gyro_set_velocity(u32 rx, u32 ry, u32 rz);
 void gyro_set_enabled(bool enabled);
 
+/* 停止 / 恢复: 暂停或恢复篡改, 保留 hook 不卸载 (区别于 gyro_remove) */
+void gyro_stop(void);
+void gyro_resume(void);
+
 #endif /* _GYRO_H_ */

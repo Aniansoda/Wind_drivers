@@ -26,6 +26,18 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
 /* ---- 内核镜像 rodata 写保护绕过 (set_memory_rw 不接受内核镜像地址) ---- */
 int wind_force_kernel_page_rw(unsigned long va, bool writable);
 
+/* ---- 影子页操作 (直接改目标进程 PTE 权限位, 无痕断点) ----
+ * mask/val 为 pteval_t 位域 (PTE_UXN / PTE_PXN / PTE_RDONLY / PTE_VALID / PTE_AF)。
+ * 遍历目标 mm 页表定位 PTE, 按 (old & ~mask) | (val & mask) 改写后刷 TLB。
+ * get 返回当前 PTE 值, err 置 0/负 errno。
+ */
+int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, pteval_t val);
+pteval_t wind_shadow_pte_get(struct mm_struct *mm, unsigned long va, int *err);
+
+/* ---- 内核态跨进程读写 (非 __user, 供 BRK 断点改指令用) ---- */
+bool wind_read_process_va(struct mm_struct *mm, uintptr_t va, void *buf, size_t size);
+bool wind_write_process_va(struct mm_struct *mm, uintptr_t va, const void *buf, size_t size);
+
 /* ---- 物理读写 (模式自适应) ---- */
 bool read_physical_address(phys_addr_t pa, void __user *buffer, size_t size, int mode);
 bool write_physical_address(phys_addr_t pa, const void __user *buffer, size_t size, int mode);

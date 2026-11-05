@@ -13,6 +13,7 @@
 #include <linux/pagemap.h>
 #include <linux/mman.h>
 #include <linux/vmalloc.h>
+#include <linux/string.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -190,14 +191,183 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	else
 		val |= (pteval_t)PTE_RDONLY;
 
-	/* 直接写 PTE 值, 避免 set_pte 对 fixmap/用户页表的额外处理;
-	 * 先 dsb 保证写可见, 再按单地址刷 TLB, 不全刷 (全刷在 KPTI 下触发副作用) */
+	/* 直接写 PTE 值, 避免 set_pte 对 fixmap/用户页表的额外处理。
+	 * 刷 TLB 用 vaae1is + vale1is 单地址刷 leaf 与 walk cache:
+	 * - vmalle1is 全刷会破坏 KPTI 全局 TLB → 卡死重启
+	 * - 只刷 vae1is 不刷 walk cache → 残留旧只读项 → 写 rodata 时 fault 瞬间重启 */
 	WRITE_ONCE(*(pteval_t *)pte, val);
-	dsb(sy);
-	asm volatile("dsb ish\n\ttlbi vae1is, %0\n\tdsb ish\n\tisb\n" : : "r" (va) : "memory");
+	asm volatile("dsb ishst\n"
+		     "\ttlbi vaae1is, %0\n"
+		     "\ttlbi vale1is, %0\n"
+		     "\tdsb ish\n"
+		     "\tisb\n"
+		     : : "r" (va) : "memory");
 
 	wind_unmap_phys(&m);
 	return 0;
+}
+
+/* ===================================================================
+ * 影子页操作: 直接改目标进程页表中目标地址的 PTE 权限位。
+ * 与 wind_force_kernel_page_rw 同构, 但目标是传入的 mm (用户态地址,
+ * TTBR0), 且按 mask/val 位域改写 (UXN/PXN/RDONLY/VALID/AF 等)。
+ * flush 用 vaae1is 刷所有 ASID 的目标地址 (断点进程非 current 时也生效)。
+ * =================================================================== */
+static pte_t *wind_shadow_pte_locate(struct mm_struct *mm, unsigned long va,
+				     struct wind_phys_map *out_m)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	phys_addr_t pa;
+	struct wind_phys_map m;
+
+	va &= PAGE_MASK;
+
+	pgd = pgd_offset(mm, va);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return NULL;
+
+	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
+		return NULL;
+	pud = (pud_t *)m.addr + pud_index(va);
+	if (pud_none(*pud) || pud_bad(*pud)) {
+		wind_unmap_phys(&m);
+		return NULL;
+	}
+
+	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
+	wind_unmap_phys(&m);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
+		return NULL;
+	pmd = (pmd_t *)m.addr + pmd_index(va);
+	if (pmd_none(*pmd)) {
+		wind_unmap_phys(&m);
+		return NULL;
+	}
+
+	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
+	wind_unmap_phys(&m);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
+		return NULL;
+	pte = (pte_t *)m.addr + pte_index(va);
+
+	if (out_m)
+		*out_m = m;
+	return pte;
+}
+
+pteval_t wind_shadow_pte_get(struct mm_struct *mm, unsigned long va, int *err)
+{
+	struct wind_phys_map m = { .area = NULL, .addr = NULL };
+	pte_t *pte;
+	pteval_t val = 0;
+
+	if (err)
+		*err = -EINVAL;
+	if (!mm)
+		return 0;
+
+	pte = wind_shadow_pte_locate(mm, va, &m);
+	if (!pte)
+		return 0;
+
+	val = pte_val(wind_ptep_get(pte));
+	wind_unmap_phys(&m);
+	if (err)
+		*err = 0;
+	return val;
+}
+
+int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, pteval_t val)
+{
+	struct wind_phys_map m = { .area = NULL, .addr = NULL };
+	pte_t *pte;
+	pteval_t old, new;
+
+	if (!mm)
+		return -EINVAL;
+
+	pte = wind_shadow_pte_locate(mm, va, &m);
+	if (!pte)
+		return -EINVAL;
+
+	old = pte_val(wind_ptep_get(pte));
+	new = (old & ~mask) | (val & mask);
+
+	/* 直接写 PTE 值, 写后单地址刷 leaf + walk cache (同 wind_force_kernel_page_rw) */
+	WRITE_ONCE(*(pteval_t *)pte, new);
+	asm volatile("dsb ishst\n"
+		     "\ttlbi vaae1is, %0\n"
+		     "\ttlbi vale1is, %0\n"
+		     "\tdsb ish\n"
+		     "\tisb\n"
+		     : : "r" (va & PAGE_MASK) : "memory");
+
+	wind_unmap_phys(&m);
+	return 0;
+}
+
+/* ===================================================================
+ * 内核态跨进程读写 (非 __user buffer)。按页翻译物理地址, vmap 后
+ * memcpy。BRK 软断点改目标进程指令字节用。
+ * =================================================================== */
+static bool wind_process_va_xfer(struct mm_struct *mm, uintptr_t va,
+				 void *buf, size_t size, bool write)
+{
+	uintptr_t cur = va;
+	char *b = buf;
+	size_t left = size;
+
+	while (left)
+	{
+		phys_addr_t pa;
+		size_t off, chunk;
+		struct wind_phys_map m;
+
+		pa = translate_linear_address(mm, cur);
+		if (!pa)
+			return false;
+
+		off = cur & (PAGE_SIZE - 1);
+		chunk = PAGE_SIZE - off;
+		if (chunk > left)
+			chunk = left;
+
+		m = wind_map_phys(pa, PAGE_SIZE);
+		if (!m.addr)
+			return false;
+
+		if (write)
+			memcpy((char *)m.addr + off, b, chunk);
+		else
+			memcpy(b, (char *)m.addr + off, chunk);
+
+		wind_unmap_phys(&m);
+		b += chunk;
+		cur += chunk;
+		left -= chunk;
+	}
+	return true;
+}
+
+bool wind_read_process_va(struct mm_struct *mm, uintptr_t va, void *buf, size_t size)
+{
+	if (!mm || !buf)
+		return false;
+	return wind_process_va_xfer(mm, va, buf, size, false);
+}
+
+bool wind_write_process_va(struct mm_struct *mm, uintptr_t va, const void *buf, size_t size)
+{
+	if (!mm || !buf)
+		return false;
+	return wind_process_va_xfer(mm, va, (void *)buf, size, true);
 }
 
 /* ===================================================================

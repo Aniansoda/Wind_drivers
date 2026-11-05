@@ -384,3 +384,13 @@ void gyro_set_enabled(bool enabled)
 {
 	gyro_enabled = enabled;
 }
+
+void gyro_stop(void)
+{
+	gyro_enabled = false;
+}
+
+void gyro_resume(void)
+{
+	gyro_enabled = true;
+}

@@ -34,6 +34,42 @@ enum OPERATIONS
 	OP_GYRO_REMOVE  = WIND_OP_BASE + 0x11, /* 卸载陀螺仪 hook */
 	OP_GYRO_SET     = WIND_OP_BASE + 0x12, /* 设置目标角速度 (rad/s) */
 	OP_GYRO_ENABLE  = WIND_OP_BASE + 0x13, /* 开关陀螺仪篡改 */
+
+	/* ---- 硬件断点 (BRP/WRP debug 寄存器, 最多 16 点) ---- */
+	OP_HWBP_SET          = WIND_OP_BASE + 0x14, /* 设置断点/观察点组 */
+	OP_HWBP_REMOVE       = WIND_OP_BASE + 0x15, /* 清除全部并清理 debug 寄存器 */
+	OP_HWBP_GET_CONFIG   = WIND_OP_BASE + 0x16, /* 读当前配置 + BRP/WRP 数量 */
+	OP_HWBP_GET_RECORDS  = WIND_OP_BASE + 0x17, /* 分段读触发 PC 聚合记录 */
+	OP_HWBP_SET_RECORD   = WIND_OP_BASE + 0x18, /* 写回记录 + 2-bit 寄存器掩码 */
+	OP_HWBP_CLEAR_RECORDS= WIND_OP_BASE + 0x19, /* 清空点位记录 (-1 全部) */
+
+	/* ---- PTE 执行断点 (改 PTE 触发 fault, 最多 16 点, 不用 debug 寄存器) ---- */
+	OP_PTEBP_SET          = WIND_OP_BASE + 0x1A,
+	OP_PTEBP_REMOVE       = WIND_OP_BASE + 0x1B,
+	OP_PTEBP_GET_CONFIG   = WIND_OP_BASE + 0x1C,
+	OP_PTEBP_GET_RECORDS  = WIND_OP_BASE + 0x1D,
+	OP_PTEBP_SET_RECORD   = WIND_OP_BASE + 0x1E,
+	OP_PTEBP_CLEAR_RECORDS= WIND_OP_BASE + 0x1F,
+
+	/* ---- BRK 软断点 (改写目标指令为 BRK, hook 异常) ---- */
+	OP_BRKBP_SET          = WIND_OP_BASE + 0x20,
+	OP_BRKBP_REMOVE       = WIND_OP_BASE + 0x21,
+	OP_BRKBP_GET_CONFIG   = WIND_OP_BASE + 0x22,
+	OP_BRKBP_GET_RECORDS  = WIND_OP_BASE + 0x23,
+	OP_BRKBP_SET_RECORD   = WIND_OP_BASE + 0x24,
+	OP_BRKBP_CLEAR_RECORDS= WIND_OP_BASE + 0x25,
+
+	/* ---- ETM/PTM 分支追踪断点 (Coresight, 硬件级执行流观测) ---- */
+	OP_ETMBP_SET          = WIND_OP_BASE + 0x26,
+	OP_ETMBP_REMOVE       = WIND_OP_BASE + 0x27,
+	OP_ETMBP_GET_CONFIG   = WIND_OP_BASE + 0x28,
+	OP_ETMBP_GET_RECORDS  = WIND_OP_BASE + 0x29,
+	OP_ETMBP_SET_RECORD   = WIND_OP_BASE + 0x2A,
+	OP_ETMBP_CLEAR_RECORDS= WIND_OP_BASE + 0x2B,
+
+	/* ---- 陀螺仪停止/恢复 (暂停/恢复篡改, 保留 hook) ---- */
+	OP_GYRO_STOP         = WIND_OP_BASE + 0x2C,
+	OP_GYRO_RESUME       = WIND_OP_BASE + 0x2D,
 };
 
 /* ---- 读取模式 ---- */
@@ -89,13 +125,268 @@ typedef struct _MODE_REQUEST
 	uint32_t mode;  /* MODE_FAST / MODE_SAFE */
 } MODE_REQUEST, *PMODE_REQUEST;
 
-/* ---- 硬件断点 ---- */
+/* ---- 硬件断点 (兼容旧 brk) ---- */
 typedef struct _BRK_REQUEST
 {
 	pid_t pid;
 	uintptr_t addr;
 	uint32_t type;  /* HW_BREAKPOINT_X / _R / _W / _RW */
 } BRK_REQUEST, *PBRK_REQUEST;
+
+/* ---- 断点通用类型 / 长度 ---- */
+enum BP_TYPE
+{
+	BP_TYPE_EXEC  = 1, /* 执行 (BRP) */
+	BP_TYPE_READ  = 2, /* 读观察 (WRP) */
+	BP_TYPE_WRITE = 3, /* 写观察 (WRP) */
+	BP_TYPE_RW    = 4, /* 读写观察 (WRP) */
+};
+
+enum BP_LEN
+{
+	BP_LEN_1 = 1,
+	BP_LEN_2 = 2,
+	BP_LEN_4 = 4,
+	BP_LEN_8 = 8,
+};
+
+/*
+ * ---- 硬件断点 (BRP/WRP debug 寄存器) ----
+ * 底层走 perf hw_breakpoint。执行断点占 BRP, 读写观察点占 WRP。
+ * 单点触发记录, 每条记录带 2-bit 寄存器操作掩码 (op_mask)。
+ */
+typedef struct _HWBP_POINT_CONFIG
+{
+	uint64_t addr;    /* 目标虚拟地址 */
+	uint32_t type;    /* BP_TYPE_* */
+	uint32_t length;  /* BP_LEN_* (执行断点恒 4 或 8) */
+} HWBP_POINT_CONFIG, *PHWBP_POINT_CONFIG;
+
+typedef struct _HWBP_CONFIG
+{
+	uint32_t num_brps;      /* 硬件支持断点寄存器数 */
+	uint32_t num_wrps;      /* 硬件支持观察点寄存器数 */
+	uint32_t active_count;  /* 当前启用点数 */
+	uint32_t reserved;
+} HWBP_CONFIG, *PHWBP_CONFIG;
+
+typedef struct _HWBP_RECORD
+{
+	uint64_t trigger_pc; /* 命中时 PC */
+	uint64_t hit_addr;   /* 命中地址 */
+	uint32_t op_mask;    /* 2-bit 寄存器操作掩码 (bit0=读, bit1=写) */
+	uint32_t reserved;
+} HWBP_RECORD, *PHWBP_RECORD;
+
+/* 设置请求: 头部 + 变长 points 数组 */
+typedef struct _HWBP_SET_REQUEST
+{
+	uint32_t point_count;
+	uint32_t reserved;
+	HWBP_POINT_CONFIG points[]; /* 变长 */
+} HWBP_SET_REQUEST, *PHWBP_SET_REQUEST;
+
+/* 记录读取请求: 内核回填 records + count_out */
+typedef struct _HWBP_RECORDS_REQUEST
+{
+	uint32_t point_index; /* 目标点位 */
+	uint32_t start_index; /* 起始记录下标 */
+	uint32_t capacity;    /* records 数组容量 */
+	uint32_t reserved;
+	HWBP_RECORD *records; /* 用户态数组指针 */
+	uint32_t *count_out;  /* 用户态实际条数输出指针 */
+} HWBP_RECORDS_REQUEST, *PHWBP_RECORDS_REQUEST;
+
+/* 单条记录写回 */
+typedef struct _HWBP_RECORD_REQUEST
+{
+	uint32_t point_index;
+	uint32_t record_index;
+	uint32_t reserved;
+	HWBP_RECORD record;
+} HWBP_RECORD_REQUEST, *PHWBP_RECORD_REQUEST;
+
+/* 清空记录请求: point_index = -1 清全部 */
+typedef struct _HWBP_CLEAR_REQUEST
+{
+	int32_t point_index;
+	uint32_t reserved;
+} HWBP_CLEAR_REQUEST, *PHWBP_CLEAR_REQUEST;
+
+/*
+ * ---- PTE 执行断点 ----
+ * 改目标页 PTE 清 PTE_AF (access flag) 触发 fault, 在 fault handler
+ * 识别命中并记录 PC, 再恢复 AF + 单步跳过。不用 debug 寄存器, 隐藏性更高。
+ */
+typedef struct _PTEBP_POINT_CONFIG
+{
+	uint64_t addr;    /* 目标虚拟地址 */
+	uint32_t type;    /* 恒 BP_TYPE_EXEC */
+	uint32_t length;  /* 恒 4 */
+} PTEBP_POINT_CONFIG, *PPTEBP_POINT_CONFIG;
+
+typedef struct _PTEBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t reserved;
+	/* num_brps / num_wrps 恒 0 (PTE 断点不占 debug 寄存器) */
+} PTEBP_CONFIG, *PPTEBP_CONFIG;
+
+typedef struct _PTEBP_RECORD
+{
+	uint64_t trigger_pc;
+	uint64_t hit_addr;
+	uint32_t op_mask;
+	uint32_t reserved;
+} PTEBP_RECORD, *PPTEBP_RECORD;
+
+typedef struct _PTEBP_SET_REQUEST
+{
+	uint32_t point_count;
+	uint32_t reserved;
+	PTEBP_POINT_CONFIG points[];
+} PTEBP_SET_REQUEST, *PPTEBP_SET_REQUEST;
+
+typedef struct _PTEBP_RECORDS_REQUEST
+{
+	uint32_t point_index;
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	PTEBP_RECORD *records;
+	uint32_t *count_out;
+} PTEBP_RECORDS_REQUEST, *PPTEBP_RECORDS_REQUEST;
+
+typedef struct _PTEBP_RECORD_REQUEST
+{
+	uint32_t point_index;
+	uint32_t record_index;
+	uint32_t reserved;
+	PTEBP_RECORD record;
+} PTEBP_RECORD_REQUEST, *PPTEBP_RECORD_REQUEST;
+
+typedef struct _PTEBP_CLEAR_REQUEST
+{
+	int32_t point_index;
+	uint32_t reserved;
+} PTEBP_CLEAR_REQUEST, *PPTEBP_CLEAR_REQUEST;
+
+/*
+ * ---- BRK 软断点 ----
+ * 目标地址原指令暂存后改写为 BRK #imm, 触发 brk 异常, 在 handler 识别命中。
+ * 数量无限, 但会改代码字节, 可被完整性校验检测。
+ */
+typedef struct _BRKBP_POINT_CONFIG
+{
+	uint64_t addr;
+	uint32_t type;    /* 恒 BP_TYPE_EXEC */
+	uint32_t length;  /* 恒 4 */
+} BRKBP_POINT_CONFIG, *PBRKBP_POINT_CONFIG;
+
+typedef struct _BRKBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t reserved;
+} BRKBP_CONFIG, *PBRKBP_CONFIG;
+
+typedef struct _BRKBP_RECORD
+{
+	uint64_t trigger_pc;
+	uint64_t hit_addr;
+	uint32_t op_mask;
+	uint32_t reserved;
+} BRKBP_RECORD, *PBRKBP_RECORD;
+
+typedef struct _BRKBP_SET_REQUEST
+{
+	uint32_t point_count;
+	uint32_t reserved;
+	BRKBP_POINT_CONFIG points[];
+} BRKBP_SET_REQUEST, *PBRKBP_SET_REQUEST;
+
+typedef struct _BRKBP_RECORDS_REQUEST
+{
+	uint32_t point_index;
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	BRKBP_RECORD *records;
+	uint32_t *count_out;
+} BRKBP_RECORDS_REQUEST, *PBRKBP_RECORDS_REQUEST;
+
+typedef struct _BRKBP_RECORD_REQUEST
+{
+	uint32_t point_index;
+	uint32_t record_index;
+	uint32_t reserved;
+	BRKBP_RECORD record;
+} BRKBP_RECORD_REQUEST, *PBRKBP_RECORD_REQUEST;
+
+typedef struct _BRKBP_CLEAR_REQUEST
+{
+	int32_t point_index;
+	uint32_t reserved;
+} BRKBP_CLEAR_REQUEST, *PBRKBP_CLEAR_REQUEST;
+
+/*
+ * ---- ETM/PTM 分支追踪断点 ----
+ * 通过 Coresight ETM 硬件追踪执行流 (分支/指令), 不改 debug 寄存器、
+ * 不改代码、不改页表, 纯被动观测, 隐藏性最高。
+ * 地址过滤: 只在 [start,end) 区间内记录执行流。
+ */
+typedef struct _ETMBP_POINT_CONFIG
+{
+	uint64_t start;   /* 追踪区间起始地址 */
+	uint64_t end;     /* 追踪区间结束地址 (开区间) */
+	uint32_t flags;   /* 0=分支追踪 1=指令追踪 */
+	uint32_t reserved;
+} ETMBP_POINT_CONFIG, *PETMBP_POINT_CONFIG;
+
+typedef struct _ETMBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t trace_id;   /* 本 trace 会话 ID (sink 关联) */
+	uint32_t reserved;
+} ETMBP_CONFIG, *PETMBP_CONFIG;
+
+typedef struct _ETMBP_RECORD
+{
+	uint64_t addr;       /* 追踪到的地址 (分支源/目标) */
+	uint64_t timestamp;  /* 相对时间戳 */
+	uint32_t flags;      /* bit0=分支 1=异常 2=返回 */
+	uint32_t reserved;
+} ETMBP_RECORD, *PETMBP_RECORD;
+
+typedef struct _ETMBP_SET_REQUEST
+{
+	uint32_t point_count;
+	uint32_t reserved;
+	ETMBP_POINT_CONFIG points[];
+} ETMBP_SET_REQUEST, *PETMBP_SET_REQUEST;
+
+typedef struct _ETMBP_RECORDS_REQUEST
+{
+	uint32_t point_index;
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	ETMBP_RECORD *records;
+	uint32_t *count_out;
+} ETMBP_RECORDS_REQUEST, *PETMBP_RECORDS_REQUEST;
+
+typedef struct _ETMBP_RECORD_REQUEST
+{
+	uint32_t point_index;
+	uint32_t record_index;
+	uint32_t reserved;
+	ETMBP_RECORD record;
+} ETMBP_RECORD_REQUEST, *PETMBP_RECORD_REQUEST;
+
+typedef struct _ETMBP_CLEAR_REQUEST
+{
+	int32_t point_index;
+	uint32_t reserved;
+} ETMBP_CLEAR_REQUEST, *PETMBP_CLEAR_REQUEST;
 
 /* ---- 陀螺仪 ---- */
 typedef struct _GYRO_REQUEST
