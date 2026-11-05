@@ -5,6 +5,14 @@
 #include "comm.h"
 
 struct driver_session;
+struct kprobe;
+struct pt_regs;
+
+/* 异常/fault handler kprobe hook (见 sym.c 实现, 白名单外符号运行时注册) */
+struct kprobe *wind_kprobe_register_symbol(const char *name,
+					  int (*pre)(struct kprobe *, struct pt_regs *),
+					  void (*post)(struct kprobe *, struct pt_regs *, unsigned long));
+void wind_kprobe_unregister_symbol(struct kprobe *kp);
 
 /* ---- 旧 brk (perf hw_breakpoint, 单点, 兼容) ---- */
 int brk_set(pid_t pid, uintptr_t addr, int type);

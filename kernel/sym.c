@@ -3,6 +3,7 @@
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/vmalloc.h>
@@ -90,6 +91,35 @@ static unsigned long wind_kprobe_resolve(const char *name)
 	addr = (unsigned long)kp.addr;
 	unregister_kprobe(&kp);
 	return addr;
+}
+
+/* 按符号名注册 kprobe hook, 供影子页/BRK 断点捕获 fault/异常。
+ * 符号受 NOKPROBE 保护时 register_kprobe 失败, 返回 NULL。 */
+struct kprobe *wind_kprobe_register_symbol(const char *name,
+					  int (*pre)(struct kprobe *, struct pt_regs *),
+					  void (*post)(struct kprobe *, struct pt_regs *, unsigned long))
+{
+	struct kprobe *kp;
+
+	kp = kzalloc(sizeof(*kp), GFP_KERNEL);
+	if (!kp)
+		return NULL;
+	kp->symbol_name = name;
+	kp->pre_handler = pre;
+	kp->post_handler = post;
+	if (register_kprobe(kp) < 0) {
+		kfree(kp);
+		return NULL;
+	}
+	return kp;
+}
+
+void wind_kprobe_unregister_symbol(struct kprobe *kp)
+{
+	if (!kp)
+		return;
+	unregister_kprobe(kp);
+	kfree(kp);
 }
 
 /*

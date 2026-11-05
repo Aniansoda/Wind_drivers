@@ -29,6 +29,7 @@ struct perf_event_attr;
 struct perf_sample_data;
 struct pt_regs;
 struct task_struct;
+struct kprobe;
 
 /* 内核 perf_overflow_handler_t 定义在 linux/perf_event.h, 这里 forward 声明等价签名;
  * sym.c 内部用内核真实类型接收, breakpoint.c/gyro.c 的回调函数签名一致可隐式转换。 */
@@ -72,6 +73,16 @@ void wind_unregister_hw_breakpoint(struct perf_event *bp);
 /* nofault 拷贝 (白名单外, 运行时解析) */
 long wind_copy_from_user_nofault(void *dst, const void __user *src, size_t size);
 long wind_copy_to_user_nofault(void __user *dst, const void *src, size_t size);
+
+/* 异常/fault handler kprobe hook (白名单外符号, 运行时注册)。
+ * 用于影子页断点捕获 fault / BRK 断点捕获异常。
+ * 注意: arm64 的 do_mem_abort / do_page_fault / brk_handler 等可能受
+ * NOKPROBE 保护, register_kprobe 会失败 (返回 NULL), 调用方需处理降级。
+ */
+struct kprobe *wind_kprobe_register_symbol(const char *name,
+					  int (*pre)(struct kprobe *, struct pt_regs *),
+					  void (*post)(struct kprobe *, struct pt_regs *, unsigned long));
+void wind_kprobe_unregister_symbol(struct kprobe *kp);
 
 int wind_sym_init(void);
 void wind_sym_exit(void);
