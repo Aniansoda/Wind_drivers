@@ -232,9 +232,9 @@ static unsigned long gyro_find_module_base(struct task_struct *task, const char 
 		if (vma->vm_file)
 		{
 			char buf[256];
-			char *p = file_path(vma->vm_file, buf, sizeof(buf) - 1);
+			char *p = wind_file_path(vma->vm_file, buf, sizeof(buf) - 1);
 
-			if (!strcmp(kbasename(p), name))
+			if (!IS_ERR(p) && !strcmp(kbasename(p), name))
 			{
 				base = vma->vm_start;
 				break;

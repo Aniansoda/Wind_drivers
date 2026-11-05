@@ -43,8 +43,8 @@ uintptr_t get_module_base(struct driver_session *sess, char *name)
 
 		if (vma->vm_file)
 		{
-			path_nm = file_path(vma->vm_file, buf, ARC_PATH_MAX - 1);
-			if (!strcmp(kbasename(path_nm), name))
+			path_nm = wind_file_path(vma->vm_file, buf, ARC_PATH_MAX - 1);
+			if (!IS_ERR(path_nm) && !strcmp(kbasename(path_nm), name))
 			{
 				base_addr = vma->vm_start;
 				break;

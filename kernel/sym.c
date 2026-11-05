@@ -50,8 +50,10 @@ static ioremap_page_range_fn g_ioremap_page_range = NULL;
 /* 文件操作 (白名单外) */
 typedef struct file *(*filp_open_fn)(const char *, int, umode_t);
 typedef ssize_t (*kernel_read_fn)(struct file *, void *, size_t, loff_t *);
+typedef char *(*file_path_fn)(struct file *, char *, int);
 static filp_open_fn g_filp_open = NULL;
 static kernel_read_fn g_kernel_read = NULL;
+static file_path_fn g_file_path = NULL;
 
 /* 硬件断点 (白名单外) */
 typedef struct perf_event *(*register_user_hw_breakpoint_fn)(struct perf_event_attr *,
@@ -201,6 +203,13 @@ ssize_t wind_kernel_read(struct file *file, void *buf, size_t count, loff_t *pos
 	return g_kernel_read(file, buf, count, pos);
 }
 
+char *wind_file_path(struct file *filp, char *buf, int buflen)
+{
+	if (!g_file_path)
+		return ERR_PTR(-EOPNOTSUPP);
+	return g_file_path(filp, buf, buflen);
+}
+
 struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr,
 						    wind_perf_overflow_handler_t triggered,
 						    void *context, struct task_struct *tsk)
@@ -245,14 +254,15 @@ int wind_sym_init(void)
 	g_ioremap_page_range = (ioremap_page_range_fn)wind_kprobe_resolve("ioremap_page_range");
 	g_filp_open = (filp_open_fn)wind_kprobe_resolve("filp_open");
 	g_kernel_read = (kernel_read_fn)wind_kprobe_resolve("kernel_read");
+	g_file_path = (file_path_fn)wind_kprobe_resolve("file_path");
 	g_register_user_hw_breakpoint = (register_user_hw_breakpoint_fn)wind_kprobe_resolve("register_user_hw_breakpoint");
 	g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)wind_kprobe_resolve("unregister_hw_breakpoint");
 	g_copy_from_user_nofault = (copy_from_user_nofault_fn)wind_kprobe_resolve("copy_from_user_nofault");
 	g_copy_to_user_nofault = (copy_to_user_nofault_fn)wind_kprobe_resolve("copy_to_user_nofault");
 
-	pr_info("wind: sym vmap=%px/%px/%px filp=%px kread=%px hwbp=%px/%px nofault=%px/%px\n",
+	pr_info("wind: sym vmap=%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px\n",
 		(void *)g_free_vm_area, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
-		(void *)g_filp_open, (void *)g_kernel_read,
+		(void *)g_filp_open, (void *)g_kernel_read, (void *)g_file_path,
 		(void *)g_register_user_hw_breakpoint, (void *)g_unregister_hw_breakpoint,
 		(void *)g_copy_from_user_nofault, (void *)g_copy_to_user_nofault);
 
@@ -273,6 +283,7 @@ void wind_sym_exit(void)
 	g_ioremap_page_range = NULL;
 	g_filp_open = NULL;
 	g_kernel_read = NULL;
+	g_file_path = NULL;
 	g_register_user_hw_breakpoint = NULL;
 	g_unregister_hw_breakpoint = NULL;
 	g_copy_from_user_nofault = NULL;
