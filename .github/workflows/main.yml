@@ -86,9 +86,6 @@ jobs:
             --enable CONFIG_PERF_EVENTS \
             --enable CONFIG_HW_BREAKPOINT \
             --enable CONFIG_MISC_DEVICES \
-            --disable CONFIG_LTO_CLANG \
-            --disable CONFIG_LTO_CLANG_THIN \
-            --disable CONFIG_CFI_CLANG \
             --disable CONFIG_AUTOFDO_CLANG \
             --disable CONFIG_DEBUG_INFO_BTF \
             --disable CONFIG_HEADERS_INSTALL \
