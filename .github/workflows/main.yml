@@ -22,7 +22,7 @@ jobs:
             llvmver: "17"
           - name: android15-6.6
             repo: aosp-mirror/kernel_common
-            ref: android15-6.6.118_r1
+            ref: android15-6.6.66_r00
             config: gki_defconfig
             prebuild: "6.6"
             prebuild_ref: "main"
@@ -87,7 +87,8 @@ jobs:
             --enable CONFIG_HW_BREAKPOINT \
             --enable CONFIG_MISC_DEVICES \
             --disable CONFIG_AUTOFDO_CLANG \
-            --disable CONFIG_DEBUG_INFO_BTF \
+            --enable CONFIG_DEBUG_INFO_BTF \
+            --enable CONFIG_DEBUG_INFO_BTF_MODULES \
             --disable CONFIG_HEADERS_INSTALL \
             --disable CONFIG_GENDWARFKSYMS \
             --disable CONFIG_MEM_ALLOC_PROFILING \
