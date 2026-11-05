@@ -135,6 +135,16 @@ jobs:
           test -s Module.symvers
           wc -l Module.symvers
 
+      - name: Verify config & module_layout CRC
+        run: |
+          cd kernel-src
+          echo "== CFI/LTO 状态 (必须 CFI_CLANG=y) =="
+          grep -E "CONFIG_CFI_CLANG|CONFIG_LTO_CLANG|CONFIG_LTO_CLANG_THIN" .config || echo "!! CFI/LTO 未启用"
+          echo "== module_layout 在 Module.symvers 里的 CRC =="
+          grep -E "module_layout" Module.symvers || echo "!! module_layout 不在 Module.symvers"
+          echo "== module_layout 是否在白名单 =="
+          grep -c '^module_layout$' /tmp/gki-prebuilt/abi_symbollist || echo "!! 不在 abi_symbollist"
+
       - name: Build wind module
         run: |
           mkdir -p kernel-src/drivers/wind
