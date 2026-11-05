@@ -189,12 +189,14 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 		val &= ~(pteval_t)PTE_RDONLY;
 	else
 		val |= (pteval_t)PTE_RDONLY;
-	set_pte(pte, __pte(val));
+
+	/* 直接写 PTE 值, 避免 set_pte 对 fixmap/用户页表的额外处理;
+	 * 先 dsb 保证写可见, 再按单地址刷 TLB, 不全刷 (全刷在 KPTI 下触发副作用) */
+	WRITE_ONCE(*(pteval_t *)pte, val);
+	dsb(sy);
+	asm volatile("dsb ish\n\ttlbi vae1is, %0\n\tdsb ish\n\tisb\n" : : "r" (va) : "memory");
+
 	wind_unmap_phys(&m);
-
-	/* 刷全部内核 TLB (模块加载只执行一次, 保守最稳) */
-	asm volatile("dsb ish\n\ttlbi vmalle1is\n\tdsb ish\n\tisb\n" ::: "memory");
-
 	return 0;
 }
 
