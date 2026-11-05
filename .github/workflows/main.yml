@@ -22,7 +22,7 @@ jobs:
             llvmver: "17"
           - name: android15-6.6
             repo: aosp-mirror/kernel_common
-            ref: android15-6.6
+            ref: android15-6.6.118_r1
             config: gki_defconfig
             prebuild: "6.6"
             prebuild_ref: "main"
