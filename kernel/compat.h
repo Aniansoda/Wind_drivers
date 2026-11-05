@@ -116,4 +116,15 @@ static inline void kh_dcache_clean_inval_poc(void *addr, size_t size)
 
 #define kh_flush_dcache(addr, size) kh_dcache_clean_inval_poc((addr), (size))
 
+/* ---- arm64_use_ng_mappings 白名单外数据符号桩 ----
+ * 6.1 的 __va/__phys_to_virt 旧路径经页表宏展开引用它 (kpti ng 映射开关),
+ * 是数据符号且不在 GKI 冻结白名单, 直接引用会导致模块加载 ENOEXEC。
+ * 本驱动只做页表遍历取物理地址, 不依赖 ng 映射判断, 这里重定向为常量 false
+ * 消除符号引用。6.6 起该符号已从 __va 路径移除, 6.12 起彻底删除, 此桩无副作用。
+ */
+#ifdef arm64_use_ng_mappings
+#undef arm64_use_ng_mappings
+#endif
+#define arm64_use_ng_mappings false
+
 #endif /* _KH_COMPAT_H_ */
