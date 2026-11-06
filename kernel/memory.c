@@ -141,6 +141,24 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
  * (null_fops 所在段) 返回 -EINVAL。这里走当前 mm 的内核段页表
  * (swapper_pg_dir 共享), 直接清/置 PTE_RDONLY 后 flush TLB。
  * =================================================================== */
+/* 单地址刷 leaf + walk cache。全刷 vmalle1is 破坏 KPTI 全局 TLB; 只刷
+ * vae1is 漏 walk cache 残留旧只读项。 */
+static inline void wind_flush_tlb_va(unsigned long va)
+{
+	asm volatile("dsb ishst\n"
+		     "\ttlbi vaae1is, %0\n"
+		     "\ttlbi vale1is, %0\n"
+		     "\tdsb ish\n"
+		     "\tisb\n"
+		     : : "r" (va) : "memory");
+}
+
+/* ===================================================================
+ * 内核镜像 rodata 写保护绕过。
+ * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
+ * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
+ * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
+ * =================================================================== */
 int wind_force_kernel_page_rw(unsigned long va, bool writable)
 {
 	pgd_t *pgd;
@@ -149,20 +167,39 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	pte_t *pte;
 	phys_addr_t pa;
 	struct wind_phys_map m;
-	pteval_t val;
+	pteval_t val, type;
+	const pteval_t AP_RO = (pteval_t)1 << 7; /* AP[2]: 1=只读 0=可写 */
 
 	va &= PAGE_MASK;
 
 	/* 内核地址用 swapper_pg_dir (TTBR1) 遍历, 不用 active_mm->pgd:
-	 * KPTI 下用户 mm 的内核段只有 trampoline, 遍历会 pgd_none/bad → EINVAL。
-	 * 直接读 TTBR1_EL1 拿内核页表根物理地址, 不依赖 init_mm/swapper_pg_dir
-	 * 数据符号 (非白名单)。 */
+	 * KPTI 下用户 mm 的内核段只有 trampoline, 遍历会 pgd_none/bad。
+	 * 读 TTBR1_EL1 拿内核页表根, 不依赖 init_mm/swapper_pg_dir 数据符号。 */
 	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
 	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
+	if (!m.addr) {
+		pr_err("wind: force_rw map pgd %pa failed\n", &pa);
 		return -EINVAL;
+	}
 	pgd = (pgd_t *)m.addr + pgd_index(va);
-	if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+	if (pgd_none(*pgd)) {
+		pr_err("wind: force_rw pgd none va=%lx\n", va);
+		wind_unmap_phys(&m);
+		return -EINVAL;
+	}
+
+	/* 1GB section (pgd block entry) */
+	type = pgd_val(*pgd) & 0x3;
+	if (type == 0x1) {
+		val = pgd_val(*pgd);
+		val = writable ? (val & ~AP_RO) : (val | AP_RO);
+		WRITE_ONCE(*(pteval_t *)pgd, val);
+		wind_flush_tlb_va(va);
+		wind_unmap_phys(&m);
+		return 0;
+	}
+	if (type != 0x3) {
+		pr_err("wind: force_rw pgd bad va=%lx val=%llx\n", va, (unsigned long long)pgd_val(*pgd));
 		wind_unmap_phys(&m);
 		return -EINVAL;
 	}
@@ -170,10 +207,29 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
 	wind_unmap_phys(&m);
 	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
+	if (!m.addr) {
+		pr_err("wind: force_rw map pud %pa failed\n", &pa);
 		return -EINVAL;
+	}
 	pud = (pud_t *)m.addr + pud_index(va);
-	if (pud_none(*pud) || pud_bad(*pud)) {
+	if (pud_none(*pud)) {
+		pr_err("wind: force_rw pud none va=%lx\n", va);
+		wind_unmap_phys(&m);
+		return -EINVAL;
+	}
+
+	/* 1GB section (pud block entry) */
+	type = pud_val(*pud) & 0x3;
+	if (type == 0x1) {
+		val = pud_val(*pud);
+		val = writable ? (val & ~AP_RO) : (val | AP_RO);
+		WRITE_ONCE(*(pteval_t *)pud, val);
+		wind_flush_tlb_va(va);
+		wind_unmap_phys(&m);
+		return 0;
+	}
+	if (type != 0x3) {
+		pr_err("wind: force_rw pud bad va=%lx val=%llx\n", va, (unsigned long long)pud_val(*pud));
 		wind_unmap_phys(&m);
 		return -EINVAL;
 	}
@@ -181,10 +237,29 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
 	wind_unmap_phys(&m);
 	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
+	if (!m.addr) {
+		pr_err("wind: force_rw map pmd %pa failed\n", &pa);
 		return -EINVAL;
+	}
 	pmd = (pmd_t *)m.addr + pmd_index(va);
 	if (pmd_none(*pmd)) {
+		pr_err("wind: force_rw pmd none va=%lx\n", va);
+		wind_unmap_phys(&m);
+		return -EINVAL;
+	}
+
+	/* 2MB section (pmd block entry) */
+	type = pmd_val(*pmd) & 0x3;
+	if (type == 0x1) {
+		val = pmd_val(*pmd);
+		val = writable ? (val & ~AP_RO) : (val | AP_RO);
+		WRITE_ONCE(*(pteval_t *)pmd, val);
+		wind_flush_tlb_va(va);
+		wind_unmap_phys(&m);
+		return 0;
+	}
+	if (type != 0x3) {
+		pr_err("wind: force_rw pmd bad va=%lx val=%llx\n", va, (unsigned long long)pmd_val(*pmd));
 		wind_unmap_phys(&m);
 		return -EINVAL;
 	}
@@ -192,8 +267,10 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
 	wind_unmap_phys(&m);
 	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
+	if (!m.addr) {
+		pr_err("wind: force_rw map pte %pa failed\n", &pa);
 		return -EINVAL;
+	}
 	pte = (pte_t *)m.addr + pte_index(va);
 
 	val = pte_val(wind_ptep_get(pte));
@@ -202,18 +279,8 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	else
 		val |= (pteval_t)PTE_RDONLY;
 
-	/* 直接写 PTE 值, 避免 set_pte 对 fixmap/用户页表的额外处理。
-	 * 刷 TLB 用 vaae1is + vale1is 单地址刷 leaf 与 walk cache:
-	 * - vmalle1is 全刷会破坏 KPTI 全局 TLB → 卡死重启
-	 * - 只刷 vae1is 不刷 walk cache → 残留旧只读项 → 写 rodata 时 fault 瞬间重启 */
 	WRITE_ONCE(*(pteval_t *)pte, val);
-	asm volatile("dsb ishst\n"
-		     "\ttlbi vaae1is, %0\n"
-		     "\ttlbi vale1is, %0\n"
-		     "\tdsb ish\n"
-		     "\tisb\n"
-		     : : "r" (va) : "memory");
-
+	wind_flush_tlb_va(va);
 	wind_unmap_phys(&m);
 	return 0;
 }
