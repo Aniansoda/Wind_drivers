@@ -21,6 +21,7 @@
 #include <asm/pgtable.h>
 #include <asm/memory.h>
 #include <asm/cacheflush.h>
+#include <asm/sysreg.h>
 
 /* ===================================================================
  * vmap 物理内存映射 (替代 ioremap_cache/iounmap):
@@ -142,7 +143,6 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
  * =================================================================== */
 int wind_force_kernel_page_rw(unsigned long va, bool writable)
 {
-	struct mm_struct *mm = current->active_mm;
 	pgd_t *pgd;
 	pud_t *pud;
 	pmd_t *pmd;
@@ -153,11 +153,22 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 
 	va &= PAGE_MASK;
 
-	pgd = pgd_offset(mm, va);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
+	/* 内核地址用 swapper_pg_dir (TTBR1) 遍历, 不用 active_mm->pgd:
+	 * KPTI 下用户 mm 的内核段只有 trampoline, 遍历会 pgd_none/bad → EINVAL。
+	 * 直接读 TTBR1_EL1 拿内核页表根物理地址, 不依赖 init_mm/swapper_pg_dir
+	 * 数据符号 (非白名单)。 */
+	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
+	m = wind_map_phys(pa, PAGE_SIZE);
+	if (!m.addr)
 		return -EINVAL;
+	pgd = (pgd_t *)m.addr + pgd_index(va);
+	if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+		wind_unmap_phys(&m);
+		return -EINVAL;
+	}
 
 	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
+	wind_unmap_phys(&m);
 	m = wind_map_phys(pa, PAGE_SIZE);
 	if (!m.addr)
 		return -EINVAL;
