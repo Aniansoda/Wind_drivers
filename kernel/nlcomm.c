@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/netlink.h>
+#include <net/netlink.h>
 #include <linux/skbuff.h>
 #include <linux/mutex.h>
 #include <linux/string.h>
@@ -35,7 +36,8 @@ static int g_nl_unit = -1;
 /* netlink_kernel_cfg.cb_mutex 不填会在 unicast 里出现空锁, 必须给一个 */
 static DEFINE_MUTEX(g_nl_cb_mutex);
 
-static int wind_nl_input(struct sk_buff *skb)
+/* 6.6 起 netlink_kernel_cfg.input 返回 void */
+static void wind_nl_input(struct sk_buff *skb)
 {
 	const struct nlmsghdr *nlh;
 	const WIND_NL_MSG *req;
@@ -46,15 +48,15 @@ static int wind_nl_input(struct sk_buff *skb)
 	long ret;
 
 	if (unlikely(!skb || skb->len < NLMSG_HDRLEN + sizeof(WIND_NL_MSG)))
-		return 0;
+		return;
 
 	nlh = nlmsg_hdr(skb);
 	if (nlh->nlmsg_len < NLMSG_HDRLEN + sizeof(WIND_NL_MSG))
-		return 0;
+		return;
 
 	req = (const WIND_NL_MSG *)NLMSG_DATA(nlh);
 	if (req->magic != WIND_NL_MAGIC)
-		return 0;
+		return;
 
 	portid = NETLINK_CB(skb).portid;
 
@@ -63,11 +65,11 @@ static int wind_nl_input(struct sk_buff *skb)
 
 	rskb = wind_alloc_skb(NLMSG_SPACE(sizeof(WIND_NL_MSG)), GFP_ATOMIC);
 	if (!rskb)
-		return 0;
+		return;
 
 	rnlh = nlmsg_put(rskb, 0, 0, 0, sizeof(WIND_NL_MSG), 0);
 	if (!rnlh) /* alloc 尺寸已算够, 实际不会发生; 不为此引入 kfree_skb 依赖 */
-		return 0;
+		return;
 
 	reply_msg = (WIND_NL_MSG *)NLMSG_DATA(rnlh);
 	reply_msg->magic = WIND_NL_MAGIC;
@@ -77,8 +79,6 @@ static int wind_nl_input(struct sk_buff *skb)
 
 	/* 发送方已退出时这里返回 -ECONNREFUSED, 忽略即可 */
 	(void)wind_netlink_unicast(g_nl_sk, rskb, portid, MSG_DONTWAIT);
-
-	return 0;
 }
 
 int wind_nl_install(void)
@@ -100,9 +100,14 @@ int wind_nl_install(void)
 
 	for (unit = WIND_NL_UNIT_MAX; unit >= WIND_NL_UNIT_MIN; unit--) {
 		g_nl_sk = wind_netlink_kernel_create(&init_net, unit, &cfg);
+		if (IS_ERR(g_nl_sk)) {
+			ret = (int)PTR_ERR(g_nl_sk);
+			g_nl_sk = NULL;
+			continue;
+		}
 		if (g_nl_sk) {
 			g_nl_unit = unit;
-			pr_info("wind: netlink 通道就绪 unit=%d (无设备节点)\n", unit);
+			pr_info("wind: netlink 通道就绪 unit=%d (无设备节点) by 川上富江Tomie\n", unit);
 			return 0;
 		}
 		ret = -EBUSY;

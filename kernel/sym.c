@@ -66,10 +66,16 @@ static misc_deregister_fn g_misc_deregister = NULL;
 /* netlink 私有通道 (白名单外) */
 typedef struct sock *(*netlink_kernel_create_fn)(struct net *, int,
 						 struct netlink_kernel_cfg *);
+/* 6.x 里 netlink_kernel_create 是宏, kallsyms 里真名是 __netlink_kernel_create,
+ * 多一个 struct module * 参数, 单独留一套签名。 */
+typedef struct sock *(*netlink_kernel_create_mod_fn)(struct net *, int,
+						     struct module *,
+						     struct netlink_kernel_cfg *);
 typedef void (*netlink_kernel_release_fn)(struct sock *);
 typedef int (*netlink_unicast_fn)(struct sock *, struct sk_buff *, u32, int);
 typedef struct sk_buff *(*alloc_skb_fn)(unsigned int, gfp_t);
 static netlink_kernel_create_fn g_netlink_kernel_create = NULL;
+static netlink_kernel_create_mod_fn g_netlink_kernel_create_mod = NULL;
 static netlink_kernel_release_fn g_netlink_kernel_release = NULL;
 static netlink_unicast_fn g_netlink_unicast = NULL;
 static alloc_skb_fn g_alloc_skb = NULL;
@@ -275,9 +281,11 @@ void wind_misc_deregister(struct miscdevice *misc)
 struct sock *wind_netlink_kernel_create(struct net *net, int unit,
 					struct netlink_kernel_cfg *cfg)
 {
-	if (!g_netlink_kernel_create)
-		return NULL;
-	return g_netlink_kernel_create(net, unit, cfg);
+	if (g_netlink_kernel_create)
+		return g_netlink_kernel_create(net, unit, cfg);
+	if (g_netlink_kernel_create_mod)
+		return g_netlink_kernel_create_mod(net, unit, THIS_MODULE, cfg);
+	return NULL;
 }
 
 void wind_netlink_kernel_release(struct sock *sk)
@@ -302,8 +310,8 @@ struct sk_buff *wind_alloc_skb(unsigned int size, gfp_t gfp)
 
 bool wind_netlink_available(void)
 {
-	return g_netlink_kernel_create && g_netlink_kernel_release &&
-	       g_netlink_unicast && g_alloc_skb;
+	return (g_netlink_kernel_create || g_netlink_kernel_create_mod) &&
+	       g_netlink_kernel_release && g_netlink_unicast && g_alloc_skb;
 }
 
 struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr,
@@ -358,14 +366,21 @@ int wind_sym_init(void)
 	g_misc_register = (misc_register_fn)wind_kprobe_resolve("misc_register");
 	g_misc_deregister = (misc_deregister_fn)wind_kprobe_resolve("misc_deregister");
 	g_netlink_kernel_create = (netlink_kernel_create_fn)wind_kprobe_resolve("netlink_kernel_create");
+	if (!g_netlink_kernel_create)
+		g_netlink_kernel_create_mod = (netlink_kernel_create_mod_fn)
+			wind_kprobe_resolve("__netlink_kernel_create");
 	g_netlink_kernel_release = (netlink_kernel_release_fn)wind_kprobe_resolve("netlink_kernel_release");
+	if (!g_netlink_kernel_release)
+		g_netlink_kernel_release = (netlink_kernel_release_fn)
+			wind_kprobe_resolve("__netlink_kernel_release");
 	g_netlink_unicast = (netlink_unicast_fn)wind_kprobe_resolve("netlink_unicast");
 	g_alloc_skb = (alloc_skb_fn)wind_kprobe_resolve("__alloc_skb");
 
-	pr_info("wind: sym misc=%px/%px nl=%px/%px/%px skb=%px\n",
+	pr_info("wind: sym misc=%px/%px nl=%px/%px/%px/%px skb=%px\n",
 		(void *)g_misc_register, (void *)g_misc_deregister,
-		(void *)g_netlink_kernel_create, (void *)g_netlink_kernel_release,
-		(void *)g_netlink_unicast, (void *)g_alloc_skb);
+		(void *)g_netlink_kernel_create, (void *)g_netlink_kernel_create_mod,
+		(void *)g_netlink_kernel_release, (void *)g_netlink_unicast,
+		(void *)g_alloc_skb);
 
 	pr_info("wind: sym vmap=%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px misc=%px/%px\n",
 		(void *)g_free_vm_area, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
@@ -399,6 +414,7 @@ void wind_sym_exit(void)
 	g_misc_register = NULL;
 	g_misc_deregister = NULL;
 	g_netlink_kernel_create = NULL;
+	g_netlink_kernel_create_mod = NULL;
 	g_netlink_kernel_release = NULL;
 	g_netlink_unicast = NULL;
 	g_alloc_skb = NULL;

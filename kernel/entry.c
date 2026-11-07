@@ -22,26 +22,20 @@
 #include "nlcomm.h"
 
 /*
- * entry.c — 通讯通道 (hook /dev/null inode->i_fop, 不注册 dev 节点)
+ * entry.c — 通讯通道与 ioctl 分发 (作者: 川上富江Tomie)
  *
- * 不在 /dev 注册固定节点 (misc_register 会留下 /dev/xxx 可见节点),
- * 改为把 /dev/null inode 的 i_fop 指向本模块内的一份 file_operations
- * 副本 (内容复制自真 null_fops, 只覆盖 unlocked_ioctl / mmap, .open 置空
- * 以阻断 chrdev_open)。用户态 open("/dev/null") + ioctl(WIND_OP_*) 通讯,
- * /dev 下无可疑节点。
+ * 三条通道, 由 module param transport 选择, 默认 3:
+ *   3 netlink  —— 内核私有 AF_NETLINK 协议号 (nlcomm.c)。不建节点、不碰
+ *                inode/fops/页表、不装 kprobe hook。默认走这条。
+ *   2 misc     —— 私有字符设备, 需用户自己 mknod; /dev 下不留节点。
+ *   1 i_fop    —— 把 /dev/null inode->i_fop 指向模块内一份 file_operations
+ *                副本 (.open 置空阻断 chrdev_open)。该核实测装完约 10 秒
+ *                卡死重启, 已降级为诊断用途, 由 hook_level 细分。
  *
- * 为什么改 inode 而不是改 null_fops: null_fops 在 .rodata, 该核 rodata 是
- *   2MB block 映射, 改描述符 AP[2] 会让整块 2MB 短暂可写, 真机实测直接
- *   卡死重启。inode 是 kmalloc 对象, i_fop 指针本就可写, 只写 8 字节。
+ * 为什么不再改 rodata: null_fops 在 .rodata, 该核 rodata 是 2MB block 映射,
+ *   改描述符 AP[2] 会让整块 2MB 短暂可写, 真机实测直接卡死重启。
  *
- * 为什么选 /dev/null: 系统恒定存在、用户态必能打开; 原 null_fops 的
- *   unlocked_ioctl 与 mmap 均为 NULL, 替换后不影响原有语义。
- *
- * 卸载: 重新 filp_open 取当前 inode 并把 i_fop 恢复成保存的原值。
- *   fops.owner = NULL, rmmod 不会被 /dev/null 的持有者卡住。
- *
- * 会话: 改全局单例 g_sess (hook 复用 /dev/null 的 file, 无法用
- *   file->private_data 存会话)。外挂驱动单用户态进程使用, 不额外加锁。
+ * 会话: 全局单例 g_sess。外挂驱动单用户态进程使用, 不额外加锁。
  */
 
 #define HOOK_PATH "/dev/null"
@@ -845,6 +839,8 @@ static int __init driver_entry(void)
 	int ret;
 
 	printk("[+] wind driver_entry");
+	printk(KERN_INFO "wind: build by 川上富江Tomie | transport=%d hook_level=%d install_hook=%d\n",
+	       transport, hook_level, (int)install_hook);
 	ret = wind_sym_init();
 	if (ret)
 		return ret;
@@ -905,4 +901,6 @@ module_exit(driver_unload);
 
 MODULE_DESCRIPTION("Wind Linux driver - kernel driver for all devices.");
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("川上富江Tomie");
 MODULE_AUTHOR("TomieNian-阿念");
+MODULE_VERSION("2026.11");
