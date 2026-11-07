@@ -13,6 +13,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/netlink.h>
 #include <net/netlink.h>
 #include <linux/skbuff.h>
@@ -30,11 +31,20 @@
 #define WIND_NL_UNIT_MIN 23
 #define WIND_NL_UNIT_MAX 31
 
+/* netlink_kernel_cfg.cb_mutex 在 6.12 被上游删除 (锁改成内核内部持有)。
+ * 6.1 / 6.6 仍需要显式给一个, 否则 unicast 里出现空锁。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+#define WIND_NL_NEEDS_CB_MUTEX 1
+#else
+#define WIND_NL_NEEDS_CB_MUTEX 0
+#endif
+
 static struct sock *g_nl_sk;
 static int g_nl_unit = -1;
 
-/* netlink_kernel_cfg.cb_mutex 不填会在 unicast 里出现空锁, 必须给一个 */
+#if WIND_NL_NEEDS_CB_MUTEX
 static DEFINE_MUTEX(g_nl_cb_mutex);
+#endif
 
 /* 6.6 起 netlink_kernel_cfg.input 返回 void */
 static void wind_nl_input(struct sk_buff *skb)
@@ -96,7 +106,9 @@ int wind_nl_install(void)
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.input = wind_nl_input;
+#if WIND_NL_NEEDS_CB_MUTEX
 	cfg.cb_mutex = &g_nl_cb_mutex;
+#endif
 
 	for (unit = WIND_NL_UNIT_MAX; unit >= WIND_NL_UNIT_MIN; unit--) {
 		g_nl_sk = wind_netlink_kernel_create(&init_net, unit, &cfg);
