@@ -1,10 +1,12 @@
 #include "memory.h"
 #include "compat.h"
 #include "sym.h"
+#include <linux/kconfig.h>
 #include <linux/tty.h>
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/sched/mm.h>
@@ -69,8 +71,129 @@ static void wind_unmap_phys(struct wind_phys_map *m)
 	m->addr = NULL;
 }
 
+/* 页表层数: GKI arm64 4KB 页下 VA_BITS=39 是 3 级 (pgd -> pmd -> pte),
+ * VA_BITS=48 是 4 级 (pgd -> pud -> pmd -> pte)。3 级时没有 pud 层,
+ * 顶层项的下一级表直接就是 pmd 表, 必须用 pmd_index(shift 21) 索引;
+ * 若按 pud_index(shift 30) 去索引这张 pmd 表会落到空项 (表现为 pud none)。 */
+#if defined(CONFIG_PGTABLE_LEVELS) && (CONFIG_PGTABLE_LEVELS > 0)
+#define WIND_PGTABLE_LEVELS CONFIG_PGTABLE_LEVELS
+#else
+#define WIND_PGTABLE_LEVELS 4
+#endif
+
+/* 每级索引位数 = PAGE_SHIFT - 3 (4KB 页 9 位, 16KB 页 11 位, 64KB 页 13 位);
+ * 第 lv 级 (0=pte) 的移位 = PAGE_SHIFT + lv * bits。与内核 VA_BITS 无关,
+ * 因此 3/4/5 级页表共用这一套索引。 */
+#define WIND_PT_BITS	(PAGE_SHIFT - 3)
+#define WIND_PT_IDXMASK	((1UL << WIND_PT_BITS) - 1)
+
+static inline unsigned long wind_lidx(unsigned long va, int lv)
+{
+	return (va >> (PAGE_SHIFT + (unsigned int)lv * WIND_PT_BITS)) & WIND_PT_IDXMASK;
+}
+
+/* 运行时确定内核页表层数: 由 task_size (== 1 << VA_BITS) 反推,
+ * 不要求构建侧 CONFIG_PGTABLE_LEVELS 与设备内核一致。
+ * VA_BITS=39 -> 3 级, VA_BITS=48 -> 4 级, VA_BITS=52 -> 5 级。 */
+static int wind_pgtable_levels_cached;
+
+static int wind_pgtable_levels(void)
+{
+	int lv = READ_ONCE(wind_pgtable_levels_cached);
+
+	if (lv)
+		return lv;
+
+	lv = WIND_PGTABLE_LEVELS;
+	if (current && current->mm) {
+		unsigned long ts = current->mm->task_size;
+
+		if (ts >= (1UL << 32)) {
+			int vabits = 63 - __builtin_clzll((unsigned long long)ts);
+			int n = (vabits - PAGE_SHIFT + WIND_PT_BITS - 1) / WIND_PT_BITS;
+
+			if (n >= 3 && n <= 5) {
+				lv = n;
+				WRITE_ONCE(wind_pgtable_levels_cached, lv);
+			}
+		}
+	}
+	return lv;
+}
+
+/* 按指定层数走目标 mm 的页表, 到 pte 级返回该项指针。
+ * 成功且 out_m 非空时, *out_m 持有该 pte 表的 vmap, 由调用方 unmap。 */
+static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
+				    int levels, struct wind_phys_map *out_m)
+{
+	pgd_t *pgd;
+	phys_addr_t pa;
+	struct wind_phys_map m;
+	pteval_t val, type;
+	int lv;
+
+	if (!mm || levels < 3 || levels > 5)
+		return NULL;
+
+	va &= PAGE_MASK;
+
+	/* 顶层直接用 mm->pgd (已在直接映射区, 无需 vmap) */
+	pgd = mm->pgd + wind_lidx(va, levels - 1);
+	val = pgd_val(*pgd);
+	if (!val || (val & 0x3) != 0x3)
+		return NULL;
+
+	pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
+
+	for (lv = levels - 2; lv >= 0; lv--) {
+		pteval_t *entry;
+
+		m = wind_map_phys(pa, PAGE_SIZE);
+		if (!m.addr)
+			return NULL;
+
+		entry = (pteval_t *)m.addr + wind_lidx(va, lv);
+		val = READ_ONCE(*entry);
+		if (!val) {
+			wind_unmap_phys(&m);
+			return NULL;
+		}
+		type = val & 0x3;
+
+		if (lv == 0) {
+			/* pte 级: 0b11 = 有效页 */
+			if (type != 0x3) {
+				wind_unmap_phys(&m);
+				return NULL;
+			}
+			if (out_m)
+				*out_m = m;
+			else
+				wind_unmap_phys(&m);
+			return (pte_t *)entry;
+		}
+
+		if (type != 0x3) {
+			wind_unmap_phys(&m);
+			return NULL;
+		}
+
+		pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
+		wind_unmap_phys(&m);
+	}
+
+	return NULL;
+}
+
+/* 按运行时确定的层数走一次。 */
+static pte_t *wind_mm_pte_locate(struct mm_struct *mm, unsigned long va,
+				 struct wind_phys_map *out_m)
+{
+	return wind_mm_pte_locate_at(mm, va, wind_pgtable_levels(), out_m);
+}
+
 /* ===================================================================
- * 页表翻译: 5.4~6.18 统一走 p4d 折叠分支 (arm64 4-level, p4d == pgd)。
+ * 页表翻译: 按 3/4/5 级自适应。
  *
  * 这里手动实现各级偏移, 不用 p4d_offset/pud_offset/pmd_offset/
  * pte_offset_kernel 内核宏 —— 它们的 *_page_vaddr 展开会引用 __va,
@@ -80,51 +203,18 @@ static void wind_unmap_phys(struct wind_phys_map *m)
  * =================================================================== */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
+	struct wind_phys_map m = { .area = NULL, .addr = NULL };
 	pte_t *pte;
 	phys_addr_t pa;
-	struct wind_phys_map m;
 
-	pgd = pgd_offset(mm, va);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
+	if (!mm)
 		return 0;
 
-	/* 页表项物理地址 -> vmap (cacheable, 等价 __va, 不依赖 memstart_addr) */
-	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
+	pte = wind_mm_pte_locate(mm, va, &m);
+	if (!pte)
 		return 0;
-	pud = (pud_t *)m.addr + pud_index(va);
-	if (pud_none(*pud) || pud_bad(*pud)) {
-		wind_unmap_phys(&m);
-		return 0;
-	}
 
-	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
-		return 0;
-	pmd = (pmd_t *)m.addr + pmd_index(va);
-	if (pmd_none(*pmd)) {
-		wind_unmap_phys(&m);
-		return 0;
-	}
-
-	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
-		return 0;
-	pte = (pte_t *)m.addr + pte_index(va);
-
-	if (pte_none(wind_ptep_get(pte))) {
-		wind_unmap_phys(&m);
-		return 0;
-	}
-	if (!pte_present(wind_ptep_get(pte))) {
+	if (pte_none(wind_ptep_get(pte)) || !pte_present(wind_ptep_get(pte))) {
 		wind_unmap_phys(&m);
 		return 0;
 	}
@@ -135,12 +225,6 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	return pa;
 }
 
-/* ===================================================================
- * 内核镜像 rodata 写保护绕过。
- * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
- * (null_fops 所在段) 返回 -EINVAL。这里走当前 mm 的内核段页表
- * (swapper_pg_dir 共享), 直接清/置 PTE_RDONLY 后 flush TLB。
- * =================================================================== */
 /* 单地址刷 leaf + walk cache。全刷 vmalle1is 破坏 KPTI 全局 TLB; 只刷
  * vae1is 漏 walk cache 残留旧只读项。 */
 static inline void wind_flush_tlb_va(unsigned long va)
@@ -159,130 +243,106 @@ static inline void wind_flush_tlb_va(unsigned long va)
  * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
  * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
  * =================================================================== */
+/* 按指定层数从 TTBR1 根走一遍, 命中 block/section 或 pte 就改 AP[2]。 */
+static int wind_kpage_rw_walk(unsigned long va, bool writable, int levels)
+{
+	const pteval_t AP_RO = (pteval_t)1 << 7; /* AP[2]: 1=只读 0=可写 */
+	struct wind_phys_map m;
+	phys_addr_t pa;
+	pteval_t val, type;
+	int lv;
+
+	if (levels < 3 || levels > 5)
+		return -EINVAL;
+
+	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
+
+	for (lv = levels - 1; lv >= 0; lv--) {
+		pteval_t *entry;
+
+		m = wind_map_phys(pa, PAGE_SIZE);
+		if (!m.addr) {
+			pr_err("wind: force_rw lv%d map %pa failed\n", lv, &pa);
+			return -EINVAL;
+		}
+
+		entry = (pteval_t *)m.addr + wind_lidx(va, lv);
+		val = READ_ONCE(*entry);
+
+		if (!val) {
+			pr_err("wind: force_rw lv%d none va=%lx idx=%lu\n",
+			       lv, va, wind_lidx(va, lv));
+			wind_unmap_phys(&m);
+			return -EINVAL;
+		}
+
+		type = val & 0x3;
+
+		if (lv == 0) {
+			/* pte 级: 0b11 = 4KB 页 */
+			if (type != 0x3) {
+				pr_err("wind: force_rw pte bad va=%lx val=%llx\n",
+				       va, (unsigned long long)val);
+				wind_unmap_phys(&m);
+				return -EINVAL;
+			}
+			val = writable ? (val & ~AP_RO) : (val | AP_RO);
+			WRITE_ONCE(*entry, val);
+			wind_flush_tlb_va(va);
+			wind_unmap_phys(&m);
+			return 0;
+		}
+
+		if (type == 0x1) {
+			/* block/section 项: 直接改本级 AP[2] */
+			val = writable ? (val & ~AP_RO) : (val | AP_RO);
+			WRITE_ONCE(*entry, val);
+			wind_flush_tlb_va(va);
+			wind_unmap_phys(&m);
+			return 0;
+		}
+
+		if (type != 0x3) {
+			pr_err("wind: force_rw lv%d bad va=%lx val=%llx\n",
+			       lv, va, (unsigned long long)val);
+			wind_unmap_phys(&m);
+			return -EINVAL;
+		}
+
+		/* 表项: 取下一级表的物理地址 */
+		pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
+		wind_unmap_phys(&m);
+	}
+
+	return -EINVAL;
+}
+
+/* ===================================================================
+ * 内核镜像 rodata 写保护绕过。
+ * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
+ * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
+ * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
+ *
+ * 层数: 运行时由 task_size 反推 (39 位 VA=3 级, 48 位=4 级, 52 位=5 级),
+ * 不依赖构建侧 CONFIG_PGTABLE_LEVELS 与设备内核一致。
+ * =================================================================== */
 int wind_force_kernel_page_rw(unsigned long va, bool writable)
 {
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-	phys_addr_t pa;
-	struct wind_phys_map m;
-	pteval_t val, type;
-	const pteval_t AP_RO = (pteval_t)1 << 7; /* AP[2]: 1=只读 0=可写 */
+	int ret, levels;
 
 	va &= PAGE_MASK;
 
-	/* 内核地址用 swapper_pg_dir (TTBR1) 遍历, 不用 active_mm->pgd:
-	 * KPTI 下用户 mm 的内核段只有 trampoline, 遍历会 pgd_none/bad。
-	 * 读 TTBR1_EL1 拿内核页表根, 不依赖 init_mm/swapper_pg_dir 数据符号。 */
-	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr) {
-		pr_err("wind: force_rw map pgd %pa failed\n", &pa);
-		return -EINVAL;
-	}
-	pgd = (pgd_t *)m.addr + pgd_index(va);
-	if (pgd_none(*pgd)) {
-		pr_err("wind: force_rw pgd none va=%lx\n", va);
-		wind_unmap_phys(&m);
-		return -EINVAL;
-	}
+	levels = wind_pgtable_levels();
+	ret = wind_kpage_rw_walk(va, writable, levels);
+	if (ret == 0) {
+		static bool wind_lv_ok;
 
-	/* 1GB section (pgd block entry) */
-	type = pgd_val(*pgd) & 0x3;
-	if (type == 0x1) {
-		val = pgd_val(*pgd);
-		val = writable ? (val & ~AP_RO) : (val | AP_RO);
-		WRITE_ONCE(*(pteval_t *)pgd, val);
-		wind_flush_tlb_va(va);
-		wind_unmap_phys(&m);
-		return 0;
+		if (!wind_lv_ok) {
+			wind_lv_ok = true;
+			pr_info("wind: kernel pgtables = %d level(s)\n", levels);
+		}
 	}
-	if (type != 0x3) {
-		pr_err("wind: force_rw pgd bad va=%lx val=%llx\n", va, (unsigned long long)pgd_val(*pgd));
-		wind_unmap_phys(&m);
-		return -EINVAL;
-	}
-
-	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr) {
-		pr_err("wind: force_rw map pud %pa failed\n", &pa);
-		return -EINVAL;
-	}
-	pud = (pud_t *)m.addr + pud_index(va);
-	if (pud_none(*pud)) {
-		pr_err("wind: force_rw pud none va=%lx\n", va);
-		wind_unmap_phys(&m);
-		return -EINVAL;
-	}
-
-	/* 1GB section (pud block entry) */
-	type = pud_val(*pud) & 0x3;
-	if (type == 0x1) {
-		val = pud_val(*pud);
-		val = writable ? (val & ~AP_RO) : (val | AP_RO);
-		WRITE_ONCE(*(pteval_t *)pud, val);
-		wind_flush_tlb_va(va);
-		wind_unmap_phys(&m);
-		return 0;
-	}
-	if (type != 0x3) {
-		pr_err("wind: force_rw pud bad va=%lx val=%llx\n", va, (unsigned long long)pud_val(*pud));
-		wind_unmap_phys(&m);
-		return -EINVAL;
-	}
-
-	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr) {
-		pr_err("wind: force_rw map pmd %pa failed\n", &pa);
-		return -EINVAL;
-	}
-	pmd = (pmd_t *)m.addr + pmd_index(va);
-	if (pmd_none(*pmd)) {
-		pr_err("wind: force_rw pmd none va=%lx\n", va);
-		wind_unmap_phys(&m);
-		return -EINVAL;
-	}
-
-	/* 2MB section (pmd block entry) */
-	type = pmd_val(*pmd) & 0x3;
-	if (type == 0x1) {
-		val = pmd_val(*pmd);
-		val = writable ? (val & ~AP_RO) : (val | AP_RO);
-		WRITE_ONCE(*(pteval_t *)pmd, val);
-		wind_flush_tlb_va(va);
-		wind_unmap_phys(&m);
-		return 0;
-	}
-	if (type != 0x3) {
-		pr_err("wind: force_rw pmd bad va=%lx val=%llx\n", va, (unsigned long long)pmd_val(*pmd));
-		wind_unmap_phys(&m);
-		return -EINVAL;
-	}
-
-	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr) {
-		pr_err("wind: force_rw map pte %pa failed\n", &pa);
-		return -EINVAL;
-	}
-	pte = (pte_t *)m.addr + pte_index(va);
-
-	val = pte_val(wind_ptep_get(pte));
-	if (writable)
-		val &= ~(pteval_t)PTE_RDONLY;
-	else
-		val |= (pteval_t)PTE_RDONLY;
-
-	WRITE_ONCE(*(pteval_t *)pte, val);
-	wind_flush_tlb_va(va);
-	wind_unmap_phys(&m);
-	return 0;
+	return ret;
 }
 
 /* ===================================================================
@@ -291,55 +351,6 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
  * TTBR0), 且按 mask/val 位域改写 (UXN/PXN/RDONLY/VALID/AF 等)。
  * flush 用 vaae1is 刷所有 ASID 的目标地址 (断点进程非 current 时也生效)。
  * =================================================================== */
-static pte_t *wind_shadow_pte_locate(struct mm_struct *mm, unsigned long va,
-				     struct wind_phys_map *out_m)
-{
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-	phys_addr_t pa;
-	struct wind_phys_map m;
-
-	va &= PAGE_MASK;
-
-	pgd = pgd_offset(mm, va);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return NULL;
-
-	pa = (phys_addr_t)(pgd_val(*pgd) & PHYS_MASK & (s32)PAGE_MASK);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
-		return NULL;
-	pud = (pud_t *)m.addr + pud_index(va);
-	if (pud_none(*pud) || pud_bad(*pud)) {
-		wind_unmap_phys(&m);
-		return NULL;
-	}
-
-	pa = (phys_addr_t)(pud_val(*pud) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
-		return NULL;
-	pmd = (pmd_t *)m.addr + pmd_index(va);
-	if (pmd_none(*pmd)) {
-		wind_unmap_phys(&m);
-		return NULL;
-	}
-
-	pa = (phys_addr_t)(pmd_val(*pmd) & PHYS_MASK & (s32)PAGE_MASK);
-	wind_unmap_phys(&m);
-	m = wind_map_phys(pa, PAGE_SIZE);
-	if (!m.addr)
-		return NULL;
-	pte = (pte_t *)m.addr + pte_index(va);
-
-	if (out_m)
-		*out_m = m;
-	return pte;
-}
-
 pteval_t wind_shadow_pte_get(struct mm_struct *mm, unsigned long va, int *err)
 {
 	struct wind_phys_map m = { .area = NULL, .addr = NULL };
@@ -351,7 +362,7 @@ pteval_t wind_shadow_pte_get(struct mm_struct *mm, unsigned long va, int *err)
 	if (!mm)
 		return 0;
 
-	pte = wind_shadow_pte_locate(mm, va, &m);
+	pte = wind_mm_pte_locate(mm, va, &m);
 	if (!pte)
 		return 0;
 
@@ -371,7 +382,7 @@ int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, p
 	if (!mm)
 		return -EINVAL;
 
-	pte = wind_shadow_pte_locate(mm, va, &m);
+	pte = wind_mm_pte_locate(mm, va, &m);
 	if (!pte)
 		return -EINVAL;
 

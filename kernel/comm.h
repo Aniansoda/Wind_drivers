@@ -70,6 +70,13 @@ enum OPERATIONS
 	/* ---- 陀螺仪停止/恢复 (暂停/恢复篡改, 保留 hook) ---- */
 	OP_GYRO_STOP         = WIND_OP_BASE + 0x2C,
 	OP_GYRO_RESUME       = WIND_OP_BASE + 0x2D,
+
+	/* ---- UDP 断点 (内核 UDP 收发路径打点) ---- */
+	OP_UDPBP_SET          = WIND_OP_BASE + 0x2E, /* 装/更新一个 UDP 断点槽 */
+	OP_UDPBP_REMOVE       = WIND_OP_BASE + 0x2F, /* 拆一个槽 (-1 = 全部) */
+	OP_UDPBP_GET_CONFIG   = WIND_OP_BASE + 0x30, /* 读当前槽位表 */
+	OP_UDPBP_GET_RECORDS  = WIND_OP_BASE + 0x31, /* 分段读命中记录 */
+	OP_UDPBP_CLEAR_RECORDS= WIND_OP_BASE + 0x32, /* 清记录 (-1 = 全部槽) */
 };
 
 /* ---- 读取模式 ---- */
@@ -393,6 +400,92 @@ typedef struct _GYRO_REQUEST
 {
 	u32 rx, ry, rz;  /* 目标三轴角速度, float 位模式 (IEEE 754)。内核态禁用 FP 寄存器 */
 } GYRO_REQUEST, *PGYRO_REQUEST;
+
+/*
+ * ---- UDP 断点 ----
+ * 在 UDP 收发路径上打点 (kprobe udp_send_skb / udp_queue_rcv_skb),
+ * 按 pid / 端口 / 方向过滤, 命中即记录或就地改写载荷。
+ * 不改 debug 寄存器、不改页表, 只挂内核探针, 对目标进程完全不可见。
+ *
+ *   dir : 0 = 发送 (TX), 1 = 接收 (RX), 2 = 双向
+ *   act : 0 = 只记录, 1 = 记录 + 改写载荷首 patch_len 字节
+ *   port: 0 = 任意。TX 比目的端口, RX 比源端口。
+ *   pid : 0 = 任意进程 (按 tgid 匹配)
+ */
+enum UDPBP_DIR
+{
+	UDPBP_DIR_TX   = 0,
+	UDPBP_DIR_RX   = 1,
+	UDPBP_DIR_BOTH = 2,
+};
+
+enum UDPBP_ACTION
+{
+	UDPBP_ACT_LOG     = 0,
+	UDPBP_ACT_REWRITE = 1,
+};
+
+#define UDPBP_MAX_SLOTS      8
+#define UDPBP_PATCH_MAX      64
+#define UDPBP_PREVIEW_MAX    32
+#define UDPBP_RECORD_MAX     256
+
+typedef struct _UDPBP_POINT_CONFIG
+{
+	uint32_t pid;          /* 0 = 任意 (tgid) */
+	uint16_t port;         /* 0 = 任意 (主机序) */
+	uint16_t dir;          /* UDPBP_DIR_* */
+	uint16_t action;       /* UDPBP_ACTION_* */
+	uint16_t patch_len;    /* <= UDPBP_PATCH_MAX */
+	uint8_t  patch[UDPBP_PATCH_MAX];
+} UDPBP_POINT_CONFIG, *PUDPBP_POINT_CONFIG;
+
+typedef struct _UDPBP_RECORD
+{
+	uint64_t ts_ns;        /* 命中时刻 (ktime_get_ns) */
+	uint32_t pid;          /* 命中进程 tgid */
+	uint32_t saddr;        /* 网络序 IPv4 */
+	uint32_t daddr;
+	uint16_t sport;        /* 主机序 */
+	uint16_t dport;
+	uint16_t dir;          /* UDPBP_DIR_TX / RX */
+	uint16_t action;       /* 实际执行的动作 */
+	uint32_t len;          /* 载荷长度 */
+	uint32_t preview_len;  /* 实际抓到的预览字节数 */
+	uint8_t  preview[UDPBP_PREVIEW_MAX];
+	uint32_t reserved;
+} UDPBP_RECORD, *PUDPBP_RECORD;
+
+typedef struct _UDPBP_CONFIG
+{
+	uint32_t slot_count;
+	uint32_t reserved;
+	UDPBP_POINT_CONFIG slots[UDPBP_MAX_SLOTS];
+} UDPBP_CONFIG, *PUDPBP_CONFIG;
+
+typedef struct _UDPBP_SET_REQUEST
+{
+	int32_t slot_index;    /* 入: -1 = 自动选空槽; 出: 实际槽号 */
+	uint32_t reserved;
+	int32_t *slot_out;     /* 可选: 内核写回实际槽号 */
+	UDPBP_POINT_CONFIG point;
+} UDPBP_SET_REQUEST, *PUDPBP_SET_REQUEST;
+
+typedef struct _UDPBP_RECORDS_REQUEST
+{
+	int32_t slot_index;    /* -1 = 所有槽合并按时间取 */
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	UDPBP_RECORD *records;
+	uint32_t *count_out;
+} UDPBP_RECORDS_REQUEST, *PUDPBP_RECORDS_REQUEST;
+
+typedef struct _UDPBP_CLEAR_REQUEST
+{
+	int32_t slot_index;    /* -1 = 全部 */
+	uint32_t reserved;
+} UDPBP_CLEAR_REQUEST, *PUDPBP_CLEAR_REQUEST;
 
 /*
  * ---- mmap 映射约定 ----

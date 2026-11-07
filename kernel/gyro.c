@@ -261,7 +261,7 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 	(void)bp;
 	(void)data;
 
-	if (!gyro_active || !gyro_enabled)
+	if (!READ_ONCE(gyro_active) || !READ_ONCE(gyro_enabled))
 		return;
 
 	mm = current->mm; /* 断点在目标进程上下文触发 */
@@ -300,19 +300,30 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 	}
 }
 
-/* ===================================================================
- * 安装 hook: 解析符号 -> 找基址 -> 设执行断点。
- * =================================================================== */
-int gyro_install(pid_t pid)
+/* 取目标进程 task (不持引用, 与 install 时一致) */
+static struct task_struct *gyro_get_task(void)
 {
 	struct pid *pid_struct;
 	struct task_struct *task;
+
+	if (!gyro_pid)
+		return NULL;
+
+	pid_struct = find_get_pid(gyro_pid);
+	if (!pid_struct)
+		return NULL;
+
+	task = pid_task(pid_struct, PIDTYPE_PID);
+	put_pid(pid_struct);
+	return task;
+}
+
+/* 解析符号 + 取基址 + 注册执行断点 (install / resume 共用) */
+static int gyro_bind(struct task_struct *task)
+{
 	unsigned long offset = 0, base = 0;
 	struct perf_event_attr attr;
 	int ret;
-
-	if (gyro_active)
-		return -EBUSY;
 
 	ret = gyro_resolve_symbol(&offset);
 	if (ret)
@@ -321,14 +332,6 @@ int gyro_install(pid_t pid)
 		return ret;
 	}
 	printk(KERN_INFO "gyro: target offset 0x%lx\n", offset);
-
-	pid_struct = find_get_pid(pid);
-	if (!pid_struct)
-		return -ESRCH;
-	task = pid_task(pid_struct, PIDTYPE_PID);
-	put_pid(pid_struct);
-	if (!task)
-		return -ESRCH;
 
 	base = gyro_find_module_base(task, GYRO_LIBSENSOR_NAME);
 	if (!base)
@@ -352,10 +355,38 @@ int gyro_install(pid_t pid)
 		printk(KERN_ERR "gyro: uprobe register failed %d\n", ret);
 		return ret;
 	}
+	return 0;
+}
+
+/* ===================================================================
+ * 安装 hook: 解析符号 -> 找基址 -> 设执行断点。
+ * =================================================================== */
+int gyro_install(pid_t pid)
+{
+	struct task_struct *task;
+	int ret;
+
+	if (gyro_active)
+		return -EBUSY;
 
 	gyro_pid = pid;
+	task = gyro_get_task();
+	if (!task)
+	{
+		gyro_pid = 0;
+		return -ESRCH;
+	}
+
+	ret = gyro_bind(task);
+	if (ret)
+	{
+		gyro_pid = 0;
+		gyro_addr = 0;
+		return ret;
+	}
+
 	gyro_active = true;
-	gyro_enabled = true;
+	WRITE_ONCE(gyro_enabled, true);
 	printk(KERN_INFO "gyro: registered successfully (pid=%d addr=0x%lx)\n", pid, gyro_addr);
 	return 0;
 }
@@ -368,6 +399,7 @@ void gyro_remove(void)
 		gyro_bp = NULL;
 	}
 	gyro_active = false;
+	WRITE_ONCE(gyro_enabled, false);
 	gyro_pid = 0;
 	gyro_addr = 0;
 	printk(KERN_INFO "gyro: unregistered\n");
@@ -382,15 +414,44 @@ void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 
 void gyro_set_enabled(bool enabled)
 {
-	gyro_enabled = enabled;
+	WRITE_ONCE(gyro_enabled, enabled);
 }
 
-void gyro_stop(void)
+/* 停止: 只关篡改, hook 保留 (热开关, 无重新解析开销) */
+int gyro_stop(void)
 {
-	gyro_enabled = false;
+	if (!gyro_active)
+		return -ENODEV;
+
+	WRITE_ONCE(gyro_enabled, false);
+	printk(KERN_INFO "gyro: stopped (hook kept)\n");
+	return 0;
 }
 
-void gyro_resume(void)
+/* 恢复: 校验目标仍存活; 断点被回收则重新绑定后再开篡改 */
+int gyro_resume(void)
 {
-	gyro_enabled = true;
+	struct task_struct *task;
+	int ret;
+
+	if (!gyro_active)
+		return -ENODEV;
+
+	if (READ_ONCE(gyro_enabled))
+		return 0;
+
+	task = gyro_get_task();
+	if (!task)
+		return -ESRCH;
+
+	if (!gyro_bp)
+	{
+		ret = gyro_bind(task);
+		if (ret)
+			return ret;
+	}
+
+	WRITE_ONCE(gyro_enabled, true);
+	printk(KERN_INFO "gyro: resumed (pid=%d addr=0x%lx)\n", gyro_pid, gyro_addr);
+	return 0;
 }

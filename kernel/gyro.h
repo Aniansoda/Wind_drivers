@@ -32,8 +32,10 @@ void gyro_remove(void);
 void gyro_set_velocity(u32 rx, u32 ry, u32 rz);
 void gyro_set_enabled(bool enabled);
 
-/* 停止 / 恢复: 暂停或恢复篡改, 保留 hook 不卸载 (区别于 gyro_remove) */
-void gyro_stop(void);
-void gyro_resume(void);
+/* 停止 / 恢复: 暂停或恢复篡改, 保留 hook 不卸载 (区别于 gyro_remove)
+ *   stop  : -ENODEV 未安装; 0 成功 (幂等)
+ *   resume: -ENODEV 未安装; -ESRCH 目标已退出; 断点缺失时自动重绑, 失败返回该错误 */
+int  gyro_stop(void);
+int  gyro_resume(void);
 
 #endif /* _GYRO_H_ */

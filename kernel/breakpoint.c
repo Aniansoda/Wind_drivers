@@ -1,9 +1,11 @@
 /*
- * breakpoint.c — 四套断点框架
+ * breakpoint.c — 五套断点框架
  *   1. hwbp  : BRP/WRP debug 寄存器硬件断点 (perf hw_breakpoint), 16 点 + 记录
  *   2. ptebp : PTE 影子页执行断点 (改 PTE_UXN 触发 fault), 16 点 + 记录, 不用 debug 寄存器
  *   3. brkbp : BRK 软断点 (改写指令字节), 16 点 + 记录
  *   4. etmbp : ETM/PTM 分支追踪 (Coresight), 全局执行流观测
+ *   5. udpbp : UDP 断点 (kprobe ip_local_out / __udp4_lib_rcv), 按 pid/端口/方向过滤,
+ *              可选改写载荷。全部走 kprobe, 不动 debug 寄存器/页表/目标指令。
  *
  * 依赖: CONFIG_HAVE_HW_BREAKPOINT + CONFIG_PERF_EVENTS (GKI 默认开)。
  * 白名单外符号 (register_user_hw_breakpoint / unregister_hw_breakpoint /
@@ -33,6 +35,12 @@
 #include <linux/mm.h>
 #include <linux/ptrace.h>
 #include <linux/kprobes.h>
+#include <linux/skbuff.h>
+#include <linux/ip.h>
+#include <linux/in.h>
+#include <linux/vmalloc.h>
+#include <linux/jiffies.h>
+#include <linux/time.h>
 #include <asm/ptrace.h>
 #include <asm/sysreg.h>
 #include <asm/pgtable.h>
@@ -910,6 +918,419 @@ int brk_clear(pid_t pid, uintptr_t addr)
 EXPORT_SYMBOL(brk_clear);
 
 /* ===================================================================
+ * 5. udpbp : UDP 断点 (kprobe 内核 UDP 收发路径)
+ *
+ * 打点位置 (都是非 static 符号, 可 kprobe):
+ *   TX : ip_local_out(net, sk, skb)   x2 = skb, data 指向 IPv4 头
+ *   RX : __udp4_lib_rcv(skb, table, proto) x0 = skb, data 指向 UDP 头
+ *
+ * 过滤: pid(tgid) / 端口 / 方向。命中写环形记录, 可选改写载荷首
+ * patch_len 字节 (仅在 skb 未被 clone 时改写, 避免污染共享数据)。
+ * 不改 debug 寄存器、不改页表、不改目标进程地址空间。
+ *
+ * 未验证项:
+ *   - 仅 IPv4 (__udp4_lib_rcv); IPv6 走 __udp6_lib_rcv, 未接。
+ *   - TX 的 skb 已是构造好的 IPv4 包, data 指向 IP 头; 若上游走
+ *     GSO/frag 链 (非线性), 预览/改写只作用于线性区。
+ *   - RX 若目标内核在 __udp4_lib_rcv 入口前已 pull IP 头, 端口仍从
+ *     skb->data 的 UDP 头读; 该假设需真机用 tcpdump 对照一次。
+ * =================================================================== */
+#define UDPBP_REC_PER_SLOT  UDPBP_RECORD_MAX
+
+struct udpbp_slot
+{
+	bool used;
+	UDPBP_POINT_CONFIG cfg;
+	UDPBP_RECORD *recs;
+	u32 head;
+	u32 count;
+	u64 hits;
+};
+
+static struct udpbp_slot g_udpbp[UDPBP_MAX_SLOTS];
+static struct kprobe *g_udpbp_tx_kp;
+static struct kprobe *g_udpbp_rx_kp;
+static bool g_udpbp_armed;
+
+static void udpbp_rec_push(struct udpbp_slot *s, const UDPBP_RECORD *rec)
+{
+	u32 idx;
+
+	if (!s->recs)
+		return;
+
+	idx = s->head % UDPBP_REC_PER_SLOT;
+	memcpy(&s->recs[idx], rec, sizeof(*rec));
+	s->head = (s->head + 1) % UDPBP_REC_PER_SLOT;
+	if (s->count < UDPBP_REC_PER_SLOT)
+		s->count++;
+	s->hits++;
+}
+
+static u32 udpbp_rec_read(struct udpbp_slot *s, u32 start_index,
+			  UDPBP_RECORD *out, u32 max)
+{
+	u32 i, n = 0, oldest;
+
+	if (!s->recs || start_index >= s->count || max == 0)
+		return 0;
+
+	oldest = (s->head - s->count + UDPBP_REC_PER_SLOT) % UDPBP_REC_PER_SLOT;
+	for (i = start_index; i < s->count && n < max; i++)
+	{
+		u32 idx = (oldest + i) % UDPBP_REC_PER_SLOT;
+
+		memcpy(&out[n], &s->recs[idx], sizeof(UDPBP_RECORD));
+		n++;
+	}
+	return n;
+}
+
+/* 解析 skb 的 UDP 端口/载荷/地址。成功返回 true。 */
+static bool udpbp_parse(struct sk_buff *skb, u16 dir, u16 *sport, u16 *dport,
+			u8 **payload, u32 *plen, u32 *saddr, u32 *daddr)
+{
+	u8 *base, *uh;
+	u32 headlen, off;
+	struct iphdr *iph;
+
+	if (!skb || !skb->data || skb->len < 8)
+		return false;
+
+	base = skb->data;
+	headlen = skb_headlen(skb);
+
+	if (dir == UDPBP_DIR_RX)
+	{
+		u32 ip_off = skb->network_header;
+
+		if (ip_off < skb->end && (u32)ip_off + sizeof(struct iphdr) <= (u32)skb->end)
+		{
+			iph = (struct iphdr *)(skb->head + ip_off);
+			if (iph->version == 4 && iph->protocol == IPPROTO_UDP)
+			{
+				*saddr = (u32)iph->saddr; /* 网络序原样 */
+				*daddr = (u32)iph->daddr;
+			}
+		}
+		if (headlen < 8)
+			return false;
+		uh = base;
+		off = 0; /* base 已指向 UDP 头 */
+	}
+	else
+	{
+		if (headlen < sizeof(struct iphdr))
+			return false;
+		iph = (struct iphdr *)base;
+		if (iph->version != 4 || iph->protocol != IPPROTO_UDP || iph->ihl < 5)
+			return false;
+		off = (u32)iph->ihl * 4;
+		if (headlen < off + 8)
+			return false;
+		uh = base + off;
+		*saddr = (u32)iph->saddr; /* 网络序原样 */
+		*daddr = (u32)iph->daddr;
+	}
+
+	*sport = ((u16)uh[0] << 8) | uh[1];
+	*dport = ((u16)uh[2] << 8) | uh[3];
+	*payload = uh + 8;
+	*plen = (skb->len > off + 8) ? (skb->len - off - 8) : 0;
+	{
+		u32 lin = (headlen > off + 8) ? (headlen - off - 8) : 0;
+
+		if (*plen > lin)
+			*plen = lin;
+	}
+
+	return true;
+}
+
+static void udpbp_handle(struct sk_buff *skb, u16 dir)
+{
+	u16 sport = 0, dport = 0;
+	u32 plen = 0, saddr = 0, daddr = 0;
+	u8 *payload = NULL;
+	u32 pid;
+	int i;
+
+	if (!READ_ONCE(g_udpbp_armed) || !skb)
+		return;
+
+	pid = (u32)current->tgid;
+
+	if (!udpbp_parse(skb, dir, &sport, &dport, &payload, &plen, &saddr, &daddr))
+		return;
+
+	for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+	{
+		struct udpbp_slot *s = &g_udpbp[i];
+		UDPBP_RECORD rec;
+		u16 act;
+
+		if (!READ_ONCE(s->used))
+			continue;
+		if (s->cfg.dir != UDPBP_DIR_BOTH && s->cfg.dir != dir)
+			continue;
+		if (s->cfg.pid && s->cfg.pid != pid)
+			continue;
+		if (s->cfg.port)
+		{
+			u16 want = (dir == UDPBP_DIR_TX) ? dport : sport;
+
+			if (want != s->cfg.port)
+				continue;
+		}
+
+		act = s->cfg.action;
+
+		/* 改写: 只动线性区且 skb 未被 clone, 否则降级为只记录 */
+		if (act == UDPBP_ACT_REWRITE)
+		{
+			u32 n = s->cfg.patch_len;
+
+			if (!payload || n == 0 || n > plen || skb_cloned(skb))
+			{
+				act = UDPBP_ACT_LOG;
+			}
+			else
+			{
+				memcpy(payload, s->cfg.patch, n);
+			}
+		}
+
+		memset(&rec, 0, sizeof(rec));
+		rec.ts_ns = (u64)READ_ONCE(jiffies) * (NSEC_PER_SEC / HZ);
+		rec.pid = pid;
+		rec.saddr = saddr;
+		rec.daddr = daddr;
+		rec.sport = sport;
+		rec.dport = dport;
+		rec.dir = dir;
+		rec.action = act;
+		rec.len = plen;
+		rec.preview_len = (payload && plen) ? min_t(u32, plen, UDPBP_PREVIEW_MAX) : 0;
+		if (rec.preview_len)
+			memcpy(rec.preview, payload, rec.preview_len);
+
+		udpbp_rec_push(s, &rec);
+	}
+}
+
+static int udpbp_tx_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	/* ip_local_out(struct net *, struct sock *, struct sk_buff *) */
+	(void)p;
+	udpbp_handle((struct sk_buff *)regs->regs[2], UDPBP_DIR_TX);
+	return 0;
+}
+
+static int udpbp_rx_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	/* __udp4_lib_rcv(struct sk_buff *, struct udp_table *, int) */
+	(void)p;
+	udpbp_handle((struct sk_buff *)regs->regs[0], UDPBP_DIR_RX);
+	return 0;
+}
+
+/* 首次使用时懒注册探针 */
+static int udpbp_probe_ensure(void)
+{
+	if (g_udpbp_tx_kp || g_udpbp_rx_kp)
+		return 0;
+
+	g_udpbp_tx_kp = wind_kprobe_register_symbol("ip_local_out", udpbp_tx_pre, NULL);
+	g_udpbp_rx_kp = wind_kprobe_register_symbol("__udp4_lib_rcv", udpbp_rx_pre, NULL);
+
+	if (!g_udpbp_tx_kp && !g_udpbp_rx_kp)
+	{
+		printk(KERN_ERR "wind: udpbp probe register failed (ip_local_out / __udp4_lib_rcv)\n");
+		return -EOPNOTSUPP;
+	}
+	printk(KERN_INFO "wind: udpbp probes tx=%d rx=%d\n",
+	       g_udpbp_tx_kp ? 1 : 0, g_udpbp_rx_kp ? 1 : 0);
+	return 0;
+}
+
+int udpbp_set(int32_t slot_index, const UDPBP_POINT_CONFIG *point, int32_t *slot_out)
+{
+	struct udpbp_slot *s = NULL;
+	int i, ret;
+
+	if (!point)
+		return -EINVAL;
+	if (point->dir > UDPBP_DIR_BOTH || point->action > UDPBP_ACT_REWRITE)
+		return -EINVAL;
+	if (point->patch_len > UDPBP_PATCH_MAX)
+		return -EINVAL;
+	if (point->action == UDPBP_ACT_REWRITE && point->patch_len == 0)
+		return -EINVAL;
+
+	ret = udpbp_probe_ensure();
+	if (ret)
+		return ret;
+
+	if (slot_index >= 0)
+	{
+		if (slot_index >= UDPBP_MAX_SLOTS)
+			return -EINVAL;
+		s = &g_udpbp[slot_index];
+	}
+	else
+	{
+		for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+			if (!g_udpbp[i].used)
+			{
+				s = &g_udpbp[i];
+				break;
+			}
+		if (!s)
+			return -ENOSPC;
+	}
+
+	if (!s->recs)
+	{
+		s->recs = vzalloc(sizeof(UDPBP_RECORD) * UDPBP_REC_PER_SLOT);
+		if (!s->recs)
+			return -ENOMEM;
+		s->head = 0;
+		s->count = 0;
+		s->hits = 0;
+	}
+
+	memcpy(&s->cfg, point, sizeof(s->cfg));
+	WRITE_ONCE(s->used, true);
+	WRITE_ONCE(g_udpbp_armed, true);
+
+	if (slot_out)
+		*slot_out = (int32_t)(s - g_udpbp);
+
+	printk(KERN_INFO "wind: udpbp slot=%d pid=%u port=%u dir=%u act=%u len=%u\n",
+	       (int)(s - g_udpbp), point->pid, point->port, point->dir,
+	       point->action, point->patch_len);
+	return 0;
+}
+
+int udpbp_remove(int32_t slot_index)
+{
+	int i, n = 0;
+
+	for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+	{
+		struct udpbp_slot *s = &g_udpbp[i];
+
+		if (slot_index >= 0 && i != slot_index)
+			continue;
+		if (!s->used)
+			continue;
+
+		/* 只失活, 不释放记录环: kprobe 可能正在另一 CPU 上读它,
+		 * 真正的 vfree 留到 wind_bp_exit (探针已注销之后)。 */
+		WRITE_ONCE(s->used, false);
+		memset(&s->cfg, 0, sizeof(s->cfg));
+		s->head = 0;
+		s->count = 0;
+		s->hits = 0;
+		n++;
+		if (slot_index >= 0)
+			break;
+	}
+
+	{
+		bool any = false;
+
+		for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+			if (g_udpbp[i].used)
+				any = true;
+		WRITE_ONCE(g_udpbp_armed, any);
+	}
+
+	return n ? 0 : -ENOENT;
+}
+
+int udpbp_get_config(UDPBP_CONFIG *config_out)
+{
+	int i, n = 0;
+
+	if (!config_out)
+		return -EINVAL;
+
+	memset(config_out, 0, sizeof(*config_out));
+	for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+		if (g_udpbp[i].used)
+		{
+			memcpy(&config_out->slots[n], &g_udpbp[i].cfg,
+			       sizeof(UDPBP_POINT_CONFIG));
+			n++;
+		}
+	config_out->slot_count = (uint32_t)n;
+	return 0;
+}
+
+int udpbp_get_records(int32_t slot_index, uint32_t start_index,
+		      UDPBP_RECORD *records, uint32_t capacity, uint32_t *count_out)
+{
+	u32 n = 0;
+	int i;
+
+	if (!records || !count_out)
+		return -EINVAL;
+
+	if (slot_index >= 0)
+	{
+		if (slot_index >= UDPBP_MAX_SLOTS)
+			return -EINVAL;
+		n = udpbp_rec_read(&g_udpbp[slot_index], start_index, records, capacity);
+	}
+	else
+	{
+		/* 合并: 逐槽按序追加 (槽号升序, 单槽内按时间) */
+		for (i = 0; i < UDPBP_MAX_SLOTS && n < capacity; i++)
+		{
+			if (!g_udpbp[i].used)
+				continue;
+			n += udpbp_rec_read(&g_udpbp[i], start_index,
+					    records + n, capacity - n);
+		}
+	}
+
+	*count_out = n;
+	return 0;
+}
+
+int udpbp_clear_records(int32_t slot_index)
+{
+	int i, n = 0;
+
+	for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+	{
+		if (slot_index >= 0 && i != slot_index)
+			continue;
+		g_udpbp[i].head = 0;
+		g_udpbp[i].count = 0;
+		g_udpbp[i].hits = 0;
+		n++;
+		if (slot_index >= 0)
+			break;
+	}
+	return n ? 0 : -ENOENT;
+}
+
+/* 探针注销之后才能释放记录环 (handler 已不会再进来) */
+static void udpbp_free_all(void)
+{
+	int i;
+
+	for (i = 0; i < UDPBP_MAX_SLOTS; i++)
+		if (g_udpbp[i].recs)
+		{
+			vfree(g_udpbp[i].recs);
+			g_udpbp[i].recs = NULL;
+		}
+}
+
+/* ===================================================================
  * 统一清理
  * =================================================================== */
 void wind_bp_exit(void)
@@ -920,6 +1341,19 @@ void wind_bp_exit(void)
 	ptebp_remove();
 	brkbp_remove();
 	etmbp_remove();
+	udpbp_remove(-1);
+
+	if (g_udpbp_tx_kp)
+	{
+		wind_kprobe_unregister_symbol(g_udpbp_tx_kp);
+		g_udpbp_tx_kp = NULL;
+	}
+	if (g_udpbp_rx_kp)
+	{
+		wind_kprobe_unregister_symbol(g_udpbp_rx_kp);
+		g_udpbp_rx_kp = NULL;
+	}
+	udpbp_free_all();
 
 	if (g_ptebp_kp)
 	{

@@ -232,11 +232,76 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		gyro_set_enabled((bool)arg);
 		return 0;
 	case OP_GYRO_STOP:
-		gyro_stop();
-		return 0;
+		return gyro_stop();
 	case OP_GYRO_RESUME:
-		gyro_resume();
+		return gyro_resume();
+
+	/* ---- UDP 断点 (kprobe 内核 UDP 收发路径) ---- */
+	case OP_UDPBP_SET:
+	{
+		UDPBP_SET_REQUEST req;
+		int32_t slot = -1;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		ret = udpbp_set(req.slot_index, &req.point, &slot);
+		if (ret)
+			return ret;
+		if (req.slot_out &&
+		    copy_to_user((void __user *)req.slot_out, &slot, sizeof(slot)) != 0)
+			return -EFAULT;
 		return 0;
+	}
+	case OP_UDPBP_REMOVE:
+		return udpbp_remove((int32_t)arg);
+	case OP_UDPBP_GET_CONFIG:
+	{
+		UDPBP_CONFIG cfg;
+		int ret = udpbp_get_config(&cfg);
+
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_UDPBP_GET_RECORDS:
+	{
+		UDPBP_RECORDS_REQUEST req;
+		UDPBP_RECORD *kbuf;
+		uint32_t count = 0;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		if (req.capacity == 0 || req.capacity > 4096)
+			return -EINVAL;
+		kbuf = kmalloc(req.capacity * sizeof(UDPBP_RECORD), GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		ret = udpbp_get_records(req.slot_index, req.start_index, kbuf,
+					req.capacity, &count);
+		if (ret == 0 && count)
+			if (copy_to_user((void __user *)req.records, kbuf,
+					 count * sizeof(UDPBP_RECORD)) != 0)
+				ret = -EFAULT;
+		kfree(kbuf);
+		if (ret)
+			return ret;
+		if (req.count_out && copy_to_user((void __user *)req.count_out,
+						  &count, sizeof(count)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_UDPBP_CLEAR_RECORDS:
+	{
+		UDPBP_CLEAR_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return udpbp_clear_records(req.slot_index);
+	}
 
 	/* ---- 硬件断点 (BRP/WRP) ---- */
 	case OP_HWBP_SET:
