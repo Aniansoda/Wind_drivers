@@ -25,6 +25,8 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
 
 /* ---- 内核镜像 rodata 写保护绕过 (set_memory_rw 不接受内核镜像地址) ---- */
 int wind_force_kernel_page_rw(unsigned long va, bool writable);
+/* 只读探测: 校验整条页表路径后读叶子 AP[2], 不写页表 */
+int wind_kernel_page_ro_state(unsigned long va, bool *is_ro);
 
 /* ---- 影子页操作 (直接改目标进程 PTE 权限位, 无痕断点) ----
  * mask/val 为 pteval_t 位域 (PTE_UXN / PTE_PXN / PTE_RDONLY / PTE_VALID / PTE_AF)。

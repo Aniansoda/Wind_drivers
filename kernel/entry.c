@@ -8,6 +8,7 @@
 #include <linux/uaccess.h>
 #include <linux/mm.h>
 #include <asm/page.h>
+#include <asm/sysreg.h>
 #include "comm.h"
 #include "memory.h"
 #include "process.h"
@@ -42,6 +43,12 @@ static long (*g_null_ioctl)(struct file *, unsigned int, unsigned long);
 static int  (*g_null_mmap)(struct file *, struct vm_area_struct *);
 
 static struct driver_session *g_sess; /* 全局单例会话 */
+
+/* insmod wind.ko install_hook=0 → 只解析符号, 不动 rodata, 不装 fops hook。
+ * 用于设备上排障: 确认 insmod 本身是否安全。 */
+static bool install_hook = true;
+module_param(install_hook, bool, 0644);
+MODULE_PARM_DESC(install_hook, "install /dev/null fops hook at load time");
 
 /* 判断 ioctl cmd 是否属于独家操作码 (高 16 位 == 0x574E) */
 static inline bool is_wind_cmd(unsigned int cmd)
@@ -655,6 +662,7 @@ static int hooked_mmap(struct file *file, struct vm_area_struct *vma)
 static int hook_install(void)
 {
 	struct file *f;
+	bool is_ro = false;
 	int ret;
 
 	f = wind_filp_open(HOOK_PATH, O_RDONLY, 0);
@@ -669,12 +677,28 @@ static int hook_install(void)
 	g_null_mmap  = g_null_fops->mmap;
 	filp_close(f, NULL);
 
-	ret = fops_unlock();
+	/* 先只读探测: 页表路径是否走得通、叶子是否只读。探测失败绝不写。 */
+	printk(KERN_INFO "wind: ttbr1=%llx tcr=%llx fops=%p\n",
+	       (unsigned long long)read_sysreg(ttbr1_el1),
+	       (unsigned long long)read_sysreg(tcr_el1), g_null_fops);
+	ret = wind_kernel_page_ro_state((unsigned long)g_null_fops, &is_ro);
 	if (ret) {
-		printk(KERN_ERR "wind: set_memory_rw failed %d (need manual PTE bypass)\n", ret);
+		printk(KERN_ERR "wind: rodata pte probe failed %d (hook disabled)\n", ret);
 		g_null_fops = NULL;
-		return ret;
+		return 0; /* 不阻断加载: 模块留在内核里, dmesg 可读 */
 	}
+	printk(KERN_INFO "wind: null_fops %p pte=%s\n", g_null_fops,
+	       is_ro ? "ro" : "rw");
+
+	if (is_ro) {
+		ret = fops_unlock();
+		if (ret) {
+			printk(KERN_ERR "wind: force_rw failed %d (hook disabled)\n", ret);
+			g_null_fops = NULL;
+			return 0;
+		}
+	}
+
 	g_null_fops->unlocked_ioctl = hooked_ioctl;
 	g_null_fops->mmap = hooked_mmap;
 	fops_relock();
@@ -705,11 +729,19 @@ static int __init driver_entry(void)
 	ret = wind_sym_init();
 	if (ret)
 		return ret;
+
+	if (!install_hook) {
+		printk(KERN_INFO "wind: install_hook=0, 跳过 fops hook (仅符号解析)\n");
+		return 0;
+	}
+
 	ret = hook_install();
 	if (ret) {
 		wind_sym_exit();
 		return ret;
 	}
+	if (!g_null_fops)
+		printk(KERN_WARNING "wind: 已加载但通讯通道未建立, 见上方 rodata 报错\n");
 	return 0;
 }
 

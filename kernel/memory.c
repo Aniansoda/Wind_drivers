@@ -16,6 +16,8 @@
 #include <linux/mman.h>
 #include <linux/vmalloc.h>
 #include <linux/string.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -86,39 +88,55 @@ static void wind_unmap_phys(struct wind_phys_map *m)
  * 因此 3/4/5 级页表共用这一套索引。 */
 #define WIND_PT_BITS	(PAGE_SHIFT - 3)
 #define WIND_PT_IDXMASK	((1UL << WIND_PT_BITS) - 1)
+#define WIND_PTE_AF	((pteval_t)1 << 10) /* arm64 各级 descriptor bit10 */
 
 static inline unsigned long wind_lidx(unsigned long va, int lv)
 {
 	return (va >> (PAGE_SHIFT + (unsigned int)lv * WIND_PT_BITS)) & WIND_PT_IDXMASK;
 }
 
-/* 运行时确定内核页表层数: 由 task_size (== 1 << VA_BITS) 反推,
- * 不要求构建侧 CONFIG_PGTABLE_LEVELS 与设备内核一致。
- * VA_BITS=39 -> 3 级, VA_BITS=48 -> 4 级, VA_BITS=52 -> 5 级。 */
+/* 运行时确定内核页表层数。
+ * 首选 TCR_EL1.T1SZ (硬件真实配置: 64 - T1SZ = TTBR1 的 VA 位宽),
+ * 取不到才退回 task_size。VA_BITS=39 -> 3 级, 48 -> 4 级, 52 -> 5 级。 */
 static int wind_pgtable_levels_cached;
+
+/* TCR_EL1.T1SZ = bits[21:16] */
+static int wind_ttbr1_vabits(void)
+{
+	u64 tcr = read_sysreg(tcr_el1);
+	u32 t1sz = (u32)((tcr >> 16) & 0x3fUL);
+	int vabits = 64 - (int)t1sz;
+
+	if (vabits < 32 || vabits > 52)
+		return 0;
+	return vabits;
+}
 
 static int wind_pgtable_levels(void)
 {
 	int lv = READ_ONCE(wind_pgtable_levels_cached);
+	int vabits, n;
 
 	if (lv)
 		return lv;
 
-	lv = WIND_PGTABLE_LEVELS;
-	if (current && current->mm) {
+	vabits = wind_ttbr1_vabits();
+	if (!vabits && current && current->mm) {
 		unsigned long ts = current->mm->task_size;
 
-		if (ts >= (1UL << 32)) {
-			int vabits = 63 - __builtin_clzll((unsigned long long)ts);
-			int n = (vabits - PAGE_SHIFT + WIND_PT_BITS - 1) / WIND_PT_BITS;
-
-			if (n >= 3 && n <= 5) {
-				lv = n;
-				WRITE_ONCE(wind_pgtable_levels_cached, lv);
-			}
-		}
+		if (ts >= (1UL << 32))
+			vabits = 63 - __builtin_clzll((unsigned long long)ts);
 	}
-	return lv;
+	if (vabits < 25)
+		vabits = 39; /* 兜底: 按 3 级处理 */
+
+	n = (vabits - PAGE_SHIFT + WIND_PT_BITS - 1) / WIND_PT_BITS;
+	if (n < 3 || n > 5)
+		n = 3;
+
+	WRITE_ONCE(wind_pgtable_levels_cached, n);
+	pr_info("wind: vabits=%d pgtables=%d level(s)\n", vabits, n);
+	return n;
 }
 
 /* 按指定层数走目标 mm 的页表, 到 pte 级返回该项指针。
@@ -140,10 +158,12 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 	/* 顶层直接用 mm->pgd (已在直接映射区, 无需 vmap) */
 	pgd = mm->pgd + wind_lidx(va, levels - 1);
 	val = pgd_val(*pgd);
-	if (!val || (val & 0x3) != 0x3)
+	if (!val || (val & 0x3) != 0x3 || !(val & WIND_PTE_AF))
 		return NULL;
 
 	pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
+	if (!pa || !IS_ALIGNED(pa, PAGE_SIZE))
+		return NULL;
 
 	for (lv = levels - 2; lv >= 0; lv--) {
 		pteval_t *entry;
@@ -173,13 +193,15 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 			return (pte_t *)entry;
 		}
 
-		if (type != 0x3) {
+		if (type != 0x3 || !(val & WIND_PTE_AF)) {
 			wind_unmap_phys(&m);
 			return NULL;
 		}
 
 		pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
 		wind_unmap_phys(&m);
+		if (!pa || !IS_ALIGNED(pa, PAGE_SIZE))
+			return NULL;
 	}
 
 	return NULL;
@@ -231,7 +253,6 @@ static inline void wind_flush_tlb_va(unsigned long va)
 {
 	asm volatile("dsb ishst\n"
 		     "\ttlbi vaae1is, %0\n"
-		     "\ttlbi vale1is, %0\n"
 		     "\tdsb ish\n"
 		     "\tisb\n"
 		     : : "r" (va) : "memory");
@@ -242,11 +263,22 @@ static inline void wind_flush_tlb_va(unsigned long va)
  * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
  * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
  * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
+ *
+ * 安全策略: 先做一次 "只读校验遍历" —— 每级必须非零、必须是表项
+ * (0b11)、必须 AF=1, 叶子必须是页 (0b11) 或 block (0b01); 全部通过
+ * 才走第二遍真正改写。层数错了会在校验阶段就退出, 不会按错误的
+ * shift 去索引别的区域的表, 避免写坏无关 PTE 导致卡死/重启。
  * =================================================================== */
-/* 按指定层数从 TTBR1 根走一遍, 命中 block/section 或 pte 就改 AP[2]。 */
-static int wind_kpage_rw_walk(unsigned long va, bool writable, int levels)
+
+/* 叶子是 block (2MB/1GB) 映射时, 改 AP[2] 会把整块改成可写。
+ * 默认拒绝: 只允许 4K 页叶子 (rodata=full 内核)。需要时显式开启。 */
+static bool allow_block_patch;
+module_param(allow_block_patch, bool, 0644);
+MODULE_PARM_DESC(allow_block_patch, "allow patching AP[2] on block-mapped rodata");
+
+/* 只读校验: 返回 0 表示整条路径合法; *leaf_block 说明叶子是 block */
+static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
 {
-	const pteval_t AP_RO = (pteval_t)1 << 7; /* AP[2]: 1=只读 0=可写 */
 	struct wind_phys_map m;
 	phys_addr_t pa;
 	pteval_t val, type;
@@ -254,8 +286,16 @@ static int wind_kpage_rw_walk(unsigned long va, bool writable, int levels)
 
 	if (levels < 3 || levels > 5)
 		return -EINVAL;
+	if (!(va >> 63)) {
+		pr_err("wind: force_rw va=%lx 不在内核高半区\n", va);
+		return -EINVAL;
+	}
 
 	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
+	if (!pa) {
+		pr_err("wind: ttbr1 root pa = 0\n");
+		return -EINVAL;
+	}
 
 	for (lv = levels - 1; lv >= 0; lv--) {
 		pteval_t *entry;
@@ -268,48 +308,91 @@ static int wind_kpage_rw_walk(unsigned long va, bool writable, int levels)
 
 		entry = (pteval_t *)m.addr + wind_lidx(va, lv);
 		val = READ_ONCE(*entry);
-
-		if (!val) {
-			pr_err("wind: force_rw lv%d none va=%lx idx=%lu\n",
-			       lv, va, wind_lidx(va, lv));
-			wind_unmap_phys(&m);
-			return -EINVAL;
-		}
+		wind_unmap_phys(&m);
 
 		type = val & 0x3;
 
+		if (!val) {
+			pr_err("wind: force_rw lv%d none va=%lx idx=%lu (levels=%d)\n",
+			       lv, va, wind_lidx(va, lv), levels);
+			return -EINVAL;
+		}
+		if (!(val & WIND_PTE_AF)) {
+			pr_err("wind: force_rw lv%d AF=0 va=%lx val=%llx\n",
+			       lv, va, (unsigned long long)val);
+			return -EINVAL;
+		}
+
 		if (lv == 0) {
-			/* pte 级: 0b11 = 4KB 页 */
 			if (type != 0x3) {
 				pr_err("wind: force_rw pte bad va=%lx val=%llx\n",
 				       va, (unsigned long long)val);
-				wind_unmap_phys(&m);
 				return -EINVAL;
 			}
-			val = writable ? (val & ~AP_RO) : (val | AP_RO);
-			WRITE_ONCE(*entry, val);
-			wind_flush_tlb_va(va);
-			wind_unmap_phys(&m);
+			*leaf_block = false;
 			return 0;
 		}
 
 		if (type == 0x1) {
-			/* block/section 项: 直接改本级 AP[2] */
-			val = writable ? (val & ~AP_RO) : (val | AP_RO);
-			WRITE_ONCE(*entry, val);
-			wind_flush_tlb_va(va);
-			wind_unmap_phys(&m);
+			/* block/section 叶子 */
+			*leaf_block = true;
 			return 0;
 		}
 
 		if (type != 0x3) {
 			pr_err("wind: force_rw lv%d bad va=%lx val=%llx\n",
 			       lv, va, (unsigned long long)val);
+			return -EINVAL;
+		}
+
+		pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
+		if (!IS_ALIGNED(pa, PAGE_SIZE) || !pa) {
+			pr_err("wind: force_rw lv%d table pa bad %llx\n",
+			       lv, (unsigned long long)pa);
+			return -EINVAL;
+		}
+	}
+
+	return -EINVAL;
+}
+
+/* 校验通过后再走一遍, 只改叶子项的 AP[2] */
+static int wind_kpage_patch(unsigned long va, bool writable, int levels)
+{
+	const pteval_t AP_RO = (pteval_t)1 << 7; /* AP[2]: 1=只读 0=可写 */
+	struct wind_phys_map m;
+	phys_addr_t pa;
+	pteval_t val;
+	int lv;
+
+	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
+
+	for (lv = levels - 1; lv >= 0; lv--) {
+		pteval_t *entry;
+		pteval_t type;
+
+		m = wind_map_phys(pa, PAGE_SIZE);
+		if (!m.addr)
+			return -EINVAL;
+
+		entry = (pteval_t *)m.addr + wind_lidx(va, lv);
+		val = READ_ONCE(*entry);
+		type = val & 0x3;
+
+		if (lv == 0 || type == 0x1) {
+			pteval_t new = writable ? (val & ~AP_RO) : (val | AP_RO);
+
+			WRITE_ONCE(*entry, new);
+			wind_unmap_phys(&m);
+			wind_flush_tlb_va(va);
+			return 0;
+		}
+
+		if (type != 0x3) {
 			wind_unmap_phys(&m);
 			return -EINVAL;
 		}
 
-		/* 表项: 取下一级表的物理地址 */
 		pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
 		wind_unmap_phys(&m);
 	}
@@ -317,32 +400,78 @@ static int wind_kpage_rw_walk(unsigned long va, bool writable, int levels)
 	return -EINVAL;
 }
 
-/* ===================================================================
- * 内核镜像 rodata 写保护绕过。
- * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
- * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
- * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
- *
- * 层数: 运行时由 task_size 反推 (39 位 VA=3 级, 48 位=4 级, 52 位=5 级),
- * 不依赖构建侧 CONFIG_PGTABLE_LEVELS 与设备内核一致。
- * =================================================================== */
 int wind_force_kernel_page_rw(unsigned long va, bool writable)
 {
+	bool leaf_block = false;
 	int ret, levels;
 
 	va &= PAGE_MASK;
 
 	levels = wind_pgtable_levels();
-	ret = wind_kpage_rw_walk(va, writable, levels);
+
+	ret = wind_kpage_validate(va, levels, &leaf_block);
+	if (ret)
+		return ret;
+
+	if (leaf_block && !allow_block_patch) {
+		pr_err("wind: rodata 叶子是 block 映射, 拒绝改写 (需 rodata=full 或 allow_block_patch=1)\n");
+		return -EINVAL;
+	}
+
+	ret = wind_kpage_patch(va, writable, levels);
 	if (ret == 0) {
 		static bool wind_lv_ok;
 
 		if (!wind_lv_ok) {
 			wind_lv_ok = true;
-			pr_info("wind: kernel pgtables = %d level(s)\n", levels);
+			pr_info("wind: kernel pgtables = %d level(s), leaf %s\n",
+				levels, leaf_block ? "block" : "page");
 		}
 	}
 	return ret;
+}
+
+/* 只读探测: 整条路径校验通过后读叶子 AP[2], 不写任何东西。
+ * *is_ro = true 表示叶子当前只读。 */
+int wind_kernel_page_ro_state(unsigned long va, bool *is_ro)
+{
+	const pteval_t AP_RO = (pteval_t)1 << 7;
+	struct wind_phys_map m;
+	phys_addr_t pa;
+	pteval_t val;
+	bool leaf_block = false;
+	int lv, levels, ret;
+
+	if (!is_ro)
+		return -EINVAL;
+
+	va &= PAGE_MASK;
+	levels = wind_pgtable_levels();
+
+	ret = wind_kpage_validate(va, levels, &leaf_block);
+	if (ret)
+		return ret;
+
+	pa = (phys_addr_t)(read_sysreg(ttbr1_el1) & PHYS_MASK & (s32)PAGE_MASK);
+	for (lv = levels - 1; lv >= 0; lv--) {
+		pteval_t *entry;
+		pteval_t type;
+
+		m = wind_map_phys(pa, PAGE_SIZE);
+		if (!m.addr)
+			return -EINVAL;
+		entry = (pteval_t *)m.addr + wind_lidx(va, lv);
+		val = READ_ONCE(*entry);
+		wind_unmap_phys(&m);
+
+		type = val & 0x3;
+		if (lv == 0 || type == 0x1) {
+			*is_ro = !!(val & AP_RO);
+			return 0;
+		}
+		pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
+	}
+	return -EINVAL;
 }
 
 /* ===================================================================
