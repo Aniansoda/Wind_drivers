@@ -88,7 +88,7 @@ static void wind_unmap_phys(struct wind_phys_map *m)
  * 因此 3/4/5 级页表共用这一套索引。 */
 #define WIND_PT_BITS	(PAGE_SHIFT - 3)
 #define WIND_PT_IDXMASK	((1UL << WIND_PT_BITS) - 1)
-#define WIND_PTE_AF	((pteval_t)1 << 10) /* arm64 各级 descriptor bit10 */
+#define WIND_PTE_AF	((pteval_t)1 << 10) /* arm64 末级(page/block) descriptor 的 AF */
 
 static inline unsigned long wind_lidx(unsigned long va, int lv)
 {
@@ -158,7 +158,8 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 	/* 顶层直接用 mm->pgd (已在直接映射区, 无需 vmap) */
 	pgd = mm->pgd + wind_lidx(va, levels - 1);
 	val = pgd_val(*pgd);
-	if (!val || (val & 0x3) != 0x3 || !(val & WIND_PTE_AF))
+	/* 顶层是表描述符: bit10 不是 AF, 只校验类型 */
+	if (!val || (val & 0x3) != 0x3)
 		return NULL;
 
 	pa = (phys_addr_t)(val & PHYS_MASK & (s32)PAGE_MASK);
@@ -193,7 +194,7 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 			return (pte_t *)entry;
 		}
 
-		if (type != 0x3 || !(val & WIND_PTE_AF)) {
+		if (type != 0x3) {
 			wind_unmap_phys(&m);
 			return NULL;
 		}
@@ -264,10 +265,11 @@ static inline void wind_flush_tlb_va(unsigned long va)
  * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
  * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
  *
- * 安全策略: 先做一次 "只读校验遍历" —— 每级必须非零、必须是表项
- * (0b11)、必须 AF=1, 叶子必须是页 (0b11) 或 block (0b01); 全部通过
- * 才走第二遍真正改写。层数错了会在校验阶段就退出, 不会按错误的
- * shift 去索引别的区域的表, 避免写坏无关 PTE 导致卡死/重启。
+ * 安全策略: 先做一次 "只读校验遍历" —— 每级必须非零、非叶子级必须是表项
+ * (0b11) 且下一级表 PA 页对齐; 叶子必须是 4KB 页 (0b11) 或 block (0b01)
+ * 且 AF=1。全部通过才走第二遍真正改写。层数错了会在校验阶段就退出,
+ * 不会按错误的 shift 去索引别的区域的表, 避免写坏无关 PTE 导致卡死/重启。
+ * 注意: arm64 表描述符的 bit10 不是 AF (内核置 0), 只在末级校验 AF。
  * =================================================================== */
 
 /* 叶子是 block (2MB/1GB) 映射时, 改 AP[2] 会把整块改成可写。
@@ -317,15 +319,16 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
 			       lv, va, wind_lidx(va, lv), levels);
 			return -EINVAL;
 		}
-		if (!(val & WIND_PTE_AF)) {
-			pr_err("wind: force_rw lv%d AF=0 va=%lx val=%llx\n",
-			       lv, va, (unsigned long long)val);
-			return -EINVAL;
-		}
 
 		if (lv == 0) {
+			/* pte 级: 0b11 = 4KB 页, 叶子 AF 必须置位 */
 			if (type != 0x3) {
 				pr_err("wind: force_rw pte bad va=%lx val=%llx\n",
+				       va, (unsigned long long)val);
+				return -EINVAL;
+			}
+			if (!(val & WIND_PTE_AF)) {
+				pr_err("wind: force_rw pte AF=0 va=%lx val=%llx\n",
 				       va, (unsigned long long)val);
 				return -EINVAL;
 			}
@@ -334,11 +337,17 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
 		}
 
 		if (type == 0x1) {
-			/* block/section 叶子 */
+			/* block 叶子 (2MB/1GB): 末级描述符, bit10 是 AF */
+			if (!(val & WIND_PTE_AF)) {
+				pr_err("wind: force_rw lv%d block AF=0 va=%lx val=%llx\n",
+				       lv, va, (unsigned long long)val);
+				return -EINVAL;
+			}
 			*leaf_block = true;
 			return 0;
 		}
 
+		/* 表项 (0b11): arm64 表描述符 bit10 不是 AF (内核置 0), 不校验 */
 		if (type != 0x3) {
 			pr_err("wind: force_rw lv%d bad va=%lx val=%llx\n",
 			       lv, va, (unsigned long long)val);
