@@ -2,6 +2,7 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
+#include <linux/miscdevice.h>
 #include <linux/namei.h>
 #include <linux/fcntl.h>
 #include <linux/set_memory.h>
@@ -18,6 +19,7 @@
 #include "kgsl.h"
 #include "gyro.h"
 #include "sym.h"
+#include "nlcomm.h"
 
 /*
  * entry.c — 通讯通道 (hook /dev/null inode->i_fop, 不注册 dev 节点)
@@ -55,6 +57,20 @@ static struct driver_session *g_sess; /* 全局单例会话 */
 static bool install_hook = true;
 module_param(install_hook, bool, 0644);
 MODULE_PARM_DESC(install_hook, "install /dev/null fops hook at load time");
+
+/* 二分定位用: 0=不装, 1=只把 inode->i_fop 指向副本 (handler 保持真 null_fops),
+ * 2=额外覆盖 unlocked_ioctl/mmap (完整通道), 3=保留原 .open (纯诊断, 通道不生效)。 */
+static int hook_level = 2;
+module_param(hook_level, int, 0644);
+MODULE_PARM_DESC(hook_level, "0=off 1=fops redirect only 2=redirect+ioctl/mmap 3=keep orig .open");
+
+/* 通讯通道:
+ *   3 = 内核 netlink 私有协议 (默认, 无节点, 无 hook)
+ *   2 = 私有 misc 字符设备 (需 mknod)
+ *   1 = 重定向 /dev/null 的 inode->i_fop (有卡死重启记录) */
+static int transport = 3;
+module_param(transport, int, 0644);
+MODULE_PARM_DESC(transport, "3=netlink 2=misc chardev 1=/dev/null i_fop");
 
 /* 判断 ioctl cmd 是否属于独家操作码 (高 16 位 == 0x574E) */
 static inline bool is_wind_cmd(unsigned int cmd)
@@ -101,6 +117,9 @@ out:
 	kfree(req);
 	return ret;
 }
+
+/* netlink 通道与 ioctl 通道共用同一套分发逻辑 */
+long wind_dispatch_ioctl(unsigned int cmd, unsigned long arg);
 
 static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 {
@@ -626,6 +645,12 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 	}
 }
 
+/* netlink 通道入口: 协议号校验由 nlcomm.c 完成, 这里只做转发 */
+long wind_dispatch_ioctl(unsigned int cmd, unsigned long arg)
+{
+	return dispatch_ioctl(cmd, arg);
+}
+
 /* hook 后的 ioctl: 独家 opcode 走 dispatch, 其余走 null 原行为 */
 static long hooked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -647,6 +672,41 @@ static int hooked_mmap(struct file *file, struct vm_area_struct *vma)
 
 	target_va = (uintptr_t)(vma->vm_pgoff << PAGE_SHIFT);
 	return mmap_process_memory(g_sess, vma, target_va, vma->vm_end - vma->vm_start);
+}
+
+/* ---- transport=2: 私有 misc 字符设备, 不碰 /dev/null 也不碰 rodata ---- */
+static const struct file_operations g_wind_dev_fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = hooked_ioctl,
+	.mmap = hooked_mmap,
+};
+
+static struct miscdevice g_wind_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "windc",
+	.fops = &g_wind_dev_fops,
+	.mode = 0600,
+};
+
+static int wind_misc_install(void)
+{
+	int ret = wind_misc_register(&g_wind_misc);
+
+	if (ret) {
+		printk(KERN_ERR "wind: misc_register 失败 %d\n", ret);
+		return ret;
+	}
+	printk(KERN_INFO "wind: misc 设备已注册 name=%s minor=%u, 用户态 mknod PATH c 10 %u\n",
+	       g_wind_misc.name, g_wind_misc.minor, g_wind_misc.minor);
+	return 0;
+}
+
+static void wind_misc_remove(void)
+{
+	if (!g_wind_misc.this_device)
+		return;
+	wind_misc_deregister(&g_wind_misc);
+	printk(KERN_INFO "wind: misc 设备已注销\n");
 }
 
 /* ------------------------------------------------------------------
@@ -699,9 +759,19 @@ static int hook_install(void)
 	g_null_mmap  = real_fops->mmap;
 
 	memcpy(&g_wind_fops, real_fops, sizeof(g_wind_fops));
-	g_wind_fops.open = NULL; /* 阻断 chrdev_open, 保住本 fops */
-	g_wind_fops.unlocked_ioctl = hooked_ioctl;
-	g_wind_fops.mmap = hooked_mmap;
+	/* hook_level 3 = 纯诊断档: 保留原 .open, 让 chrdev_open 照常跑
+	 * (fops 会被换回真 null_fops, 通道不生效), 只留 inode 指向我们的副本。
+	 * 用来判断 '卡死重启' 是 .open 被跳过造成的, 还是重定向本身造成的。 */
+	if (hook_level != 3)
+		g_wind_fops.open = NULL; /* 阻断 chrdev_open, 保住本 fops */
+	if (hook_level >= 2) {
+		g_wind_fops.unlocked_ioctl = hooked_ioctl;
+		g_wind_fops.mmap = hooked_mmap;
+	} else if (hook_level == 1) {
+		printk(KERN_INFO "wind: hook_level=1, 只重定向 fops, 不覆盖 ioctl/mmap\n");
+	} else if (hook_level == 3) {
+		printk(KERN_INFO "wind: hook_level=3, 保留原 .open, 通道不生效(仅诊断)\n");
+	}
 	/* owner 必须为 NULL: 置 THIS_MODULE 的话, 系统里任何 exec 到 /dev/null
 	 * 的进程都会持一个模块引用, rmmod 永远 EBUSY。
 	 * 代价: 卸载后, 已存在的 /dev/null fd 若再发 ioctl 会跳进已释放内存。
@@ -719,6 +789,11 @@ static int hook_install(void)
 	       inode, g_inode_fop_orig, real_fops, &g_wind_fops);
 
 	filp_close(f, NULL);
+
+	if (hook_level == 3) {
+		printk(KERN_INFO "wind: hook_level=3 诊断档, 跳过自检 (通道本就不生效)\n");
+		return 0;
+	}
 
 	/* 自检: 重新打开 /dev/null, 必须落到我们的 fops 上; 否则立刻回滚,
 	 * 绝不把错误状态留在系统里 (这是上一轮留下野 f_op 的教训)。 */
@@ -774,18 +849,38 @@ static int __init driver_entry(void)
 	if (ret)
 		return ret;
 
-	if (!install_hook) {
-		printk(KERN_INFO "wind: install_hook=0, 跳过 fops hook (仅符号解析)\n");
+	if (!install_hook || hook_level <= 0 || transport == 0) {
+		printk(KERN_INFO "wind: 跳过通讯通道 (install_hook=%d hook_level=%d transport=%d), 仅符号解析\n",
+		       (int)install_hook, hook_level, transport);
 		return 0;
 	}
 
-	ret = hook_install();
-	if (ret) {
-		wind_sym_exit();
-		return ret;
+	if (transport == 3) {
+		ret = wind_nl_install();
+		if (!ret)
+			return 0;
+		printk(KERN_WARNING "wind: netlink 通道失败 %d, 回退 transport=2 (misc)\n", ret);
+		transport = 2;
 	}
-	if (!g_null_fops)
-		printk(KERN_WARNING "wind: 已加载但通讯通道未建立, 见上方报错\n");
+
+	if (transport == 2) {
+		ret = wind_misc_install();
+		if (!ret)
+			return 0;
+		printk(KERN_WARNING "wind: misc 通道失败 %d, 回退 transport=1 (/dev/null)\n", ret);
+		transport = 1;
+	}
+
+	if (transport == 1) {
+		ret = hook_install();
+		if (ret) {
+			wind_sym_exit();
+			return ret;
+		}
+		if (!g_null_fops)
+			printk(KERN_WARNING "wind: 已加载但通讯通道未建立, 见上方报错\n");
+	}
+
 	return 0;
 }
 
@@ -795,6 +890,8 @@ static void __exit driver_unload(void)
 	gyro_remove();
 	kgsl_hook_remove();
 	wind_bp_exit();
+	wind_nl_remove();
+	wind_misc_remove();
 	hook_remove();
 	if (g_sess) {
 		session_destroy(g_sess);

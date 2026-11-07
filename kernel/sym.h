@@ -64,6 +64,23 @@ struct file *wind_filp_open(const char *filename, int flags, umode_t mode);
 ssize_t wind_kernel_read(struct file *file, void *buf, size_t count, loff_t *pos);
 char *wind_file_path(struct file *filp, char *buf, int buflen);
 
+/* 私有字符设备 (白名单外, 运行时解析) */
+struct miscdevice;
+int wind_misc_register(struct miscdevice *misc);
+void wind_misc_deregister(struct miscdevice *misc);
+
+/* netlink 私有通道 (白名单外, 运行时解析; 编译期不产生 CRC 引用) */
+struct sock;
+struct sk_buff;
+struct net;
+struct netlink_kernel_cfg;
+struct sock *wind_netlink_kernel_create(struct net *net, int unit,
+					struct netlink_kernel_cfg *cfg);
+void wind_netlink_kernel_release(struct sock *sk);
+int wind_netlink_unicast(struct sock *ssk, struct sk_buff *skb, u32 portid, int nonblock);
+struct sk_buff *wind_alloc_skb(unsigned int size, gfp_t gfp);
+bool wind_netlink_available(void);
+
 /* 硬件断点 (白名单外, 运行时解析) */
 struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr,
 						    wind_perf_overflow_handler_t triggered,

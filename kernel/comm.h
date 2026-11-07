@@ -499,4 +499,21 @@ typedef struct _UDPBP_CLEAR_REQUEST
 #define MMAP_PID_SHIFT   32
 #define MMAP_OFF_MASK    0xFFFFFFFFULL
 
+/*
+ * ---- netlink 传输 (无节点通道) ----
+ * 内核注册一个私有 AF_NETLINK 协议号, 用户态 socket(AF_NETLINK, SOCK_RAW, unit)
+ * 发一条 WIND_NL_MSG, 内核在同一发送进程上下文里执行操作并回一条同样结构。
+ * arg 是用户态指针, 语义与 ioctl 的 arg 完全一致, 因此 dispatch 逻辑不用改。
+ * 不建任何设备节点, 不 hook 任何内核对象。
+ */
+#define WIND_NL_MAGIC 0x574E4C31u /* "WNL1" */
+
+typedef struct _WIND_NL_MSG
+{
+	uint32_t magic;  /* WIND_NL_MAGIC */
+	uint32_t op;     /* OPERATIONS 之一 */
+	uint64_t arg;    /* 用户态指针, 同 ioctl 第三参数 */
+	int64_t  result; /* 内核回填的返回值 */
+} WIND_NL_MSG, *PWIND_NL_MSG;
+
 #endif /* _COMM_H_ */

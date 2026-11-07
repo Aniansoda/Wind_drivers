@@ -8,6 +8,7 @@
 #include <linux/io.h>
 #include <linux/vmalloc.h>
 #include <linux/fs.h>
+#include <linux/miscdevice.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
 
@@ -55,6 +56,23 @@ typedef char *(*file_path_fn)(struct file *, char *, int);
 static filp_open_fn g_filp_open = NULL;
 static kernel_read_fn g_kernel_read = NULL;
 static file_path_fn g_file_path = NULL;
+
+/* 私有字符设备注册 (白名单外) */
+typedef int (*misc_register_fn)(struct miscdevice *);
+typedef void (*misc_deregister_fn)(struct miscdevice *);
+static misc_register_fn g_misc_register = NULL;
+static misc_deregister_fn g_misc_deregister = NULL;
+
+/* netlink 私有通道 (白名单外) */
+typedef struct sock *(*netlink_kernel_create_fn)(struct net *, int,
+						 struct netlink_kernel_cfg *);
+typedef void (*netlink_kernel_release_fn)(struct sock *);
+typedef int (*netlink_unicast_fn)(struct sock *, struct sk_buff *, u32, int);
+typedef struct sk_buff *(*alloc_skb_fn)(unsigned int, gfp_t);
+static netlink_kernel_create_fn g_netlink_kernel_create = NULL;
+static netlink_kernel_release_fn g_netlink_kernel_release = NULL;
+static netlink_unicast_fn g_netlink_unicast = NULL;
+static alloc_skb_fn g_alloc_skb = NULL;
 
 /* 硬件断点 (白名单外) */
 typedef struct perf_event *(*register_user_hw_breakpoint_fn)(struct perf_event_attr *,
@@ -240,6 +258,54 @@ char *wind_file_path(struct file *filp, char *buf, int buflen)
 	return g_file_path(filp, buf, buflen);
 }
 
+/* 私有字符设备注册 (白名单外, 运行时解析) */
+int wind_misc_register(struct miscdevice *misc)
+{
+	if (!g_misc_register)
+		return -EOPNOTSUPP;
+	return g_misc_register(misc);
+}
+
+void wind_misc_deregister(struct miscdevice *misc)
+{
+	if (g_misc_deregister)
+		g_misc_deregister(misc);
+}
+
+struct sock *wind_netlink_kernel_create(struct net *net, int unit,
+					struct netlink_kernel_cfg *cfg)
+{
+	if (!g_netlink_kernel_create)
+		return NULL;
+	return g_netlink_kernel_create(net, unit, cfg);
+}
+
+void wind_netlink_kernel_release(struct sock *sk)
+{
+	if (g_netlink_kernel_release && sk)
+		g_netlink_kernel_release(sk);
+}
+
+int wind_netlink_unicast(struct sock *ssk, struct sk_buff *skb, u32 portid, int nonblock)
+{
+	if (!g_netlink_unicast)
+		return -EOPNOTSUPP;
+	return g_netlink_unicast(ssk, skb, portid, nonblock);
+}
+
+struct sk_buff *wind_alloc_skb(unsigned int size, gfp_t gfp)
+{
+	if (!g_alloc_skb)
+		return NULL;
+	return g_alloc_skb(size, gfp);
+}
+
+bool wind_netlink_available(void)
+{
+	return g_netlink_kernel_create && g_netlink_kernel_release &&
+	       g_netlink_unicast && g_alloc_skb;
+}
+
 struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr,
 						    wind_perf_overflow_handler_t triggered,
 						    void *context, struct task_struct *tsk)
@@ -289,12 +355,24 @@ int wind_sym_init(void)
 	g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)wind_kprobe_resolve("unregister_hw_breakpoint");
 	g_copy_from_user_nofault = (copy_from_user_nofault_fn)wind_kprobe_resolve("copy_from_user_nofault");
 	g_copy_to_user_nofault = (copy_to_user_nofault_fn)wind_kprobe_resolve("copy_to_user_nofault");
+	g_misc_register = (misc_register_fn)wind_kprobe_resolve("misc_register");
+	g_misc_deregister = (misc_deregister_fn)wind_kprobe_resolve("misc_deregister");
+	g_netlink_kernel_create = (netlink_kernel_create_fn)wind_kprobe_resolve("netlink_kernel_create");
+	g_netlink_kernel_release = (netlink_kernel_release_fn)wind_kprobe_resolve("netlink_kernel_release");
+	g_netlink_unicast = (netlink_unicast_fn)wind_kprobe_resolve("netlink_unicast");
+	g_alloc_skb = (alloc_skb_fn)wind_kprobe_resolve("__alloc_skb");
 
-	pr_info("wind: sym vmap=%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px\n",
+	pr_info("wind: sym misc=%px/%px nl=%px/%px/%px skb=%px\n",
+		(void *)g_misc_register, (void *)g_misc_deregister,
+		(void *)g_netlink_kernel_create, (void *)g_netlink_kernel_release,
+		(void *)g_netlink_unicast, (void *)g_alloc_skb);
+
+	pr_info("wind: sym vmap=%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px misc=%px/%px\n",
 		(void *)g_free_vm_area, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
 		(void *)g_filp_open, (void *)g_kernel_read, (void *)g_file_path,
 		(void *)g_register_user_hw_breakpoint, (void *)g_unregister_hw_breakpoint,
-		(void *)g_copy_from_user_nofault, (void *)g_copy_to_user_nofault);
+		(void *)g_copy_from_user_nofault, (void *)g_copy_to_user_nofault,
+		(void *)g_misc_register, (void *)g_misc_deregister);
 
 	return 0;
 }
@@ -318,4 +396,10 @@ void wind_sym_exit(void)
 	g_unregister_hw_breakpoint = NULL;
 	g_copy_from_user_nofault = NULL;
 	g_copy_to_user_nofault = NULL;
+	g_misc_register = NULL;
+	g_misc_deregister = NULL;
+	g_netlink_kernel_create = NULL;
+	g_netlink_kernel_release = NULL;
+	g_netlink_unicast = NULL;
+	g_alloc_skb = NULL;
 }
