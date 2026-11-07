@@ -273,13 +273,16 @@ static inline void wind_flush_tlb_va(unsigned long va)
  * =================================================================== */
 
 /* 叶子是 block (2MB/1GB) 映射时, 改 AP[2] 会把整块改成可写。
- * 默认拒绝: 只允许 4K 页叶子 (rodata=full 内核)。需要时显式开启。 */
+ * 只允许 NX 数据块 (PXN|UXN 都置位, 即 .rodata); 可执行块一律拒绝,
+ * 除非显式 allow_block_patch=1 强制。 */
 static bool allow_block_patch;
 module_param(allow_block_patch, bool, 0644);
-MODULE_PARM_DESC(allow_block_patch, "allow patching AP[2] on block-mapped rodata");
+MODULE_PARM_DESC(allow_block_patch, "force allow AP[2] patch on executable block leaf");
 
-/* 只读校验: 返回 0 表示整条路径合法; *leaf_block 说明叶子是 block */
-static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
+/* 只读校验: 返回 0 表示整条路径合法; *leaf_block 说明叶子是 block,
+ * *leaf_val 输出叶子描述符原始值 (供 NX 判定)。 */
+static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block,
+			       pteval_t *leaf_val)
 {
 	struct wind_phys_map m;
 	phys_addr_t pa;
@@ -298,7 +301,6 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
 		pr_err("wind: ttbr1 root pa = 0\n");
 		return -EINVAL;
 	}
-
 	for (lv = levels - 1; lv >= 0; lv--) {
 		pteval_t *entry;
 
@@ -333,6 +335,7 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
 				return -EINVAL;
 			}
 			*leaf_block = false;
+			*leaf_val = val;
 			return 0;
 		}
 
@@ -344,6 +347,7 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block)
 				return -EINVAL;
 			}
 			*leaf_block = true;
+			*leaf_val = val;
 			return 0;
 		}
 
@@ -411,20 +415,32 @@ static int wind_kpage_patch(unsigned long va, bool writable, int levels)
 
 int wind_force_kernel_page_rw(unsigned long va, bool writable)
 {
+	const pteval_t PXN = (pteval_t)1 << 53; /* 特权执行禁止: 1 = 数据段 */
+	const pteval_t UXN = (pteval_t)1 << 54;
 	bool leaf_block = false;
+	pteval_t leaf_val = 0;
 	int ret, levels;
 
 	va &= PAGE_MASK;
 
 	levels = wind_pgtable_levels();
 
-	ret = wind_kpage_validate(va, levels, &leaf_block);
+	ret = wind_kpage_validate(va, levels, &leaf_block, &leaf_val);
 	if (ret)
 		return ret;
 
-	if (leaf_block && !allow_block_patch) {
-		pr_err("wind: rodata 叶子是 block 映射, 拒绝改写 (需 rodata=full 或 allow_block_patch=1)\n");
-		return -EINVAL;
+	/* block 叶子: 只允许 NX 数据块 (rodata)。可执行块需显式强制。 */
+	if (leaf_block) {
+		bool nx = (leaf_val & PXN) && (leaf_val & UXN);
+
+		if (!nx && !allow_block_patch) {
+			pr_err("wind: block 叶子是可执行段, 拒绝改写 (val=%llx)\n",
+			       (unsigned long long)leaf_val);
+			return -EINVAL;
+		}
+		if (!allow_block_patch)
+			pr_info("wind: block 叶子 NX 数据段, 整块 2MB 临时开放 (val=%llx)\n",
+				(unsigned long long)leaf_val);
 	}
 
 	ret = wind_kpage_patch(va, writable, levels);
@@ -447,7 +463,7 @@ int wind_kernel_page_ro_state(unsigned long va, bool *is_ro)
 	const pteval_t AP_RO = (pteval_t)1 << 7;
 	struct wind_phys_map m;
 	phys_addr_t pa;
-	pteval_t val;
+	pteval_t val, leaf_val = 0;
 	bool leaf_block = false;
 	int lv, levels, ret;
 
@@ -457,7 +473,7 @@ int wind_kernel_page_ro_state(unsigned long va, bool *is_ro)
 	va &= PAGE_MASK;
 	levels = wind_pgtable_levels();
 
-	ret = wind_kpage_validate(va, levels, &leaf_block);
+	ret = wind_kpage_validate(va, levels, &leaf_block, &leaf_val);
 	if (ret)
 		return ret;
 
