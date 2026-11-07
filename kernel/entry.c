@@ -1,11 +1,13 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/cdev.h>
 #include <linux/namei.h>
 #include <linux/fcntl.h>
 #include <linux/set_memory.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/string.h>
 #include <linux/mm.h>
 #include <asm/page.h>
 #include <asm/sysreg.h>
@@ -18,19 +20,23 @@
 #include "sym.h"
 
 /*
- * entry.c — 通讯通道 (hook /dev/null fops, 不注册 dev 节点)
+ * entry.c — 通讯通道 (hook /dev/null inode->i_fop, 不注册 dev 节点)
  *
  * 不在 /dev 注册固定节点 (misc_register 会留下 /dev/xxx 可见节点),
- * 改为 hook 系统自带 /dev/null 的 file_operations->unlocked_ioctl / mmap。
- * 用户态 open("/dev/null") + ioctl(WIND_OP_*) 通讯, /dev 下无可疑节点。
+ * 改为把 /dev/null inode 的 i_fop 指向本模块内的一份 file_operations
+ * 副本 (内容复制自真 null_fops, 只覆盖 unlocked_ioctl / mmap, .open 置空
+ * 以阻断 chrdev_open)。用户态 open("/dev/null") + ioctl(WIND_OP_*) 通讯,
+ * /dev 下无可疑节点。
  *
- * 为什么选 /dev/null:
- *   系统恒定存在、用户态必能打开; null_fops 的 unlocked_ioctl 与 mmap
- *   均为 NULL, 替换后不影响原有语义 (非 magic ioctl 返回 -ENOTTY)。
+ * 为什么改 inode 而不是改 null_fops: null_fops 在 .rodata, 该核 rodata 是
+ *   2MB block 映射, 改描述符 AP[2] 会让整块 2MB 短暂可写, 真机实测直接
+ *   卡死重启。inode 是 kmalloc 对象, i_fop 指针本就可写, 只写 8 字节。
  *
- * 写保护: null_fops 位于内核 rodata, 用 set_memory_rw/set_memory_ro 临时
- *   放开页权限再恢复。若目标内核未导出 set_memory_rw (GPL), 需手动改
- *   PTE 清 PTE_WRITE (未验证兜底)。
+ * 为什么选 /dev/null: 系统恒定存在、用户态必能打开; 原 null_fops 的
+ *   unlocked_ioctl 与 mmap 均为 NULL, 替换后不影响原有语义。
+ *
+ * 卸载: 重新 filp_open 取当前 inode 并把 i_fop 恢复成保存的原值。
+ *   fops.owner = NULL, rmmod 不会被 /dev/null 的持有者卡住。
  *
  * 会话: 改全局单例 g_sess (hook 复用 /dev/null 的 file, 无法用
  *   file->private_data 存会话)。外挂驱动单用户态进程使用, 不额外加锁。
@@ -56,26 +62,10 @@ static inline bool is_wind_cmd(unsigned int cmd)
 	return (cmd & 0xFFFF0000u) == (WIND_OP_BASE & 0xFFFF0000u);
 }
 
-/* ---- fops 写保护绕过 (null_fops 在 rodata, set_memory_rw 对内核镜像返回 EINVAL) ---- */
-static int fops_unlock(void)
-{
-	unsigned long page = (unsigned long)g_null_fops & PAGE_MASK;
-	int ret;
-
-	ret = wind_set_memory_rw(page, 1);
-	if (ret == 0)
-		return 0;
-	/* set_memory_rw 不接受内核镜像 rodata 地址, 降级到 PTE 级改写 */
-	return wind_force_kernel_page_rw(page, true);
-}
-
-static void fops_relock(void)
-{
-	unsigned long page = (unsigned long)g_null_fops & PAGE_MASK;
-
-	if (wind_force_kernel_page_rw(page, false))
-		printk(KERN_WARNING "wind: force ro failed (page left rw)\n");
-}
+/* ---- 说明: null_fops 在 .rodata, 该核是 2MB block 映射, 改描述符 AP[2]
+ * 会让整块短暂可写并实测触发卡死重启, 因此装载路径完全不碰 rodata。
+ * 通讯通道改为写 /dev/null 的 inode->i_fop (kmalloc 对象, 本就可写)。
+ */
 
 /*
  * 批量请求: 用户态传 BATCH_REQUEST 头 + count 个 BATCH_ITEM。
@@ -659,11 +649,32 @@ static int hooked_mmap(struct file *file, struct vm_area_struct *vma)
 	return mmap_process_memory(g_sess, vma, target_va, vma->vm_end - vma->vm_start);
 }
 
+/* ------------------------------------------------------------------
+ * 通讯通道: 改 /dev/null 的 inode->i_fop 指向本模块内的 fops 副本。
+ *
+ * 为什么不改 null_fops 本身: null_fops 在 .rodata, 该核 rodata 是 2MB
+ * block 映射, 改 block 描述符 AP[2] 会让整块 2MB 短暂可写, 实测触发
+ * 卡死重启。inode 与 struct cdev 都是 kmalloc 对象, 字段本就可写。
+ *
+ * 字符设备 inode->i_fop 本来是 def_chr_fops (只有 .open = chrdev_open),
+ * open 时 chrdev_open 用 inode->i_cdev->ops (= memory_fops) 的 .open
+ * 调 memory_open, 再 replace_fops 换成真正的 null_fops。
+ * 所以副本必须:
+ *   1. 内容取 filp_open 之后的 f->f_op (此时已是真 null_fops 的 read/write/llseek)
+ *   2. .open 置 NULL → chrdev_open 不被调用, 不会被换回真 null_fops
+ *   3. 只覆盖 unlocked_ioctl / mmap
+ * 全程只写 inode->i_fop 一个指针与本模块 .data, 不碰页表、不碰 rodata。
+ * ------------------------------------------------------------------ */
+static struct file_operations g_wind_fops;
+static const struct file_operations *g_inode_fop_orig; /* 原 inode->i_fop, 卸载恢复 */
+static struct inode *g_null_inode;
+
 static int hook_install(void)
 {
+	const struct file_operations *real_fops;
+	struct inode *inode;
 	struct file *f;
-	bool is_ro = false;
-	int ret;
+	int ret = 0;
 
 	f = wind_filp_open(HOOK_PATH, O_RDONLY, 0);
 	if (IS_ERR(f)) {
@@ -672,52 +683,61 @@ static int hook_install(void)
 		return ret;
 	}
 
-	g_null_fops = (struct file_operations *)f->f_op;
-	g_null_ioctl = g_null_fops->unlocked_ioctl;
-	g_null_mmap  = g_null_fops->mmap;
+	inode = f->f_inode;
+	/* 打开过的 /dev/null: f_op 已经过 memory_open 换成真正的 null_fops */
+	real_fops = f->f_op;
+	if (!inode || !real_fops) {
+		printk(KERN_ERR "wind: 取不到 %s 的 fops/inode\n", HOOK_PATH);
+		filp_close(f, NULL);
+		return 0;
+	}
+
+	g_null_fops = (struct file_operations *)real_fops;
+	g_null_ioctl = real_fops->unlocked_ioctl;
+	g_null_mmap  = real_fops->mmap;
+
+	memcpy(&g_wind_fops, real_fops, sizeof(g_wind_fops));
+	g_wind_fops.open = NULL; /* 阻断 chrdev_open, 保住本 fops */
+	g_wind_fops.unlocked_ioctl = hooked_ioctl;
+	g_wind_fops.mmap = hooked_mmap;
+	/* owner 必须为 NULL: 置 THIS_MODULE 的话, 系统里任何 exec 到 /dev/null
+	 * 的进程都会持一个模块引用, rmmod 永远 EBUSY。
+	 * 代价: 卸载后, 已存在的 /dev/null fd 若再发 ioctl 会跳进已释放内存。
+	 * read/write 指向内核真函数, 不受影响; 实际只有本 loader 会发 ioctl,
+	 * 卸载即退出, 不触发。 */
+	g_wind_fops.owner = NULL;
+
+	g_inode_fop_orig = inode->i_fop;
+	g_null_inode = inode;
+
+	/* 单指针赋值, arm64 8 字节对齐写原子 */
+	WRITE_ONCE(inode->i_fop, &g_wind_fops);
+
+	printk(KERN_INFO "wind: i_fop hooked inode=%px orig=%px real=%px new=%px\n",
+	       inode, g_inode_fop_orig, real_fops, &g_wind_fops);
+
 	filp_close(f, NULL);
-
-	/* 先只读探测: 页表路径是否走得通、叶子是否只读。探测失败绝不写。 */
-	printk(KERN_INFO "wind: ttbr1=%llx tcr=%llx fops=%p\n",
-	       (unsigned long long)read_sysreg(ttbr1_el1),
-	       (unsigned long long)read_sysreg(tcr_el1), g_null_fops);
-	ret = wind_kernel_page_ro_state((unsigned long)g_null_fops, &is_ro);
-	if (ret) {
-		printk(KERN_ERR "wind: rodata pte probe failed %d (hook disabled)\n", ret);
-		g_null_fops = NULL;
-		return 0; /* 不阻断加载: 模块留在内核里, dmesg 可读 */
-	}
-	printk(KERN_INFO "wind: null_fops %p pte=%s\n", g_null_fops,
-	       is_ro ? "ro" : "rw");
-
-	if (is_ro) {
-		ret = fops_unlock();
-		if (ret) {
-			printk(KERN_ERR "wind: force_rw failed %d (hook disabled)\n", ret);
-			g_null_fops = NULL;
-			return 0;
-		}
-	}
-
-	g_null_fops->unlocked_ioctl = hooked_ioctl;
-	g_null_fops->mmap = hooked_mmap;
-	fops_relock();
-
-	printk(KERN_INFO "wind: fops hook installed (fops=%p)\n", g_null_fops);
 	return 0;
 }
 
 static void hook_remove(void)
 {
-	if (!g_null_fops)
+	struct file *f;
+
+	if (!g_null_fops || !g_inode_fop_orig)
 		return;
 
-	fops_unlock();
-	g_null_fops->unlocked_ioctl = g_null_ioctl;
-	g_null_fops->mmap = g_null_mmap;
-	fops_relock();
+	/* 重新打开取当前 inode, 不依赖保存的 inode 指针 (可能被回收) */
+	f = wind_filp_open(HOOK_PATH, O_RDONLY, 0);
+	if (!IS_ERR(f)) {
+		if (f->f_inode)
+			WRITE_ONCE(f->f_inode->i_fop, g_inode_fop_orig);
+		filp_close(f, NULL);
+	}
 
-	printk(KERN_INFO "wind: fops hook removed\n");
+	printk(KERN_INFO "wind: i_fop restored\n");
+	g_null_inode = NULL;
+	g_inode_fop_orig = NULL;
 	g_null_fops = NULL;
 }
 
@@ -741,7 +761,7 @@ static int __init driver_entry(void)
 		return ret;
 	}
 	if (!g_null_fops)
-		printk(KERN_WARNING "wind: 已加载但通讯通道未建立, 见上方 rodata 报错\n");
+		printk(KERN_WARNING "wind: 已加载但通讯通道未建立, 见上方报错\n");
 	return 0;
 }
 
