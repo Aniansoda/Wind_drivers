@@ -669,6 +669,8 @@ static struct file_operations g_wind_fops;
 static const struct file_operations *g_inode_fop_orig; /* 原 inode->i_fop, 卸载恢复 */
 static struct inode *g_null_inode;
 
+static void hook_remove(void);
+
 static int hook_install(void)
 {
 	const struct file_operations *real_fops;
@@ -717,6 +719,24 @@ static int hook_install(void)
 	       inode, g_inode_fop_orig, real_fops, &g_wind_fops);
 
 	filp_close(f, NULL);
+
+	/* 自检: 重新打开 /dev/null, 必须落到我们的 fops 上; 否则立刻回滚,
+	 * 绝不把错误状态留在系统里 (这是上一轮留下野 f_op 的教训)。 */
+	f = wind_filp_open(HOOK_PATH, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		printk(KERN_ERR "wind: 自检 filp_open 失败 %ld, 回滚\n", PTR_ERR(f));
+		hook_remove();
+		return 0;
+	}
+	if (f->f_op != &g_wind_fops) {
+		printk(KERN_ERR "wind: 自检未命中 (f_op=%px), 回滚\n",
+		       (void *)f->f_op);
+		filp_close(f, NULL);
+		hook_remove();
+		return 0;
+	}
+	filp_close(f, NULL);
+	printk(KERN_INFO "wind: 自检通过, /dev/null 已指向 wind fops\n");
 	return 0;
 }
 
@@ -729,11 +749,15 @@ static void hook_remove(void)
 
 	/* 重新打开取当前 inode, 不依赖保存的 inode 指针 (可能被回收) */
 	f = wind_filp_open(HOOK_PATH, O_RDONLY, 0);
-	if (!IS_ERR(f)) {
-		if (f->f_inode)
-			WRITE_ONCE(f->f_inode->i_fop, g_inode_fop_orig);
-		filp_close(f, NULL);
+	if (IS_ERR(f)) {
+		printk(KERN_ERR "wind: 恢复失败 filp_open %ld —— 卸载前必须重启\n",
+		       PTR_ERR(f));
+		return; /* 保留 g_inode_fop_orig, 不置空, 让下次卸载再试 */
 	}
+
+	if (f->f_inode)
+		WRITE_ONCE(f->f_inode->i_fop, g_inode_fop_orig);
+	filp_close(f, NULL);
 
 	printk(KERN_INFO "wind: i_fop restored\n");
 	g_null_inode = NULL;
