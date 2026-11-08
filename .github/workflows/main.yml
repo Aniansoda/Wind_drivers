@@ -23,6 +23,11 @@ jobs:
             cc: "LLVM=1"
             llvmver: "14"
             llvm_unprefixed: "1"
+            # GKI 5.10 默认 CONFIG_LTO_CLANG_THIN=y，vmlinux.o 的 LTO 链接
+            # 单进程要 10G+ 内存，runner 16G 直接被 OOM 杀（日志就一行 Killed）。
+            # 外部模块不需要内核 LTO / CFI，vermagic 也不含这两项，
+            # 关掉既省内存又不影响 wind.ko 的加载校验。
+            no_lto: "1"
             mode: full
           - name: android14-5.15.167
             kernel_version: "5.15.167"
@@ -35,6 +40,7 @@ jobs:
             cc: "LLVM=1"
             llvmver: "17"
             llvm_unprefixed: "1"
+            no_lto: "1"
             mode: full
           - name: android14-6.1
             kernel_version: ""
@@ -80,6 +86,20 @@ jobs:
     steps:
       - name: Checkout driver source
         uses: actions/checkout@v4
+
+      - name: Add swap (LTO 兜底)
+        run: |
+          # arm64 vmlinux 的 LTO 链接是本项目的内存峰值，runner 只有 16G，
+          # 被 OOM 杀掉时日志只有一个 "Killed"，没有任何可读错误。
+          if [ ! -f /swapfile ]; then
+            sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile > /dev/null
+            sudo swapon /swapfile
+          fi
+          free -m
+          swapon --show || true
+          df -h / | tail -1
 
       - name: Install cross toolchain
         run: |
@@ -188,7 +208,23 @@ jobs:
             --disable CONFIG_MEM_ALLOC_PROFILING \
             --disable CONFIG_WERROR \
             || true
+          # 5.x 关掉 LTO / CFI：GKI 5.10 / 5.15 默认 CONFIG_LTO_CLANG_THIN=y，
+          # `LTO vmlinux.o` 是单进程链接，峰值 10G+ 内存，runner 16G 直接 OOM
+          # （日志只有一行 Killed，看不出原因）。外部模块不需要内核 LTO / CFI，
+          # vermagic 也不含这两项，关掉不影响 wind.ko 的加载校验。
+          if [ "${{ matrix.no_lto }}" = "1" ]; then
+            ./scripts/config \
+              --disable CONFIG_LTO \
+              --disable CONFIG_LTO_CLANG \
+              --disable CONFIG_LTO_CLANG_THIN \
+              --disable CONFIG_LTO_CLANG_FULL \
+              --disable CONFIG_CFI_CLANG \
+              --disable CONFIG_CFI_ICALL_NORMALIZE_INTEGERS \
+              || true
+          fi
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          echo "== 关键配置 =="
+          grep -E "^CONFIG_(LTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|WERROR|DEBUG_INFO_BTF|KPROBES)[= ]" .config || true
 
       - name: Prepare kernel modules
         run: |
