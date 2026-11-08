@@ -18,6 +18,8 @@
 #include <linux/string.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/jiffies.h>
+#include <linux/atomic.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -633,12 +635,160 @@ bool wind_write_process_va(struct mm_struct *mm, uintptr_t va, const void *buf, 
  * (wind_get_vm_area_caller + wind_ioremap_page_range, PAGE_KERNEL cacheable,
  * 运行时解析)。进程上下文 (ioctl) 可睡眠, vmap 合法。
  * =================================================================== */
+
+/* ===================================================================
+ * 单页映射缓存 —— 读取性能的主开关
+ *
+ * 旧路径每次 read 都是: get_vm_area_caller -> ioremap_page_range -> 读 ->
+ * vunmap。这三步都在 vmalloc 全局锁下, 而 vunmap 还要做 TLB shootdown,
+ * 向所有 CPU 发 IPI。单次开销 20~60us, 一帧几百个字段读就是几毫秒纯开销,
+ * 实测只有个位数帧率。
+ *
+ * 这里把最近用过的单页映射留着复用: 命中时只剩一次 copy_to_user。
+ * 只缓存读。写路径仍走一次性映射 —— 目标物理页被回收后复用同一物理页的
+ * 是别的进程, 缓存的映射写下去会写到别人内存里, 读最坏只是读到脏数据,
+ * 两者风险不对等。
+ *
+ * 失效: session_bind / session_destroy / 模块卸载 全清; 条目另有 5s TTL。
+ * =================================================================== */
+#define WIND_MAP_SLOTS 256
+#define WIND_MAP_TTL   (5 * HZ)
+
+struct wind_map_slot {
+	phys_addr_t pa;
+	struct vm_struct *area;
+	void *addr;
+	unsigned long stamp;
+};
+
+static struct wind_map_slot g_map_slots[WIND_MAP_SLOTS];
+static DEFINE_MUTEX(g_map_mutex);
+static atomic64_t g_stat_reads = ATOMIC64_INIT(0);
+static atomic64_t g_stat_hits = ATOMIC64_INIT(0);
+static atomic64_t g_stat_misses = ATOMIC64_INIT(0);
+static atomic64_t g_stat_evicts = ATOMIC64_INIT(0);
+
+static void wind_slot_free(struct wind_map_slot *s)
+{
+	if (s->area)
+		wind_vunmap(s->addr, s->area);
+	memset(s, 0, sizeof(*s));
+}
+
+void wind_map_cache_purge(void)
+{
+	int i;
+
+	mutex_lock(&g_map_mutex);
+	for (i = 0; i < WIND_MAP_SLOTS; i++)
+		wind_slot_free(&g_map_slots[i]);
+	mutex_unlock(&g_map_mutex);
+}
+
+void wind_map_cache_get_stats(struct wind_map_stats *out)
+{
+	int i, used = 0;
+
+	if (!out)
+		return;
+	mutex_lock(&g_map_mutex);
+	for (i = 0; i < WIND_MAP_SLOTS; i++)
+		if (g_map_slots[i].area)
+			used++;
+	mutex_unlock(&g_map_mutex);
+
+	out->reads = (uint64_t)atomic64_read(&g_stat_reads);
+	out->hits = (uint64_t)atomic64_read(&g_stat_hits);
+	out->misses = (uint64_t)atomic64_read(&g_stat_misses);
+	out->evicts = (uint64_t)atomic64_read(&g_stat_evicts);
+	out->cached = (uint64_t)used;
+}
+
+/* 调用方必须持有 g_map_mutex。返回页对齐 pa 的 kernel 映射。 */
+static void *wind_slot_lookup_locked(phys_addr_t pa_page)
+{
+	unsigned long now = jiffies;
+	unsigned long oldest = ~0UL;
+	int i, free_slot = -1, lru = 0;
+	struct wind_map_slot *s;
+	struct wind_phys_map m;
+
+	for (i = 0; i < WIND_MAP_SLOTS; i++) {
+		s = &g_map_slots[i];
+		if (!s->area) {
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+		/* 过期条目顺手回收, TTL 不依赖额外定时器 */
+		if (time_after(now, s->stamp + WIND_MAP_TTL)) {
+			wind_slot_free(s);
+			atomic64_inc(&g_stat_evicts);
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+		if (s->pa == pa_page) {
+			s->stamp = now;
+			atomic64_inc(&g_stat_hits);
+			return s->addr;
+		}
+		if (s->stamp < oldest) {
+			oldest = s->stamp;
+			lru = i;
+		}
+	}
+
+	if (free_slot < 0) {
+		free_slot = lru;                     /* 全满: 淘汰最久未用 */
+		wind_slot_free(&g_map_slots[lru]);
+		atomic64_inc(&g_stat_evicts);
+	}
+
+	m = wind_map_phys(pa_page, PAGE_SIZE);
+	atomic64_inc(&g_stat_misses);
+	if (!m.addr)
+		return NULL;
+
+	s = &g_map_slots[free_slot];
+	s->pa = pa_page;
+	s->area = m.area;
+	s->addr = m.addr;
+	s->stamp = now;
+	return s->addr;
+}
+
+/* 页内小读走缓存; 失败返回 false 让上层决定是否回落整段映射 */
+static bool wind_read_cached_page(phys_addr_t pa_page, size_t off,
+				  void __user *buffer, size_t size, bool safe)
+{
+	void *kva;
+	bool ok = false;
+
+	mutex_lock(&g_map_mutex);
+	kva = wind_slot_lookup_locked(pa_page);
+	if (kva) {
+		if (safe)
+			kh_dcache_clean_inval_poc((char *)kva + off, size);
+		ok = copy_to_user(buffer, (char *)kva + off, size) == 0;
+	}
+	mutex_unlock(&g_map_mutex);
+	return ok;
+}
+
 static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t size)
 {
 	phys_addr_t base = pa & PAGE_MASK;
 	size_t off = (size_t)(pa - base);
-	struct wind_phys_map m = wind_map_phys(base, PAGE_ALIGN(off + size));
+	struct wind_phys_map m;
 
+	atomic64_inc(&g_stat_reads);
+	/* 页内读走缓存: 这是热路径, 一次 copy_to_user 就完事 */
+	if (off + size <= PAGE_SIZE)
+		return wind_read_cached_page(base, off, buffer, size, false);
+
+	/* 跨页 / 大块读: 一次性映射整段, 不进缓存 (缓存只养单页) */
+	m = wind_map_phys(base, PAGE_ALIGN(off + size));
 	if (!m.addr)
 		return false;
 	if (copy_to_user(buffer, (char *)m.addr + off, size)) {
@@ -679,8 +829,14 @@ static bool read_physical_nocache(phys_addr_t pa, void __user *buffer, size_t si
 {
 	phys_addr_t base = pa & PAGE_MASK;
 	size_t off = (size_t)(pa - base);
-	struct wind_phys_map m = wind_map_phys(base, PAGE_ALIGN(off + size));
+	struct wind_phys_map m;
 
+	atomic64_inc(&g_stat_reads);
+	/* 安全模式同样吃缓存: 每读前 dc civac invalidate, 语义与一次性映射一致 */
+	if (off + size <= PAGE_SIZE)
+		return wind_read_cached_page(base, off, buffer, size, true);
+
+	m = wind_map_phys(base, PAGE_ALIGN(off + size));
 	if (!m.addr)
 		return false;
 	kh_dcache_clean_inval_poc((char *)m.addr + off, size); /* 读前 invalidate, 防 stale cache */
@@ -803,8 +959,6 @@ bool read_process_memory(struct driver_session *sess, uintptr_t addr, void __use
 	if (sess && sess->task && sess->task->mm == current->mm) {
 		void *tmp;
 
-		pr_info("wind: read self va=%lx size=%zu\n",
-			(unsigned long)addr, size);
 		if (!size || size > PAGE_SIZE * 4)
 			return false;
 		tmp = kmalloc(size, GFP_KERNEL);
@@ -977,6 +1131,9 @@ void session_bind(struct driver_session *sess, pid_t pid)
 	if (!sess)
 		return;
 
+	/* 换目标 pid 前把页映射缓存清掉: 旧目标的物理页可能已回收 */
+	wind_map_cache_purge();
+
 	/* 解绑旧的: 同时把 bound 清掉, 否则下面任何一步失败都会留下
 	 * bound=true + task=NULL 的半绑定状态, 读取路径一解引用就是 NULL panic。 */
 	if (sess->task) {
@@ -1011,5 +1168,6 @@ void session_destroy(struct driver_session *sess)
 		sess->task = NULL;
 	}
 	sess->bound = false;
+	wind_map_cache_purge();
 	kfree(sess);
 }

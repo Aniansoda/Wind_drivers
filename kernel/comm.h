@@ -77,6 +77,9 @@ enum OPERATIONS
 	OP_UDPBP_GET_CONFIG   = WIND_OP_BASE + 0x30, /* 读当前槽位表 */
 	OP_UDPBP_GET_RECORDS  = WIND_OP_BASE + 0x31, /* 分段读命中记录 */
 	OP_UDPBP_CLEAR_RECORDS= WIND_OP_BASE + 0x32, /* 清记录 (-1 = 全部槽) */
+
+	/* ---- 读取路径统计 (页映射缓存命中率, 调优用) ---- */
+	OP_STATS              = WIND_OP_BASE + 0x33,
 };
 
 /* ---- 读取模式 ---- */

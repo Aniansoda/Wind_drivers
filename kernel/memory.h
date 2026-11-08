@@ -20,6 +20,19 @@ struct driver_session
 	spinlock_t lock;          /* 保护后续加入的页缓存/批量状态 */
 };
 
+/* ---- 页映射缓存统计 (OP_STATS 返回) ---- */
+struct wind_map_stats
+{
+	uint64_t reads;   /* 走物理读的总次数 */
+	uint64_t hits;    /* 缓存命中 */
+	uint64_t misses;  /* 新建映射 */
+	uint64_t evicts;  /* 淘汰/过期回收 */
+	uint64_t cached;  /* 当前驻留条目数 */
+};
+
+void wind_map_cache_purge(void);
+void wind_map_cache_get_stats(struct wind_map_stats *out);
+
 /* ---- 页表翻译 ---- */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
 

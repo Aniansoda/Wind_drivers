@@ -219,6 +219,15 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		if (!g_sess)
 			return -ESRCH;
 		return handle_batch(g_sess, arg, true);
+	case OP_STATS:
+	{
+		struct wind_map_stats st;
+
+		wind_map_cache_get_stats(&st);
+		if (copy_to_user((void __user *)arg, &st, sizeof(st)) != 0)
+			return -EFAULT;
+		return 0;
+	}
 	case OP_MODULE_BASE:
 	{
 		if (!g_sess)
@@ -927,6 +936,7 @@ static void __exit driver_unload(void)
 	kgsl_hook_remove();
 	wind_bp_exit();
 	wind_nl_remove();
+	wind_map_cache_purge();
 	wind_misc_remove();
 	hook_remove();
 	if (g_sess) {
