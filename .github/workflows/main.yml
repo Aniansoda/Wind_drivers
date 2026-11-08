@@ -306,14 +306,45 @@ jobs:
             fi
           fi
 
+      - name: Build kernel & generate symvers
+        run: |
+          cd kernel-src
+          # 5.10 / 5.15 的顶层 Makefile 里没有 `PHONY += modpost`（6.1 之后才有），
+          # 所以 `make modpost` 在 5.10 / 5.15 上是 "No rule to make target"。
+          # symvers 只能等 modpost 真正跑过才有，这里照 Ylarod/ddk 的做法做完整构建，
+          # 目标用 modules（依赖 vmlinux，且一定会跑 modpost）。
+          # 产物名按版本不同：5.10 / 5.15 是根 Module.symvers，
+          # 6.1+ 还会另出 vmlinux.symvers。
+          set +e
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules \
+            > /tmp/kbuild.log 2>&1
+          RC=$?
+          set -e
+          echo "构建退出码 rc=$RC（最后 40 行）"
+          tail -40 /tmp/kbuild.log
+          echo "== 目录里的 symvers 产物 =="
+          for f in vmlinux.symvers Module.symvers; do
+            if [ -s "$f" ]; then echo "  $f  $(wc -l < "$f") 行"; else echo "  $f  无"; fi
+          done
+          if [ ! -s vmlinux.symvers ] && [ ! -s Module.symvers ]; then
+            echo "!! 完整构建没有产出任何 symvers，rc=$RC"
+            exit 1
+          fi
+          if [ "$RC" -ne 0 ]; then
+            echo "!! 完整内核构建 rc=$RC，但已产出 symvers，继续（只要模块能链上）"
+          fi
+
       - name: Get Module.symvers
         run: |
           cd kernel-src
-          # 自编译 vmlinux.symvers：genksyms CRC 由源码 C 声明决定，
-          # 与 LTO / CFI / 编译器版本无关，和内核同源，直接拿来当 Module.symvers。
-          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
-          test -s vmlinux.symvers
-          cp vmlinux.symvers /tmp/full.symvers
+          # genksyms CRC 由源码 C 声明决定，与 LTO / CFI / 编译器版本无关，
+          # 和内核同源，直接拿来当 Module.symvers。
+          if [ -s vmlinux.symvers ]; then
+            cp vmlinux.symvers /tmp/full.symvers
+          else
+            cp Module.symvers /tmp/full.symvers
+          fi
+          echo "取自 $( [ -s vmlinux.symvers ] && echo vmlinux.symvers || echo Module.symvers )"
           # GKI 的 abi_symbollist 只列冻结 ABI 符号，而本驱动要用 register_kprobe /
           # filp_open / kallsyms_lookup_name 这类不在表里的符号，按白名单过滤会在
           # modpost 阶段直接 undefined。这里改成 Ylarod/ddk 的做法：
@@ -343,6 +374,10 @@ jobs:
       - name: Verify config & module_layout CRC
         run: |
           cd kernel-src
+          echo "== MODVERSIONS 状态 =="
+          grep -E "CONFIG_MODVERSIONS|CONFIG_MODULE_SIG" .config || echo "!! MODVERSIONS 未开，symvers 里 CRC 会全 0"
+          echo "== symvers 前两行 =="
+          head -2 Module.symvers || true
           echo "== CFI/LTO 状态 (必须 CFI_CLANG=y) =="
           grep -E "CONFIG_CFI=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG|CONFIG_CFI_ICALL_NORMALIZE_INTEGERS" .config || echo "!! CFI/LTO 未启用"
           echo "== module_layout 在 Module.symvers 里的 CRC =="
