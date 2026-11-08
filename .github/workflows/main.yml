@@ -62,12 +62,12 @@ jobs:
             cc: "LLVM=-18"
             llvmver: "18"
             mode: modpost
-          - name: android16-6.12.69
-            kernel_version: "6.12.69"
+          - name: android16-6.12.58
+            kernel_version: "6.12.58"
             urls: >-
               https://android.googlesource.com/kernel/common
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
-            ref: android16-6.12.69_r00
+            ref: android16-6.12.58_r00
             config: gki_defconfig
             cc: "LLVM=-19"
             llvmver: "19"
@@ -262,6 +262,24 @@ jobs:
           
           test -s Module.symvers
           wc -l Module.symvers
+
+      - name: Merge device CRCs (if provided)
+        run: |
+          cd kernel-src
+          # 设备镜像的 module_layout 等符号 crc 由**厂商那套 .config** 决定，
+          # 我们自建的是 GKI 默认配置，两者 struct module 布局可能不同，
+          # 直接 insmod 会得到 "disagrees about version of symbol module_layout"。
+          # 这里用设备上现成 .ko 的 __versions（即设备内核 __kcrctab 的真实值）覆盖。
+          SRC="../tools/device-symvers/${{ matrix.name }}.symvers"
+          if [ -f "$SRC" ]; then
+            echo "== 用设备 crc 覆盖: $SRC =="
+            python3 ../tools/dump_kcrc.py merge Module.symvers "$SRC" /tmp/merged.symvers
+            mv /tmp/merged.symvers Module.symvers
+            echo "== 合并后 module_layout =="
+            grep -m1 module_layout Module.symvers
+          else
+            echo "没有 $SRC，直接用自建 crc（只在纯 GKI 机型上能加载）"
+          fi
 
       - name: Verify config & module_layout CRC
         run: |
