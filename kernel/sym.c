@@ -40,12 +40,14 @@ static remap_pfn_range_fn g_remap_pfn_range = NULL;
 
 /* vmap 三件套: 物理地址 → 内核虚拟地址临时映射 (白名单外) */
 typedef void (*free_vm_area_fn)(struct vm_struct *);
+typedef void (*vunmap_fn)(const void *);
 typedef struct vm_struct *(*get_vm_area_caller_fn)(unsigned long, unsigned long,
 						   unsigned long, unsigned long,
 						   const void *);
 typedef int (*ioremap_page_range_fn)(unsigned long, unsigned long,
 				     phys_addr_t, pgprot_t);
 static free_vm_area_fn g_free_vm_area = NULL;
+static vunmap_fn g_vunmap = NULL;
 static get_vm_area_caller_fn g_get_vm_area_caller = NULL;
 static ioremap_page_range_fn g_ioremap_page_range = NULL;
 
@@ -229,6 +231,21 @@ void wind_free_vm_area(struct vm_struct *area)
 		g_free_vm_area(area);
 }
 
+/*
+ * ioremap_page_range 建立的是带页表的映射, 收尾必须是 vunmap
+ * (remove_vm_area 会 purge 页表再释放 vmap 区)。
+ * 只用 free_vm_area 会漏掉页表页, 每次读都漏 3~5 个 order-0 页。
+ */
+void wind_vunmap(const void *addr, struct vm_struct *area)
+{
+	if (g_vunmap) {
+		g_vunmap(addr);
+		return;
+	}
+	if (g_free_vm_area && area)
+		g_free_vm_area(area);
+}
+
 struct vm_struct *wind_get_vm_area_caller(unsigned long size, unsigned long flags,
 					  unsigned long start, unsigned long end,
 					  const void *caller)
@@ -358,6 +375,7 @@ int wind_sym_init(void)
 	g_iounmap = (iounmap_fn)wind_kprobe_resolve("iounmap");
 	g_remap_pfn_range = (remap_pfn_range_fn)wind_kprobe_resolve("remap_pfn_range");
 	g_free_vm_area = (free_vm_area_fn)wind_kprobe_resolve("free_vm_area");
+	g_vunmap = (vunmap_fn)wind_kprobe_resolve("vunmap");
 	g_get_vm_area_caller = (get_vm_area_caller_fn)wind_kprobe_resolve("__get_vm_area_caller");
 	g_ioremap_page_range = (ioremap_page_range_fn)wind_kprobe_resolve("ioremap_page_range");
 	g_filp_open = (filp_open_fn)wind_kprobe_resolve("filp_open");
@@ -386,8 +404,8 @@ int wind_sym_init(void)
 		(void *)g_netlink_kernel_release, (void *)g_netlink_unicast,
 		(void *)g_alloc_skb);
 
-	pr_info("wind: sym vmap=%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px misc=%px/%px\n",
-		(void *)g_free_vm_area, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
+	pr_info("wind: sym vmap=%px/%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px misc=%px/%px\n",
+		(void *)g_free_vm_area, (void *)g_vunmap, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
 		(void *)g_filp_open, (void *)g_kernel_read, (void *)g_file_path,
 		(void *)g_register_user_hw_breakpoint, (void *)g_unregister_hw_breakpoint,
 		(void *)g_copy_from_user_nofault, (void *)g_copy_to_user_nofault,
@@ -406,6 +424,7 @@ void wind_sym_exit(void)
 	g_iounmap = NULL;
 	g_remap_pfn_range = NULL;
 	g_free_vm_area = NULL;
+	g_vunmap = NULL;
 	g_get_vm_area_caller = NULL;
 	g_ioremap_page_range = NULL;
 	g_filp_open = NULL;

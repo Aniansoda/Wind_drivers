@@ -53,6 +53,7 @@ int wind_remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 
 /* vmap 三件套 (白名单外, 运行时解析) */
 void wind_free_vm_area(struct vm_struct *area);
+void wind_vunmap(const void *addr, struct vm_struct *area);
 struct vm_struct *wind_get_vm_area_caller(unsigned long size, unsigned long flags,
 					  unsigned long start, unsigned long end,
 					  const void *caller);
