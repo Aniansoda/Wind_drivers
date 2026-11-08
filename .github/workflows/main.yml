@@ -172,9 +172,21 @@ jobs:
               *)            URL="${REPO%/}/+archive/${REF}.tar.gz" ;;
             esac
             echo "下载 $URL"
-            mkdir -p kernel-src
             curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 "$URL" -o /tmp/kernel.tar.gz
-            tar xzf /tmp/kernel.tar.gz -C kernel-src --strip-components=1
+            # 两种归档包结构不同：
+            #   Gitiles (+archive/<rev>.tar.gz) 是平的，根就是 Makefile / arch/
+            #   GitHub (/archive/<sha>.tar.gz) 外面有一层 <repo>-<sha>/
+            # 之前固定 --strip-components=1 会把 Gitiles 的 arch/ 切掉，
+            # 于是 make 找不到 gki_defconfig（就是 6.18 那个报错）。
+            rm -rf /tmp/kx && mkdir -p /tmp/kx
+            tar xzf /tmp/kernel.tar.gz -C /tmp/kx
+            if [ -f /tmp/kx/Makefile ]; then
+              SRC=/tmp/kx
+            else
+              SRC=$(find /tmp/kx -maxdepth 1 -mindepth 1 -type d | head -1)
+            fi
+            test -f "$SRC/Makefile" || { echo "!! 归档包结构不认识，顶层："; ls -A /tmp/kx; exit 1; }
+            mv "$SRC" kernel-src
           else
             # 分支 / 标签：保持原来的浅克隆（6.1 / 6.6 走这条）。
             case "$REPO" in
@@ -186,6 +198,27 @@ jobs:
           fi
           echo "== Makefile 版本行 =="
           sed -n '1,5p' kernel-src/Makefile
+
+      - name: Patch modpost (allow non-ABI symbols)
+        run: |
+          cd kernel-src
+          M=scripts/mod/modpost.c
+          test -f "$M"
+          # Ylarod/ddk 的 patch_modpost：放开符号导出校验，让外部模块能引用
+          # GKI 冻结 ABI 之外的符号（本驱动要 register_kprobe / filp_open /
+          # kallsyms_lookup_name），否则 modpost 直接报 undefined。
+          # 四条都幂等：已改过的不再命中。
+          sed -i 's/^\(\s*check_exports(mod);\)/\/\/\1/' "$M"
+          sed -i 's/^\(\s*s->module = exp->module;\)/\/\/\1/' "$M"
+          sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$M"
+          # check_exports 不跑之后 add_extended_versions() 会生成
+          # `____version_ext_names[] = ;` 这种非法空初始化，补一个空串
+          perl -0pi -e 's/__version_ext_names"\) =\s*\n/__version_ext_names") = ""\n/' "$M"
+          echo "== 补丁结果 =="
+          grep -n "check_exports(mod);" "$M" || echo "  check_exports(mod) 已注释"
+          grep -n "attribute__((unused)) check_exports" "$M" || true
+          grep -n 's->module = exp->module;' "$M" || echo "  s->module 赋值已注释"
+          grep -n '__version_ext_names") =' "$M" || true
 
       - name: Pin localversion (vermagic)
         run: |
@@ -202,18 +235,22 @@ jobs:
           # 所以把中段写进名为 localversion* 的文件即可，位置正好在 -4k 之前。
           WANT="${{ matrix.localversion }}"
           echo "目标中段=[$WANT]  gki_defconfig 自带 CONFIG_LOCALVERSION='-4k'"
-          if [ -n "$WANT" ]; then
-            # 清掉源码里可能自带的其它 localversion*，避免多段拼在一起
-            for f in localversion*; do
-              if [ -e "$f" ]; then echo "删除已有 $f"; rm -f "$f"; fi
-            done
-            printf '%s' "$WANT" > localversion-wind
-            echo "已写入 localversion-wind"
-          else
-            echo "该内核不钉中段，沿用默认"
+          # 没有 localversion 的行（5.10 / 5.15 / 6.1 / 6.6）直接退出：
+          # GitHub 的 run 是 bash -e，未命中的 glob（localversion*）会让命令
+          # 返回 1 并把整个 job 干掉，所以这里不碰这些文件。
+          if [ -z "$WANT" ]; then
+            echo "该内核不钉中段，沿用 Makefile / 分支默认，跳过"
+            exit 0
           fi
-          echo "== localversion* =="; ls -l localversion* 2>/dev/null || true
-          cat localversion* 2>/dev/null; echo
+          # 清掉源码里可能自带的其它 localversion*，避免多段拼在一起
+          for f in localversion*; do
+            if [ -e "$f" ]; then echo "删除已有 $f"; rm -f "$f"; fi
+          done
+          printf '%s' "$WANT" > localversion-wind
+          echo "已写入 localversion-wind"
+          echo "== localversion* =="
+          ls -l localversion* || true
+          cat localversion-wind
 
       - name: Configure kernel
         run: |
@@ -272,27 +309,33 @@ jobs:
       - name: Get Module.symvers
         run: |
           cd kernel-src
-          # 方案 G: 自编译 vmlinux.symvers (genksyms CRC), 再用 abi_symbollist 白名单过滤。
-          # genksyms CRC 由源码 C 声明决定, 与 LTO/CFI/编译器版本无关,
-          # 对白名单符号等于 GKI 冻结 CRC。
-          # 旧方案 (官方 .ko 的 __versions 提取) 不完整 —— 缺白名单内但官方
-          # prebuilt .ko 未实际引用的符号 (register_kprobe / file_path / mas_find 等),
-          # 导致 modpost 把这些白名单符号误报为 undefined。
+          # 自编译 vmlinux.symvers：genksyms CRC 由源码 C 声明决定，
+          # 与 LTO / CFI / 编译器版本无关，和内核同源，直接拿来当 Module.symvers。
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
           test -s vmlinux.symvers
           cp vmlinux.symvers /tmp/full.symvers
+          # GKI 的 abi_symbollist 只列冻结 ABI 符号，而本驱动要用 register_kprobe /
+          # filp_open / kallsyms_lookup_name 这类不在表里的符号，按白名单过滤会在
+          # modpost 阶段直接 undefined。这里改成 Ylarod/ddk 的做法：
+          #   用自编译 vmlinux.symvers（genksyms CRC，和内核同源）全量，
+          #   再打 modpost 补丁放开符号校验（见上面的 Patch modpost 步）。
+          cp /tmp/full.symvers Module.symvers
+          # 顺带统计一下有多少符号落在冻结 ABI 表里，仅作信息输出
           if [ -n "${{ matrix.prebuild }}" ]; then
-            # GKI: 从官方 prebuilt 获取 abi_symbollist 白名单 (每行一个符号名)
-            git clone --depth 1 --branch "${{ matrix.prebuild_ref }}" \
+            rm -rf /tmp/gki-prebuilt
+            git clone --depth 1 --filter=blob:none --no-checkout \
+              --branch "${{ matrix.prebuild_ref }}" \
               "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/prebuilts/${{ matrix.prebuild }}/arm64/" \
-              /tmp/gki-prebuilt
-            test -s /tmp/gki-prebuilt/abi_symbollist
-            # 只保留白名单符号的 CRC; 模块引用白名单外符号会在 modpost 暴露 undefined
-            awk 'NR==FNR { whitelist[$1]=1; next } ($2 in whitelist) { print }' \
-              /tmp/gki-prebuilt/abi_symbollist /tmp/full.symvers > Module.symvers
-          else
-            # 主线: 不过滤
-            cp /tmp/full.symvers Module.symvers
+              /tmp/gki-prebuilt || true
+            for f in abi_symbollist abi_symbol_list; do
+              git -C /tmp/gki-prebuilt checkout -q HEAD -- "$f" 2>/dev/null || true
+            done
+            for cand in abi_symbollist abi_symbol_list; do
+              if [ -s "/tmp/gki-prebuilt/$cand" ]; then
+                echo "ABI 表 ${{ matrix.prebuild }}: $cand = $(grep -c . "/tmp/gki-prebuilt/$cand") 行"
+                break
+              fi
+            done
           fi
           test -s Module.symvers
           wc -l Module.symvers
@@ -304,8 +347,14 @@ jobs:
           grep -E "CONFIG_CFI=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG|CONFIG_CFI_ICALL_NORMALIZE_INTEGERS" .config || echo "!! CFI/LTO 未启用"
           echo "== module_layout 在 Module.symvers 里的 CRC =="
           grep -E "module_layout" Module.symvers || echo "!! module_layout 不在 Module.symvers"
-          echo "== module_layout 是否在白名单 =="
-          grep -c '^module_layout$' /tmp/gki-prebuilt/abi_symbollist || echo "!! 不在 abi_symbollist"
+          echo "== 模块用到的关键符号在 Module.symvers 里 =="
+          for s in register_kprobe unregister_kprobe filp_open kernel_read; do
+            if grep -qE "^[^[:space:]]+[[:space:]]+$s[[:space:]]" Module.symvers; then
+              echo "  $s OK"
+            else
+              echo "  $s 缺（modpost 已打补丁，运行时可能要 kallsyms 兜底）"
+            fi
+          done
 
       - name: Build wind module
         run: |
