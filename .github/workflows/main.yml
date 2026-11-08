@@ -12,9 +12,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # urls 按顺序试，前一个失败换下一个，每个源再重试 3 次。
-          # 清华源在 GitHub runner 上经常排队 / TLS 中断（curl 56 GnuTLS），放最后。
-          # android.googlesource.com 实测支持按 SHA 取任意 commit，放第一。
           - name: android13-5.10.226
             kernel_version: "5.10.226"
             urls: >-
@@ -23,8 +20,9 @@ jobs:
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android13-5.10.226_r00
             config: gki_defconfig
-            cc: "LLVM=-14"
+            cc: "LLVM=1"
             llvmver: "14"
+            llvm_unprefixed: "1"
             mode: full
           - name: android14-5.15.167
             kernel_version: "5.15.167"
@@ -34,8 +32,9 @@ jobs:
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android14-5.15.167_r00
             config: gki_defconfig
-            cc: "LLVM=-17"
+            cc: "LLVM=1"
             llvmver: "17"
+            llvm_unprefixed: "1"
             mode: full
           - name: android14-6.1
             kernel_version: ""
@@ -72,8 +71,6 @@ jobs:
             urls: >-
               https://android.googlesource.com/kernel/common
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
-            # 清华源与 AOSP 都没有 android17-6.18.21_r00 这个 release tag
-            # （只有 .24 / .32 / .33），只能按 commit 取；两个源都实测支持按 SHA fetch。
             sha: f957accaf5634f841071adb4f35286ef2779d5b1
             config: gki_defconfig
             cc: "LLVM=-21"
@@ -94,16 +91,39 @@ jobs:
             libssl-dev libelf-dev \
             dwarves libdwarf-dev kmod \
             wget gnupg
-          # GKI 内核强制 CONFIG_CC_IS_CLANG, 不能用 gcc 交叉编译。
-          # 按版本装 LLVM: 5.10 -> clang-14, 5.15 -> clang-17, 6.1 -> 17, 6.6 -> 18,
-          # 6.12 -> clang-19, 6.18 -> clang-21 (对齐 Android 工具链)。
-          # 用 ubuntu-22.04 是因为 apt.llvm.org 的 noble 源只有 17/18/19/21，
-          # jammy 才有 clang-14 / clang-17；5.10 用 14 编译。
+            
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
           if [ -n "${{ matrix.llvmver }}" ]; then
             sudo /tmp/llvm.sh "${{ matrix.llvmver }}" all
           fi
+
+      - name: Expose unprefixed LLVM tools (5.x only)
+        if: ${{ matrix.llvm_unprefixed == '1' }}
+        run: |
+          V="${{ matrix.llvmver }}"
+          BIN="/usr/lib/llvm-$V/bin"
+          if [ ! -d "$BIN" ]; then
+            echo "!! 找不到 $BIN，先确认 llvm.sh $V 装成功"
+            ls -d /usr/lib/llvm-* 2>/dev/null || true
+            exit 1
+          fi
+          sudo mkdir -p /usr/local/llvm-shim
+          for t in clang clang++ ld.lld lld llvm-ar llvm-nm llvm-objcopy llvm-objdump \
+                   llvm-readelf llvm-strip llvm-size llvm-ranlib llvm-as llvm-dis \
+                   llvm-link llvm-addr2line llvm-profdata; do
+            if [ -x "$BIN/$t" ]; then
+              sudo ln -sf "$BIN/$t" "/usr/local/llvm-shim/$t"
+            else
+              echo "  跳过 $t（$BIN 下没有）"
+            fi
+          done
+          echo "/usr/local/llvm-shim" >> "$GITHUB_PATH"
+          export PATH="/usr/local/llvm-shim:$PATH"
+          echo "== 无前缀工具自检 =="
+          which clang ld.lld llvm-ar
+          clang --version | head -1
+          ld.lld --version
 
       - name: Clone kernel source
         run: |
@@ -117,7 +137,6 @@ jobs:
               if [ -n "$SHA" ]; then
                 git init -q kernel-src
                 git -C kernel-src remote add origin "$u"
-                # googlesource / 清华都支持按 SHA 浅取；GitHub 镜像会报 not our ref
                 if timeout 900 git -C kernel-src -c http.version=HTTP/1.1 \
                      -c http.postBuffer=524288000 fetch --depth 1 origin "$SHA"; then
                   if git -C kernel-src checkout -q FETCH_HEAD; then ok=1; fi
@@ -167,6 +186,7 @@ jobs:
             --disable CONFIG_HEADERS_INSTALL \
             --disable CONFIG_GENDWARFKSYMS \
             --disable CONFIG_MEM_ALLOC_PROFILING \
+            --disable CONFIG_WERROR \
             || true
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
@@ -186,11 +206,7 @@ jobs:
       - name: Get Module.symvers
         run: |
           cd kernel-src
-          # 方案 G: 自编译 vmlinux.symvers (genksyms CRC)。CRC 只由 C 声明决定，
-          # 与 LTO / CFI / 编译器版本无关，和内核同源，直接拿来当 Module.symvers。
-          #
-          # 5.10 / 5.15 的顶层 Makefile 没有 `PHONY += modpost`，`make modpost` 会报
-          # No rule to make target，symvers 只能由完整构建产出，所以这两行走 full。
+
           if [ "${{ matrix.mode }}" = "full" ]; then
             make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules \
               || echo "!! 完整构建非零退出，先看有没有 symvers"
@@ -207,9 +223,7 @@ jobs:
             test -s vmlinux.symvers
             cp vmlinux.symvers Module.symvers
           fi
-          # 不按 abi 白名单过滤：5.10 / 5.15 的 prebuilt 目录里根本没有
-          # abi_symbollist（5.10 叫 abi_symbol_list，5.15 两个都没有），
-          # 而且驱动要用的 register_kprobe / filp_open 也不在冻结 ABI 表里。
+          
           test -s Module.symvers
           wc -l Module.symvers
 
