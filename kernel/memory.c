@@ -908,11 +908,13 @@ void session_bind(struct driver_session *sess, pid_t pid)
 	if (!sess)
 		return;
 
-	/* 解绑旧的 */
+	/* 解绑旧的: 同时把 bound 清掉, 否则下面任何一步失败都会留下
+	 * bound=true + task=NULL 的半绑定状态, 读取路径一解引用就是 NULL panic。 */
 	if (sess->task) {
 		put_task_struct(sess->task);
 		sess->task = NULL;
 	}
+	sess->bound = false;
 
 	pid_struct = find_get_pid(pid);
 	if (!pid_struct)
@@ -920,6 +922,10 @@ void session_bind(struct driver_session *sess, pid_t pid)
 	task = pid_task(pid_struct, PIDTYPE_PID); /* 不持引用, 下面显式 get_task_struct */
 	put_pid(pid_struct);
 	if (!task)
+		return;
+
+	/* 内核线程 / 已退出的进程没有 mm, 绑定它们只会在第一次读写时踩空指针。 */
+	if (!task->mm)
 		return;
 
 	get_task_struct(task);

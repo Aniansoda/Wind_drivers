@@ -122,19 +122,54 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 	MODE_REQUEST mode_req;
 	char name[0x100] = {0};
 
+	/* 需要"已绑定目标会话"的操作。旧代码在未绑定时直接拿 g_sess->task 去取 mm,
+	 * 只要用户态先发一条 READ/MODULE_BASE 就是 NULL deref → 内核 panic。
+	 * 这里统一挡在 -ENOTCONN, 不再往下面走。 */
+	switch (cmd)
+	{
+	case OP_READ_MEM: case OP_WRITE_MEM:
+	case OP_READ_BATCH: case OP_WRITE_BATCH:
+	case OP_SET_MODE: case OP_MODULE_BASE:
+	case OP_HIDE_FILE:
+	case OP_BRK_SET: case OP_BRK_CLEAR:
+	case OP_HWBP_SET: case OP_HWBP_REMOVE: case OP_HWBP_GET_CONFIG:
+	case OP_HWBP_GET_RECORDS: case OP_HWBP_SET_RECORD: case OP_HWBP_CLEAR_RECORDS:
+	case OP_PTEBP_SET: case OP_PTEBP_REMOVE: case OP_PTEBP_GET_CONFIG:
+	case OP_PTEBP_GET_RECORDS: case OP_PTEBP_SET_RECORD: case OP_PTEBP_CLEAR_RECORDS:
+	case OP_BRKBP_SET: case OP_BRKBP_REMOVE: case OP_BRKBP_GET_CONFIG:
+	case OP_BRKBP_GET_RECORDS: case OP_BRKBP_SET_RECORD: case OP_BRKBP_CLEAR_RECORDS:
+	case OP_ETMBP_SET: case OP_ETMBP_REMOVE: case OP_ETMBP_GET_CONFIG:
+	case OP_ETMBP_GET_RECORDS: case OP_ETMBP_SET_RECORD: case OP_ETMBP_CLEAR_RECORDS:
+		if (!g_sess || !g_sess->bound || !g_sess->task || !g_sess->task->mm)
+			return -ENOTCONN;
+		break;
+	default:
+		break;
+	}
+
 	switch (cmd)
 	{
 	case OP_BIND:
 	{
 		pid_t pid = (pid_t)arg;
+		/* 0/1 与负数都不是合法用户进程: 0 会撞到内核线程, 1 是 init。
+		 * 绑定失败就返回 -ESRCH, 绝不把一个没有 mm 的 task 缓存进会话。 */
+		if (pid <= 1)
+			return -EINVAL;
+		/* 打点: BIND 是用户态连接后第一条 op, 一旦它在驱动里炸,
+		 * pstore 里能看到这条就知道死在 session_bind 之前还是之后。 */
+		pr_info("wind: BIND pid=%d\n", pid);
 		if (!g_sess) {
 			g_sess = session_create();
 			if (!g_sess)
 				return -ENOMEM;
 		}
 		session_bind(g_sess, pid);
-		if (!g_sess->bound)
+		if (!g_sess->bound) {
+			pr_warn("wind: BIND pid=%d 失败(无 mm 或已退出)\n", pid);
 			return -ESRCH;
+		}
+		pr_info("wind: BIND pid=%d ok\n", pid);
 		return 0;
 	}
 	case OP_UNBIND:
@@ -845,11 +880,16 @@ static int __init driver_entry(void)
 	if (ret)
 		return ret;
 
-	if (!install_hook || hook_level <= 0 || transport == 0) {
-		printk(KERN_INFO "wind: 跳过通讯通道 (install_hook=%d hook_level=%d transport=%d), 仅符号解析\n",
-		       (int)install_hook, hook_level, transport);
+	/* 通道建立只由 transport 决定, 与 install_hook / hook_level 无关。
+	 * 以前这里把 install_hook=0 也当成"什么都不建", 结果用户按建议关 hook 做对照,
+	 * 连 netlink 通道一起没了, 用户态永远连不上。 */
+	if (transport == 0) {
+		printk(KERN_INFO "wind: transport=0, 只做符号解析, 不建通道\n");
 		return 0;
 	}
+	if (!install_hook || hook_level <= 0)
+		printk(KERN_INFO "wind: install_hook=%d hook_level=%d → 只跳过 hook, 通道照建\n",
+		       (int)install_hook, hook_level);
 
 	if (transport == 3) {
 		ret = wind_nl_install();

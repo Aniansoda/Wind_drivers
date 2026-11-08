@@ -26,6 +26,14 @@
 #include "sym.h"
 #include "nlcomm.h"
 
+/* 老内核头里可能没有这两个位(3.9 起才有), 自己兜底 */
+#ifndef NL_CFG_F_NONROOT_RECV
+#define NL_CFG_F_NONROOT_RECV (1 << 0)
+#endif
+#ifndef NL_CFG_F_NONROOT_SEND
+#define NL_CFG_F_NONROOT_SEND (1 << 1)
+#endif
+
 /* 候选协议号: 从高往低试, 23..31 在内核里没有固定用途。
  * NETLINK_GENERIC(16)/KOBJECT_UEVENT(15)/SELINUX(7) 等全部避开。 */
 #define WIND_NL_UNIT_MIN 23
@@ -41,6 +49,14 @@
 
 static struct sock *g_nl_sk;
 static int g_nl_unit = -1;
+
+/* 私有无设备节点通道的协议号。默认固定一个号，用户态只握这一个号。
+ * 传 -1 才回到 31..23 全扫：全扫会给我们不认识的协议号发 nlmsg，
+ * 某些厂商模块的 input 回调不做长度校验，会直接内核 panic。
+ * 用法: insmod wind.ko nl_unit=29  或  insmod wind.ko nl_unit=-1 */
+static int nl_unit = 29;
+module_param(nl_unit, int, 0644);
+MODULE_PARM_DESC(nl_unit, "netlink 协议号 23..31 固定单号; -1 = 31..23 全扫(不推荐)");
 
 #if WIND_NL_NEEDS_CB_MUTEX
 static DEFINE_MUTEX(g_nl_cb_mutex);
@@ -61,7 +77,10 @@ static void wind_nl_input(struct sk_buff *skb)
 		return;
 
 	nlh = nlmsg_hdr(skb);
-	if (nlh->nlmsg_len < NLMSG_HDRLEN + sizeof(WIND_NL_MSG))
+	/* 三重长度校验: skb 长度 / nlmsg_len / 载荷是否装得下整条消息。
+	 * 少一条就可能被长度造假的包打下内核。 */
+	if (nlh->nlmsg_len < NLMSG_HDRLEN + sizeof(WIND_NL_MSG) ||
+	    (size_t)nlh->nlmsg_len > skb->len)
 		return;
 
 	req = (const WIND_NL_MSG *)NLMSG_DATA(nlh);
@@ -69,6 +88,14 @@ static void wind_nl_input(struct sk_buff *skb)
 		return;
 
 	portid = NETLINK_CB(skb).portid;
+	/* portid==0 是内核自己; 回包会打到内核 socket 上 */
+	if (unlikely(portid == 0))
+		return;
+
+	/* op 白名单: 只接受本驱动定义的操作码区间, 其它一律丢弃不回包,
+	 * 避免任何意外输入被 dispatch 当成合法 cmd 深解引用。 */
+	if (req->op < WIND_OP_BASE + 0x01 || req->op > WIND_OP_BASE + 0x32)
+		return;
 
 	/* 在发送进程上下文里跑, arg 是用户指针, dispatch 里自己 copy_from/to_user */
 	ret = wind_dispatch_ioctl(req->op, (unsigned long)req->arg);
@@ -95,6 +122,7 @@ int wind_nl_install(void)
 {
 	struct netlink_kernel_cfg cfg;
 	int unit, ret = -EOPNOTSUPP;
+	int WIND_NL_UNIT_LO = WIND_NL_UNIT_MIN, WIND_NL_UNIT_HI = WIND_NL_UNIT_MAX;
 
 	if (g_nl_sk)
 		return 0;
@@ -106,11 +134,25 @@ int wind_nl_install(void)
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.input = wind_nl_input;
+	/* 允许非 root 进程 bind 非零 portid(收) 与 send(发)。
+	 * 不开这两个 flag, 普通 app 一 bind 就是 -EPERM, 用户态表现为 err=-1。 */
+	cfg.flags = NL_CFG_F_NONROOT_RECV | NL_CFG_F_NONROOT_SEND;
 #if WIND_NL_NEEDS_CB_MUTEX
 	cfg.cb_mutex = &g_nl_cb_mutex;
 #endif
 
-	for (unit = WIND_NL_UNIT_MAX; unit >= WIND_NL_UNIT_MIN; unit--) {
+	{
+		int lo = WIND_NL_UNIT_MIN, hi = WIND_NL_UNIT_MAX;
+		if (nl_unit >= WIND_NL_UNIT_MIN && nl_unit <= WIND_NL_UNIT_MAX) {
+			lo = hi = nl_unit;   /* 默认: 只注册这一个号 */
+		} else if (nl_unit != -1) {
+			pr_warn("wind: nl_unit=%d 非法, 用默认 29\n", nl_unit);
+			lo = hi = 29;
+		}
+		WIND_NL_UNIT_LO = lo;
+		WIND_NL_UNIT_HI = hi;
+	}
+	for (unit = WIND_NL_UNIT_HI; unit >= WIND_NL_UNIT_LO; unit--) {
 		g_nl_sk = wind_netlink_kernel_create(&init_net, unit, &cfg);
 		if (IS_ERR(g_nl_sk)) {
 			ret = (int)PTR_ERR(g_nl_sk);
@@ -125,8 +167,8 @@ int wind_nl_install(void)
 		ret = -EBUSY;
 	}
 
-	pr_err("wind: netlink 协议号 %d..%d 全被占用\n",
-	       WIND_NL_UNIT_MIN, WIND_NL_UNIT_MAX);
+	pr_err("wind: netlink 协议号 %d..%d 全被占用 (可用 insmod wind.ko nl_unit=N 换号)\n",
+	       WIND_NL_UNIT_LO, WIND_NL_UNIT_HI);
 	g_nl_sk = NULL;
 	return ret;
 }
