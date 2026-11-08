@@ -267,8 +267,10 @@ jobs:
             --enable CONFIG_HW_BREAKPOINT \
             --enable CONFIG_MISC_DEVICES \
             --disable CONFIG_AUTOFDO_CLANG \
-            --enable CONFIG_DEBUG_INFO_BTF \
-            --enable CONFIG_DEBUG_INFO_BTF_MODULES \
+            --disable CONFIG_DEBUG_INFO \
+            --disable CONFIG_DEBUG_INFO_BTF \
+            --disable CONFIG_DEBUG_INFO_BTF_MODULES \
+            --disable CONFIG_DEBUG_INFO_DWARF5 \
             --disable CONFIG_HEADERS_INSTALL \
             --disable CONFIG_GENDWARFKSYMS \
             --disable CONFIG_MEM_ALLOC_PROFILING \
@@ -279,46 +281,16 @@ jobs:
           fi
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      - name: Prepare kernel modules
+      - name: Build kernel (full, generates symvers)
+        # 无条件做一次完整内核构建：vmlinux.symvers / Module.symvers 只在 modpost
+        # 真的跑过 vmlinux 之后才有，5.10 / 5.15 又没有 `make modpost` 这个伪目标。
+        # 产物名按版本不同：5.10 / 5.15 是根 Module.symvers，6.1+ 另出 vmlinux.symvers。
+        # 耗时参考（GitHub runner 4 核）：5.10 / 5.15 约 15-25 分钟，
+        # 6.12 / 6.18 走 thin LTO 约 40-70 分钟。
         run: |
           cd kernel-src
-          echo "== CC =="
-          if [ -n "${{ matrix.clang_prebuilt }}" ]; then
-            clang --version | head -1
-          elif [ -n "${{ matrix.llvmver }}" ]; then
-            clang-${{ matrix.llvmver }} --version | head -1
-          else
-            aarch64-linux-gnu-gcc --version | head -1
-          fi
-          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" -O modules_prepare \
-            > /tmp/prepare.log 2>&1 \
-            || { echo "=== prepare FAILED, tail 120 lines ==="; tail -120 /tmp/prepare.log; exit 1; }
-          echo "== 实际 kernelrelease =="
-          GOT=$(make -s ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)
-          echo "$GOT"
-          grep -m1 UTS_RELEASE include/generated/utsrelease.h || true
-          if [ -n "${{ matrix.kernel_version }}" ]; then
-            WANT="${{ matrix.kernel_version }}${{ matrix.localversion }}-4k"
-            if [ "$GOT" != "$WANT" ]; then
-              echo "!! kernelrelease=$GOT 与设备 $WANT 不一致，insmod 会报 version magic"
-            else
-              echo "kernelrelease 与设备 uname -r 一致：$GOT"
-            fi
-          fi
-
-      - name: Build kernel & generate symvers (opt-in, slow)
-        # 只有矩阵行写了 symvers_mode: build 才跑。
-        # 跑 = 一次完整内核构建（5.10/5.15 约 15-25 分钟，6.12/6.18 thin LTO 约 40-70 分钟），
-        # 换来的是 genksyms 精确 CRC，模块里带 __versions，加载时内核会校验版本。
-        if: ${{ matrix.symvers_mode == 'build' }}
-        run: |
-          cd kernel-src
-          # 5.10 / 5.15 的顶层 Makefile 里没有 `PHONY += modpost`（6.1 之后才有），
-          # 所以 `make modpost` 在 5.10 / 5.15 上是 "No rule to make target"。
-          # symvers 只能等 modpost 真正跑过才有，这里照 Ylarod/ddk 的做法做完整构建，
-          # 目标用 modules（依赖 vmlinux，且一定会跑 modpost）。
-          # 产物名按版本不同：5.10 / 5.15 是根 Module.symvers，
-          # 6.1+ 还会另出 vmlinux.symvers。
+          # 用 modules 而不是 `make modpost`：5.10 / 5.15 的顶层 Makefile 里没有
+          # `PHONY += modpost`（6.1 之后才有），直接 `make modpost` 就是这次的报错。
           set +e
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules \
             > /tmp/kbuild.log 2>&1
@@ -337,31 +309,36 @@ jobs:
           if [ "$RC" -ne 0 ]; then
             echo "!! 完整内核构建 rc=$RC，但已产出 symvers，继续（只要模块能链上）"
           fi
+          echo "== 实际 kernelrelease =="
+          GOT=$(make -s ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)
+          echo "$GOT"
+          grep -m1 UTS_RELEASE include/generated/utsrelease.h || true
+          if [ -n "${{ matrix.kernel_version }}" ]; then
+            WANT="${{ matrix.kernel_version }}${{ matrix.localversion }}-4k"
+            if [ "$GOT" != "$WANT" ]; then
+              echo "!! kernelrelease=$GOT 与设备 $WANT 不一致，insmod 会报 version magic"
+            else
+              echo "kernelrelease 与设备 uname -r 一致：$GOT"
+            fi
+          fi
 
       - name: Get Module.symvers
         run: |
           cd kernel-src
-          MODE="${{ matrix.symvers_mode }}"
-          if [ "$MODE" = "build" ]; then
-            # 完整构建产物：6.1+ 是 vmlinux.symvers，5.10/5.15 是根 Module.symvers
-            if [ -s vmlinux.symvers ]; then
-              cp vmlinux.symvers Module.symvers
-              echo "CRC 模式：取 vmlinux.symvers"
-            else
-              echo "CRC 模式：沿用构建出的 Module.symvers"
-            fi
-            test -s Module.symvers
-            echo "行数 $(wc -l < Module.symvers)"
+          # genksyms CRC 由源码 C 声明决定，与 LTO / CFI / 编译器版本无关，
+          # 和内核同源，直接拿来当 Module.symvers，模块里带 __versions，
+          # 加载时内核会按 vermagic + 每个符号的 CRC 双重校验。
+          if [ -s vmlinux.symvers ]; then
+            cp vmlinux.symvers Module.symvers
+            echo "取自 vmlinux.symvers"
+          elif [ -s Module.symvers ]; then
+            echo "取自根 Module.symvers"
           else
-            # 快速模式：不产出 CRC，模块里没有 __versions，
-            # 加载时内核跳过 check_version（vermagic 仍然照查）。
-            # 因为源码 commit 和设备的 uname -r 是同一个，符号签名本来就一致，
-            # 省掉的只是“值对不上会在 insmod 报错”这道保险。
-            : > Module.symvers
-            echo "快速模式：Module.symvers 置空（不跑完整构建）"
-            echo "  想要 CRC 校验：在对应矩阵行加 symvers_mode: build"
-            echo "  代价：5.10/5.15 约 15-25 分钟，6.12/6.18 约 40-70 分钟"
+            echo "!! 完整构建没有产出任何 symvers"
+            exit 1
           fi
+          echo "行数 $(wc -l < Module.symvers)"
+          grep -c . Module.symvers
 
       - name: Verify config & module_layout CRC
         run: |
