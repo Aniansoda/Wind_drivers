@@ -38,19 +38,18 @@ jobs:
             llvm_unprefixed: "1"
             no_lto: "1"
             mode: full
-          - name: android14-5.15.74
+          - name: android13-5.15.74
             kernel_version: "5.15.74"
             urls: >-
               https://android.googlesource.com/kernel/common
-              https://github.com/aosp-mirror/kernel_common.git
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
-            ref: android14-5.15.74_r00
+            ref: android13-5.15.74_r00
             config: gki_defconfig
             cc: "LLVM=1"
-            llvmver: "17"
+            llvmver: "14"
+            mode: full
             llvm_unprefixed: "1"
             no_lto: "1"
-            mode: full
           - name: android14-6.1
             kernel_version: ""
             urls: >-
