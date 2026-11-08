@@ -1020,15 +1020,39 @@ static bool udpbp_parse(struct sk_buff *skb, u16 dir, u16 *sport, u16 *dport,
 	}
 	else
 	{
-		if (headlen < sizeof(struct iphdr))
+		/* TX: udp_send_skb / ip_send_skb 时 skb->data 一般已指向 IP 头,
+		 * 但 GSO/分片链上只保证 network_header 有效, 两条都试。 */
+		iph = NULL;
+		if (base && headlen >= sizeof(struct iphdr))
+		{
+			struct iphdr *cand = (struct iphdr *)base;
+
+			if (cand->version == 4 && cand->protocol == IPPROTO_UDP &&
+			    cand->ihl >= 5)
+				iph = cand;
+		}
+		if (!iph && (u32)skb->network_header + sizeof(struct iphdr) <=
+			     (u32)skb->end)
+		{
+			struct iphdr *cand =
+				(struct iphdr *)(skb->head + skb->network_header);
+
+			if (cand->version == 4 && cand->protocol == IPPROTO_UDP &&
+			    cand->ihl >= 5)
+				iph = cand;
+		}
+		if (!iph)
 			return false;
-		iph = (struct iphdr *)base;
-		if (iph->version != 4 || iph->protocol != IPPROTO_UDP || iph->ihl < 5)
-			return false;
-		off = (u32)iph->ihl * 4;
-		if (headlen < off + 8)
-			return false;
-		uh = base + off;
+
+		{
+			u8 *ip_base = (u8 *)iph;
+			u32 ip_off = (u32)(ip_base - base);
+
+			off = ip_off + (u32)iph->ihl * 4;
+			if (off < ip_off || headlen < off + 8)
+				return false;
+			uh = ip_base + (u32)iph->ihl * 4;
+		}
 		*saddr = (u32)iph->saddr; /* 网络序原样 */
 		*daddr = (u32)iph->daddr;
 	}
@@ -1075,13 +1099,10 @@ static void udpbp_handle(struct sk_buff *skb, u16 dir)
 			continue;
 		if (s->cfg.pid && s->cfg.pid != pid)
 			continue;
-		if (s->cfg.port)
-		{
-			u16 want = (dir == UDPBP_DIR_TX) ? dport : sport;
-
-			if (want != s->cfg.port)
-				continue;
-		}
+		/* 原实现 TX 只比目的端口、RX 只比源端口, 按端口抓本地收发都会漏。
+		 * 改成源/目的任一命中即算命中, 结构体定义不变。 */
+		if (s->cfg.port && s->cfg.port != sport && s->cfg.port != dport)
+			continue;
 
 		act = s->cfg.action;
 
@@ -1118,11 +1139,18 @@ static void udpbp_handle(struct sk_buff *skb, u16 dir)
 	}
 }
 
+/* TX 探针候选: 名字 / skb 所在参数序号 (arm64 x0..x2)。
+ * ip_local_out 在 GKI 的 LTO 构建里被内联, 挂在它的符号地址上的 kprobe
+ * 一次都不会触发（真机 ftrace: hits=0）, 所以它只能当兜底。 */
+static const char *g_udpbp_tx_sym;
+static int g_udpbp_tx_arg = 2;
+
 static int udpbp_tx_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	/* ip_local_out(struct net *, struct sock *, struct sk_buff *) */
+	/* udp_send_skb(skb, sk) / ip_send_skb(net, skb) /
+	 * ip_local_out(net, sk, skb) —— 按 g_udpbp_tx_arg 取参数 */
 	(void)p;
-	udpbp_handle((struct sk_buff *)regs->regs[2], UDPBP_DIR_TX);
+	udpbp_handle((struct sk_buff *)regs->regs[g_udpbp_tx_arg], UDPBP_DIR_TX);
 	return 0;
 }
 
@@ -1140,16 +1168,39 @@ static int udpbp_probe_ensure(void)
 	if (g_udpbp_tx_kp || g_udpbp_rx_kp)
 		return 0;
 
-	g_udpbp_tx_kp = wind_kprobe_register_symbol("ip_local_out", udpbp_tx_pre, NULL);
+	{
+		static const struct {
+			const char *name;
+			int arg;
+		} tx_cands[] = {
+			{ "udp_send_skb", 0 },  /* 首选: 每个 UDP 报文必走 */
+			{ "ip_send_skb",  1 },
+			{ "ip_local_out", 2 },  /* GKI 上被内联, 仅兜底 */
+		};
+		int i;
+
+		for (i = 0; i < (int)(sizeof(tx_cands) / sizeof(tx_cands[0])); i++)
+		{
+			g_udpbp_tx_arg = tx_cands[i].arg;
+			g_udpbp_tx_kp = wind_kprobe_register_symbol(tx_cands[i].name,
+								   udpbp_tx_pre, NULL);
+			if (g_udpbp_tx_kp)
+			{
+				g_udpbp_tx_sym = tx_cands[i].name;
+				break;
+			}
+		}
+	}
 	g_udpbp_rx_kp = wind_kprobe_register_symbol("__udp4_lib_rcv", udpbp_rx_pre, NULL);
 
 	if (!g_udpbp_tx_kp && !g_udpbp_rx_kp)
 	{
-		printk(KERN_ERR "wind: udpbp probe register failed (ip_local_out / __udp4_lib_rcv)\n");
+		printk(KERN_ERR "wind: udpbp probe register failed (tx: udp_send_skb/ip_send_skb/ip_local_out, rx: __udp4_lib_rcv)\n");
 		return -EOPNOTSUPP;
 	}
-	printk(KERN_INFO "wind: udpbp probes tx=%d rx=%d\n",
-	       g_udpbp_tx_kp ? 1 : 0, g_udpbp_rx_kp ? 1 : 0);
+	printk(KERN_INFO "wind: udpbp probes tx=%s(arg%d) rx=%d\n",
+	       g_udpbp_tx_sym ? g_udpbp_tx_sym : "none", g_udpbp_tx_arg,
+	       g_udpbp_rx_kp ? 1 : 0);
 	return 0;
 }
 
