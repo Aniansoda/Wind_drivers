@@ -306,7 +306,11 @@ jobs:
             fi
           fi
 
-      - name: Build kernel & generate symvers
+      - name: Build kernel & generate symvers (opt-in, slow)
+        # 只有矩阵行写了 symvers_mode: build 才跑。
+        # 跑 = 一次完整内核构建（5.10/5.15 约 15-25 分钟，6.12/6.18 thin LTO 约 40-70 分钟），
+        # 换来的是 genksyms 精确 CRC，模块里带 __versions，加载时内核会校验版本。
+        if: ${{ matrix.symvers_mode == 'build' }}
         run: |
           cd kernel-src
           # 5.10 / 5.15 的顶层 Makefile 里没有 `PHONY += modpost`（6.1 之后才有），
@@ -337,39 +341,27 @@ jobs:
       - name: Get Module.symvers
         run: |
           cd kernel-src
-          # genksyms CRC 由源码 C 声明决定，与 LTO / CFI / 编译器版本无关，
-          # 和内核同源，直接拿来当 Module.symvers。
-          if [ -s vmlinux.symvers ]; then
-            cp vmlinux.symvers /tmp/full.symvers
+          MODE="${{ matrix.symvers_mode }}"
+          if [ "$MODE" = "build" ]; then
+            # 完整构建产物：6.1+ 是 vmlinux.symvers，5.10/5.15 是根 Module.symvers
+            if [ -s vmlinux.symvers ]; then
+              cp vmlinux.symvers Module.symvers
+              echo "CRC 模式：取 vmlinux.symvers"
+            else
+              echo "CRC 模式：沿用构建出的 Module.symvers"
+            fi
+            test -s Module.symvers
+            echo "行数 $(wc -l < Module.symvers)"
           else
-            cp Module.symvers /tmp/full.symvers
+            # 快速模式：不产出 CRC，模块里没有 __versions，
+            # 加载时内核跳过 check_version（vermagic 仍然照查）。
+            # 因为源码 commit 和设备的 uname -r 是同一个，符号签名本来就一致，
+            # 省掉的只是“值对不上会在 insmod 报错”这道保险。
+            : > Module.symvers
+            echo "快速模式：Module.symvers 置空（不跑完整构建）"
+            echo "  想要 CRC 校验：在对应矩阵行加 symvers_mode: build"
+            echo "  代价：5.10/5.15 约 15-25 分钟，6.12/6.18 约 40-70 分钟"
           fi
-          echo "取自 $( [ -s vmlinux.symvers ] && echo vmlinux.symvers || echo Module.symvers )"
-          # GKI 的 abi_symbollist 只列冻结 ABI 符号，而本驱动要用 register_kprobe /
-          # filp_open / kallsyms_lookup_name 这类不在表里的符号，按白名单过滤会在
-          # modpost 阶段直接 undefined。这里改成 Ylarod/ddk 的做法：
-          #   用自编译 vmlinux.symvers（genksyms CRC，和内核同源）全量，
-          #   再打 modpost 补丁放开符号校验（见上面的 Patch modpost 步）。
-          cp /tmp/full.symvers Module.symvers
-          # 顺带统计一下有多少符号落在冻结 ABI 表里，仅作信息输出
-          if [ -n "${{ matrix.prebuild }}" ]; then
-            rm -rf /tmp/gki-prebuilt
-            git clone --depth 1 --filter=blob:none --no-checkout \
-              --branch "${{ matrix.prebuild_ref }}" \
-              "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/prebuilts/${{ matrix.prebuild }}/arm64/" \
-              /tmp/gki-prebuilt || true
-            for f in abi_symbollist abi_symbol_list; do
-              git -C /tmp/gki-prebuilt checkout -q HEAD -- "$f" 2>/dev/null || true
-            done
-            for cand in abi_symbollist abi_symbol_list; do
-              if [ -s "/tmp/gki-prebuilt/$cand" ]; then
-                echo "ABI 表 ${{ matrix.prebuild }}: $cand = $(grep -c . "/tmp/gki-prebuilt/$cand") 行"
-                break
-              fi
-            done
-          fi
-          test -s Module.symvers
-          wc -l Module.symvers
 
       - name: Verify config & module_layout CRC
         run: |
