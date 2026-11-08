@@ -12,47 +12,68 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # urls 按顺序试，前一个失败换下一个，每个源再重试 3 次。
+          # 清华源在 GitHub runner 上经常排队 / TLS 中断（curl 56 GnuTLS），放最后。
+          # android.googlesource.com 实测支持按 SHA 取任意 commit，放第一。
           - name: android13-5.10.226
-            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
-            ref: refs/tags/android13-5.10.226_r00
+            kernel_version: "5.10.226"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://github.com/aosp-mirror/kernel_common.git
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            ref: android13-5.10.226_r00
             config: gki_defconfig
             cc: "LLVM=-14"
             llvmver: "14"
             mode: full
           - name: android14-5.15.167
-            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
-            ref: refs/tags/android14-5.15.167_r00
+            kernel_version: "5.15.167"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://github.com/aosp-mirror/kernel_common.git
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            ref: android14-5.15.167_r00
             config: gki_defconfig
             cc: "LLVM=-17"
             llvmver: "17"
             mode: full
           - name: android14-6.1
-            url: "https://github.com/aosp-mirror/kernel_common.git"
+            kernel_version: ""
+            urls: >-
+              https://github.com/aosp-mirror/kernel_common.git
+              https://android.googlesource.com/kernel/common
             ref: android14-6.1
             config: gki_defconfig
             cc: "LLVM=-17"
             llvmver: "17"
             mode: modpost
           - name: android15-6.6
-            url: "https://github.com/aosp-mirror/kernel_common.git"
+            kernel_version: "6.6.66"
+            urls: >-
+              https://github.com/aosp-mirror/kernel_common.git
+              https://android.googlesource.com/kernel/common
             ref: android15-6.6.66_r00
             config: gki_defconfig
             cc: "LLVM=-18"
             llvmver: "18"
             mode: modpost
           - name: android16-6.12.69
-            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
-            ref: refs/tags/android16-6.12.69_r00
+            kernel_version: "6.12.69"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            ref: android16-6.12.69_r00
             config: gki_defconfig
             cc: "LLVM=-19"
             llvmver: "19"
             mode: modpost
           - name: android17-6.18.21
-            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
-            # 清华源没有 android17-6.18.21_r00 这个 tag（只有 .24 / .32 / .33），
-            # 6.18.21 只能按 commit 取。实测清华源支持按 SHA fetch，GitHub 镜像不支持
-            # (upload-pack: not our ref)，所以必须走清华源。
-            # f957accaf563 的 Makefile = 6.18.21，与设备 uname -r 对齐。
+            kernel_version: "6.18.21"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            # 清华源与 AOSP 都没有 android17-6.18.21_r00 这个 release tag
+            # （只有 .24 / .32 / .33），只能按 commit 取；两个源都实测支持按 SHA fetch。
             sha: f957accaf5634f841071adb4f35286ef2779d5b1
             config: gki_defconfig
             cc: "LLVM=-21"
@@ -86,17 +107,45 @@ jobs:
 
       - name: Clone kernel source
         run: |
-          if [ -n "${{ matrix.sha }}" ]; then
-            git init -q kernel-src
-            git -C kernel-src remote add origin "${{ matrix.url }}"
-            git -C kernel-src fetch --depth 1 origin "${{ matrix.sha }}"
-            git -C kernel-src checkout -q FETCH_HEAD
-          else
-            git clone --depth 1 --branch "${{ matrix.ref }}" "${{ matrix.url }}" kernel-src
-          fi
+          SHA="${{ matrix.sha }}"
+          REF="${{ matrix.ref }}"
+          ok=0
+          for u in ${{ matrix.urls }}; do
+            echo "===== 源: $u ====="
+            for i in 1 2 3; do
+              rm -rf kernel-src
+              if [ -n "$SHA" ]; then
+                git init -q kernel-src
+                git -C kernel-src remote add origin "$u"
+                # googlesource / 清华都支持按 SHA 浅取；GitHub 镜像会报 not our ref
+                if timeout 900 git -C kernel-src -c http.version=HTTP/1.1 \
+                     -c http.postBuffer=524288000 fetch --depth 1 origin "$SHA"; then
+                  if git -C kernel-src checkout -q FETCH_HEAD; then ok=1; fi
+                fi
+              else
+                if timeout 900 git -c http.version=HTTP/1.1 -c http.postBuffer=524288000 \
+                     clone --depth 1 --branch "$REF" "$u" kernel-src; then
+                  ok=1
+                fi
+              fi
+              [ "$ok" = "1" ] && break
+              echo "  第 $i 次失败，退避 $((i * 15))s 后重试"
+              sleep $((i * 15))
+            done
+            if [ "$ok" = "1" ]; then echo "拉取成功: $u"; break; fi
+            echo "!! 这个源拿不到，换下一个"
+          done
+          if [ "$ok" != "1" ]; then echo "!! 所有源都失败"; exit 1; fi
+
           echo "== 源码版本 =="
-          awk -F'= *' '/^VERSION /{a=$2} /^PATCHLEVEL /{b=$2} /^SUBLEVEL /{c=$2} END{print a"."b"."c}' kernel-src/Makefile
+          GOT=$(awk -F'= *' '/^VERSION /{a=$2} /^PATCHLEVEL /{b=$2} /^SUBLEVEL /{c=$2} END{print a"."b"."c}' kernel-src/Makefile)
+          echo "$GOT"
           git -C kernel-src log --oneline -1
+          WANT="${{ matrix.kernel_version }}"
+          if [ -n "$WANT" ] && [ "$GOT" != "$WANT" ]; then
+            echo "!! 版本不符：期望 $WANT，实际 $GOT"
+            exit 1
+          fi
 
       - name: Configure kernel
         run: |
