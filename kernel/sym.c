@@ -73,7 +73,10 @@ typedef struct sock *(*netlink_kernel_create_mod_fn)(struct net *, int,
 						     struct netlink_kernel_cfg *);
 typedef void (*netlink_kernel_release_fn)(struct sock *);
 typedef int (*netlink_unicast_fn)(struct sock *, struct sk_buff *, u32, int);
-typedef struct sk_buff *(*alloc_skb_fn)(unsigned int, gfp_t);
+/* __alloc_skb(size, gfp_mask, flags, node) —— 是 4 个参数。
+ * 之前只按 2 个参数调, x2/x3 是残留垃圾, node 变成随机值,
+ * kmem_cache_alloc_node 直接崩在 wind_Alloc_skb 里(实测 pstore 栈)。 */
+typedef struct sk_buff *(*alloc_skb_fn)(unsigned int, gfp_t, int, int);
 static netlink_kernel_create_fn g_netlink_kernel_create = NULL;
 static netlink_kernel_create_mod_fn g_netlink_kernel_create_mod = NULL;
 static netlink_kernel_release_fn g_netlink_kernel_release = NULL;
@@ -305,7 +308,8 @@ struct sk_buff *wind_alloc_skb(unsigned int size, gfp_t gfp)
 {
 	if (!g_alloc_skb)
 		return NULL;
-	return g_alloc_skb(size, gfp);
+	/* flags = 0 (不要 SKB_ALLOC_RX/FCLONE), node = NUMA_NO_NODE */
+	return g_alloc_skb(size, gfp, 0, -1);
 }
 
 bool wind_netlink_available(void)
