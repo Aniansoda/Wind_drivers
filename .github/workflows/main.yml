@@ -23,10 +23,6 @@ jobs:
             cc: "LLVM=1"
             llvmver: "14"
             llvm_unprefixed: "1"
-            # GKI 5.10 默认 CONFIG_LTO_CLANG_THIN=y，vmlinux.o 的 LTO 链接
-            # 单进程要 10G+ 内存，runner 16G 直接被 OOM 杀（日志就一行 Killed）。
-            # 外部模块不需要内核 LTO / CFI，vermagic 也不含这两项，
-            # 关掉既省内存又不影响 wind.ko 的加载校验。
             no_lto: "1"
             mode: full
           - name: android14-5.15.167
@@ -36,6 +32,19 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android14-5.15.167_r00
+            config: gki_defconfig
+            cc: "LLVM=1"
+            llvmver: "17"
+            llvm_unprefixed: "1"
+            no_lto: "1"
+            mode: full
+          - name: android14-5.15.74
+            kernel_version: "5.15.74"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://github.com/aosp-mirror/kernel_common.git
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            ref: android14-5.15.74_r00
             config: gki_defconfig
             cc: "LLVM=1"
             llvmver: "17"
@@ -72,6 +81,16 @@ jobs:
             cc: "LLVM=-19"
             llvmver: "19"
             mode: modpost
+          - name: android16-6.12.69
+            kernel_version: "6.12.69"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            ref: android16-6.12.69_r00
+            config: gki_defconfig
+            cc: "LLVM=-19"
+            llvmver: "19"
+            mode: modpost
           - name: android17-6.18.21
             kernel_version: "6.18.21"
             urls: >-
@@ -89,8 +108,6 @@ jobs:
 
       - name: Add swap (LTO 兜底)
         run: |
-          # arm64 vmlinux 的 LTO 链接是本项目的内存峰值，runner 只有 16G，
-          # 被 OOM 杀掉时日志只有一个 "Killed"，没有任何可读错误。
           if [ ! -f /swapfile ]; then
             sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
             sudo chmod 600 /swapfile
@@ -208,10 +225,6 @@ jobs:
             --disable CONFIG_MEM_ALLOC_PROFILING \
             --disable CONFIG_WERROR \
             || true
-          # 5.x 关掉 LTO / CFI：GKI 5.10 / 5.15 默认 CONFIG_LTO_CLANG_THIN=y，
-          # `LTO vmlinux.o` 是单进程链接，峰值 10G+ 内存，runner 16G 直接 OOM
-          # （日志只有一行 Killed，看不出原因）。外部模块不需要内核 LTO / CFI，
-          # vermagic 也不含这两项，关掉不影响 wind.ko 的加载校验。
           if [ "${{ matrix.no_lto }}" = "1" ]; then
             ./scripts/config \
               --disable CONFIG_LTO \
@@ -266,10 +279,6 @@ jobs:
       - name: Merge device CRCs (if provided)
         run: |
           cd kernel-src
-          # 设备镜像的 module_layout 等符号 crc 由**厂商那套 .config** 决定，
-          # 我们自建的是 GKI 默认配置，两者 struct module 布局可能不同，
-          # 直接 insmod 会得到 "disagrees about version of symbol module_layout"。
-          # 这里用设备上现成 .ko 的 __versions（即设备内核 __kcrctab 的真实值）覆盖。
           SRC="../tools/device-symvers/${{ matrix.name }}.symvers"
           if [ -f "$SRC" ]; then
             echo "== 用设备 crc 覆盖: $SRC =="
