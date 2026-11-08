@@ -1106,6 +1106,22 @@ static void udpbp_handle(struct sk_buff *skb, u16 dir)
 
 		act = s->cfg.action;
 
+		/* 记录里的 preview 必须是"改写前"的原始载荷: 上层要拿它做离线解密,
+		 * 若先改写再拷贝, 记录里就只剩自己写进去的明文, 无法校验。
+		 * 先把记录填好, 再做改写。 */
+		memset(&rec, 0, sizeof(rec));
+		rec.ts_ns = (u64)READ_ONCE(jiffies) * (NSEC_PER_SEC / HZ);
+		rec.pid = pid;
+		rec.saddr = saddr;
+		rec.daddr = daddr;
+		rec.sport = sport;
+		rec.dport = dport;
+		rec.dir = dir;
+		rec.len = plen;
+		rec.preview_len = (payload && plen) ? min_t(u32, plen, UDPBP_PREVIEW_MAX) : 0;
+		if (rec.preview_len)
+			memcpy(rec.preview, payload, rec.preview_len);
+
 		/* 改写: 只动线性区且 skb 未被 clone, 否则降级为只记录 */
 		if (act == UDPBP_ACT_REWRITE)
 		{
@@ -1120,20 +1136,7 @@ static void udpbp_handle(struct sk_buff *skb, u16 dir)
 				memcpy(payload, s->cfg.patch, n);
 			}
 		}
-
-		memset(&rec, 0, sizeof(rec));
-		rec.ts_ns = (u64)READ_ONCE(jiffies) * (NSEC_PER_SEC / HZ);
-		rec.pid = pid;
-		rec.saddr = saddr;
-		rec.daddr = daddr;
-		rec.sport = sport;
-		rec.dport = dport;
-		rec.dir = dir;
 		rec.action = act;
-		rec.len = plen;
-		rec.preview_len = (payload && plen) ? min_t(u32, plen, UDPBP_PREVIEW_MAX) : 0;
-		if (rec.preview_len)
-			memcpy(rec.preview, payload, rec.preview_len);
 
 		udpbp_rec_push(s, &rec);
 	}
