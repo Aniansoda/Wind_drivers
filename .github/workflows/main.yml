@@ -7,122 +7,57 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 5.10 / 5.15：源码仓库与工具链口径同 Ylarod/ddk（mapping.json）
-          #   android12-5.10 -> branch android12-5.10-lts  clang-r416183b (master-kernel-build-2021)
-          #   android13-5.10 -> branch android13-5.10-lts  clang-r450784e (master-kernel-build-2022)
-          #   android13-5.15 -> branch android13-5.15-lts  clang-r450784e (master-kernel-build-2022)
-          #   android14-5.15 -> branch android14-5.15-lts  clang-r487747c (main-kernel-build-2023)
-          # 仓库都是 https://android.googlesource.com/kernel/common，
-          # 分支头会漂，没有可钉的版本号（和下面的 6.1 / 6.6 一样按分支取）。
-          # 只想要其中一个 android 版本，删掉多余的行即可。
-          - name: android12-5.10
-            repo: "https://android.googlesource.com/kernel/common"
-            ref: "android12-5.10-lts"
+          - name: android13-5.10.226
+            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
+            ref: refs/tags/android13-5.10.226_r00
             config: gki_defconfig
-            prebuild: "5.10"
-            prebuild_ref: "main"
-            clang_prebuilt: "clang-r416183b"
-            clang_prebuilt_branch: "master-kernel-build-2021"
-            cc: "LLVM=1"
-            llvmver: ""
-          - name: android13-5.10
-            repo: "https://android.googlesource.com/kernel/common"
-            ref: "android13-5.10-lts"
+            cc: "LLVM=-14"
+            llvmver: "14"
+            mode: full
+          - name: android14-5.15.167
+            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
+            ref: refs/tags/android14-5.15.167_r00
             config: gki_defconfig
-            prebuild: "5.10"
-            prebuild_ref: "main"
-            clang_prebuilt: "clang-r450784e"
-            clang_prebuilt_branch: "master-kernel-build-2022"
-            cc: "LLVM=1"
-            llvmver: ""
-          - name: android13-5.15
-            repo: "https://android.googlesource.com/kernel/common"
-            ref: "android13-5.15-lts"
-            config: gki_defconfig
-            prebuild: "5.15"
-            prebuild_ref: "main"
-            clang_prebuilt: "clang-r450784e"
-            clang_prebuilt_branch: "master-kernel-build-2022"
-            cc: "LLVM=1"
-            llvmver: ""
-          - name: android14-5.15
-            repo: "https://android.googlesource.com/kernel/common"
-            ref: "android14-5.15-lts"
-            config: gki_defconfig
-            prebuild: "5.15"
-            prebuild_ref: "main"
-            clang_prebuilt: "clang-r487747c"
-            clang_prebuilt_branch: "main-kernel-build-2023"
-            cc: "LLVM=1"
-            llvmver: ""
-          - name: android14-6.1
-            repo: aosp-mirror/kernel_common
-            ref: android14-6.1
-            config: gki_defconfig
-            prebuild: "6.1"
-            prebuild_ref: "main"
             cc: "LLVM=-17"
             llvmver: "17"
+            mode: full
+          - name: android14-6.1
+            url: "https://github.com/aosp-mirror/kernel_common.git"
+            ref: android14-6.1
+            config: gki_defconfig
+            cc: "LLVM=-17"
+            llvmver: "17"
+            mode: modpost
           - name: android15-6.6
-            repo: aosp-mirror/kernel_common
+            url: "https://github.com/aosp-mirror/kernel_common.git"
             ref: android15-6.6.66_r00
             config: gki_defconfig
-            prebuild: "6.6"
-            prebuild_ref: "main"
             cc: "LLVM=-18"
             llvmver: "18"
-          # 6.12 / 6.18：源码来源对齐 Ylarod/ddk
-          #   build-ddk.py: git clone https://android.googlesource.com/kernel/common \
-          #                            -b <branch> --depth 1
-          #   mapping.json: android16-6.12 -> branch android16-6.12-lts
-          #                 android17-6.18 -> branch android17-6.18-lts
-          #                 clang: 6.12 -> clang-r536225 (main-kernel-2025)
-          #                        6.18 -> clang-r584948c (main-kernel-2026)
-          #   build-ddk.py: CFI_NORMALIZE_INTEGERS_BRANCHES = {android16-6.12, android17-6.18}
-          #     → 这两条分支必须开 CONFIG_CFI_ICALL_NORMALIZE_INTEGERS，
-          #       gki_defconfig 里没有这一项，不开外部模块一律过不了 CFI 校验。
-          #
-          # lts 分支头会漂，所以 ref 钉到设备 uname -r 对应版本号的 commit：
-          #   6.12.58 -> bb362a4b5ee3881ccfd3a565d7560dee2c7155e6 (tag android16-6.12.58_r00)
-          #   6.18.21 -> f957accaf5634f841071adb4f35286ef2779d5b1
-          # 两个 Makefile 的 VERSION/PATCHLEVEL/SUBLEVEL 已核对 = 6.12.58 / 6.18.21。
-          #
-          # release 串拼法（scripts/setlocalversion）：
-          #   KERNELVERSION + localversion* 文件 + CONFIG_LOCALVERSION(-4k) + scm
-          # localversion 只填中段，-4k 由 gki_defconfig 自带，合出来是：
-          #   6.12.58-android16-6--97704a1ae279b-ab15213644-4k
-          #   6.18.21-android17-5-gf957accaf563-ab15926176-4k
-          - name: android16-6.12
-            repo: "https://android.googlesource.com/kernel/common"
-            ref: "bb362a4b5ee3881ccfd3a565d7560dee2c7155e6"
-            kernel_version: "6.12.58"
-            localversion: "-android16-6--97704a1ae279b-ab15213644"
+            mode: modpost
+          - name: android16-6.12.69
+            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
+            ref: refs/tags/android16-6.12.69_r00
             config: gki_defconfig
-            prebuild: "6.12"
-            prebuild_ref: "main"
-            clang_prebuilt: "clang-r536225"
-            clang_prebuilt_branch: "main-kernel-2025"
-            cfi_normalize: "1"
-            cc: "LLVM=1"
-            llvmver: ""
-          - name: android17-6.18
-            repo: "https://android.googlesource.com/kernel/common"
-            ref: "f957accaf5634f841071adb4f35286ef2779d5b1"
-            kernel_version: "6.18.21"
-            localversion: "-android17-5-gf957accaf563-ab15926176"
+            cc: "LLVM=-19"
+            llvmver: "19"
+            mode: modpost
+          - name: android17-6.18.21
+            url: "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git"
+            # 清华源没有 android17-6.18.21_r00 这个 tag（只有 .24 / .32 / .33），
+            # 6.18.21 只能按 commit 取。实测清华源支持按 SHA fetch，GitHub 镜像不支持
+            # (upload-pack: not our ref)，所以必须走清华源。
+            # f957accaf563 的 Makefile = 6.18.21，与设备 uname -r 对齐。
+            sha: f957accaf5634f841071adb4f35286ef2779d5b1
             config: gki_defconfig
-            prebuild: "6.18"
-            prebuild_ref: "android17-release"
-            clang_prebuilt: "clang-r584948c"
-            clang_prebuilt_branch: "main-kernel-2026"
-            cfi_normalize: "1"
-            cc: "LLVM=1"
-            llvmver: ""
+            cc: "LLVM=-21"
+            llvmver: "21"
+            mode: modpost
 
     steps:
       - name: Checkout driver source
@@ -139,118 +74,29 @@ jobs:
             dwarves libdwarf-dev kmod \
             wget gnupg
           # GKI 内核强制 CONFIG_CC_IS_CLANG, 不能用 gcc 交叉编译。
-          if [ -n "${{ matrix.clang_prebuilt }}" ]; then
-            # 6.12 / 6.18：用 AOSP 官方预编译 clang（ddk 同源），
-            # 和内核分支配套，kCFI 类型哈希才对得上。
-            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ matrix.clang_prebuilt_branch }}/${{ matrix.clang_prebuilt }}.tar.gz"
-            echo "下载 $URL"
-            sudo mkdir -p /opt/clang
-            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 "$URL" | sudo tar xz -C /opt/clang
-            echo "/opt/clang/bin" >> "$GITHUB_PATH"
-            /opt/clang/bin/clang --version | head -1
+          # 按版本装 LLVM: 5.10 -> clang-14, 5.15 -> clang-17, 6.1 -> 17, 6.6 -> 18,
+          # 6.12 -> clang-19, 6.18 -> clang-21 (对齐 Android 工具链)。
+          # 用 ubuntu-22.04 是因为 apt.llvm.org 的 noble 源只有 17/18/19/21，
+          # jammy 才有 clang-14 / clang-17；5.10 用 14 编译。
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          if [ -n "${{ matrix.llvmver }}" ]; then
+            sudo /tmp/llvm.sh "${{ matrix.llvmver }}" all
+          fi
+
+      - name: Clone kernel source
+        run: |
+          if [ -n "${{ matrix.sha }}" ]; then
+            git init -q kernel-src
+            git -C kernel-src remote add origin "${{ matrix.url }}"
+            git -C kernel-src fetch --depth 1 origin "${{ matrix.sha }}"
+            git -C kernel-src checkout -q FETCH_HEAD
           else
-            # 6.1 / 6.6：保持原样，按版本装 LLVM。
-            wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-            chmod +x /tmp/llvm.sh
-            if [ -n "${{ matrix.llvmver }}" ]; then
-              sudo /tmp/llvm.sh "${{ matrix.llvmver }}" all
-            fi
+            git clone --depth 1 --branch "${{ matrix.ref }}" "${{ matrix.url }}" kernel-src
           fi
-
-      - name: Fetch kernel source
-        env:
-          REPO: ${{ matrix.repo }}
-          REF: ${{ matrix.ref }}
-        run: |
-          set -eu
-          rm -rf kernel-src
-          if printf '%s' "$REF" | grep -Eq '^[0-9a-f]{7,40}$'; then
-            # 具体 commit：取归档包（--depth 克隆只认分支头，拿不到任意 SHA）。
-            # Gitiles 用 /+archive/<rev>.tar.gz，GitHub 用 /archive/<sha>.tar.gz。
-            case "$REPO" in
-              *github.com*) URL="${REPO%/}/archive/${REF}.tar.gz" ;;
-              *)            URL="${REPO%/}/+archive/${REF}.tar.gz" ;;
-            esac
-            echo "下载 $URL"
-            curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 "$URL" -o /tmp/kernel.tar.gz
-            # 两种归档包结构不同：
-            #   Gitiles (+archive/<rev>.tar.gz) 是平的，根就是 Makefile / arch/
-            #   GitHub (/archive/<sha>.tar.gz) 外面有一层 <repo>-<sha>/
-            # 之前固定 --strip-components=1 会把 Gitiles 的 arch/ 切掉，
-            # 于是 make 找不到 gki_defconfig（就是 6.18 那个报错）。
-            rm -rf /tmp/kx && mkdir -p /tmp/kx
-            tar xzf /tmp/kernel.tar.gz -C /tmp/kx
-            if [ -f /tmp/kx/Makefile ]; then
-              SRC=/tmp/kx
-            else
-              SRC=$(find /tmp/kx -maxdepth 1 -mindepth 1 -type d | head -1)
-            fi
-            test -f "$SRC/Makefile" || { echo "!! 归档包结构不认识，顶层："; ls -A /tmp/kx; exit 1; }
-            mv "$SRC" kernel-src
-          else
-            # 分支 / 标签：保持原来的浅克隆（6.1 / 6.6 走这条）。
-            case "$REPO" in
-              http*) CLONE_URL="${REPO%/}.git" ;;
-              *)     CLONE_URL="https://github.com/${REPO}.git" ;;
-            esac
-            echo "克隆 $CLONE_URL ($REF)"
-            git clone --depth 1 --branch "$REF" "$CLONE_URL" kernel-src
-          fi
-          echo "== Makefile 版本行 =="
-          sed -n '1,5p' kernel-src/Makefile
-
-      - name: Patch modpost (allow non-ABI symbols)
-        run: |
-          cd kernel-src
-          M=scripts/mod/modpost.c
-          test -f "$M"
-          # Ylarod/ddk 的 patch_modpost：放开符号导出校验，让外部模块能引用
-          # GKI 冻结 ABI 之外的符号（本驱动要 register_kprobe / filp_open /
-          # kallsyms_lookup_name），否则 modpost 直接报 undefined。
-          # 四条都幂等：已改过的不再命中。
-          sed -i 's/^\(\s*check_exports(mod);\)/\/\/\1/' "$M"
-          sed -i 's/^\(\s*s->module = exp->module;\)/\/\/\1/' "$M"
-          sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$M"
-          # check_exports 不跑之后 add_extended_versions() 会生成
-          # `____version_ext_names[] = ;` 这种非法空初始化，补一个空串
-          perl -0pi -e 's/__version_ext_names"\) =\s*\n/__version_ext_names") = ""\n/' "$M"
-          echo "== 补丁结果 =="
-          grep -n "check_exports(mod);" "$M" || echo "  check_exports(mod) 已注释"
-          grep -n "attribute__((unused)) check_exports" "$M" || true
-          grep -n 's->module = exp->module;' "$M" || echo "  s->module 赋值已注释"
-          grep -n '__version_ext_names") =' "$M" || true
-
-      - name: Pin localversion (vermagic)
-        run: |
-          cd kernel-src
-          # insmod 校验 vermagic，必须和 uname -r 一模一样：
-          #   6.12.58-android16-6--97704a1ae279b-ab15213644-4k
-          #   6.18.21-android17-5-gf957accaf563-ab15926176-4k
-          #
-          # setlocalversion 的拼法是：
-          #   ${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm}
-          # 其中 file_localversion = collect_files(localversion*)，
-          # config_localversion = CONFIG_LOCALVERSION（gki_defconfig 里是 "-4k"），
-          # 归档包没有 .git，scm 段为空。
-          # 所以把中段写进名为 localversion* 的文件即可，位置正好在 -4k 之前。
-          WANT="${{ matrix.localversion }}"
-          echo "目标中段=[$WANT]  gki_defconfig 自带 CONFIG_LOCALVERSION='-4k'"
-          # 没有 localversion 的行（5.10 / 5.15 / 6.1 / 6.6）直接退出：
-          # GitHub 的 run 是 bash -e，未命中的 glob（localversion*）会让命令
-          # 返回 1 并把整个 job 干掉，所以这里不碰这些文件。
-          if [ -z "$WANT" ]; then
-            echo "该内核不钉中段，沿用 Makefile / 分支默认，跳过"
-            exit 0
-          fi
-          # 清掉源码里可能自带的其它 localversion*，避免多段拼在一起
-          for f in localversion*; do
-            if [ -e "$f" ]; then echo "删除已有 $f"; rm -f "$f"; fi
-          done
-          printf '%s' "$WANT" > localversion-wind
-          echo "已写入 localversion-wind"
-          echo "== localversion* =="
-          ls -l localversion* || true
-          cat localversion-wind
+          echo "== 源码版本 =="
+          awk -F'= *' '/^VERSION /{a=$2} /^PATCHLEVEL /{b=$2} /^SUBLEVEL /{c=$2} END{print a"."b"."c}' kernel-src/Makefile
+          git -C kernel-src log --oneline -1
 
       - name: Configure kernel
         run: |
@@ -267,96 +113,70 @@ jobs:
             --enable CONFIG_HW_BREAKPOINT \
             --enable CONFIG_MISC_DEVICES \
             --disable CONFIG_AUTOFDO_CLANG \
-            --disable CONFIG_DEBUG_INFO \
-            --disable CONFIG_DEBUG_INFO_BTF \
-            --disable CONFIG_DEBUG_INFO_BTF_MODULES \
-            --disable CONFIG_DEBUG_INFO_DWARF5 \
+            --enable CONFIG_DEBUG_INFO_BTF \
+            --enable CONFIG_DEBUG_INFO_BTF_MODULES \
             --disable CONFIG_HEADERS_INSTALL \
             --disable CONFIG_GENDWARFKSYMS \
             --disable CONFIG_MEM_ALLOC_PROFILING \
             || true
-          # 6.12 / 6.18：ddk 的 CFI_NORMALIZE_INTEGERS_BRANCHES 明确要求这一项
-          if [ -n "${{ matrix.cfi_normalize }}" ]; then
-            ./scripts/config --enable CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
-          fi
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      - name: Build kernel (full, generates symvers)
-        # 无条件做一次完整内核构建：vmlinux.symvers / Module.symvers 只在 modpost
-        # 真的跑过 vmlinux 之后才有，5.10 / 5.15 又没有 `make modpost` 这个伪目标。
-        # 产物名按版本不同：5.10 / 5.15 是根 Module.symvers，6.1+ 另出 vmlinux.symvers。
-        # 耗时参考（GitHub runner 4 核）：5.10 / 5.15 约 15-25 分钟，
-        # 6.12 / 6.18 走 thin LTO 约 40-70 分钟。
+      - name: Prepare kernel modules
         run: |
           cd kernel-src
-          # 用 modules 而不是 `make modpost`：5.10 / 5.15 的顶层 Makefile 里没有
-          # `PHONY += modpost`（6.1 之后才有），直接 `make modpost` 就是这次的报错。
-          set +e
-          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules \
-            > /tmp/kbuild.log 2>&1
-          RC=$?
-          set -e
-          echo "构建退出码 rc=$RC（最后 40 行）"
-          tail -40 /tmp/kbuild.log
-          echo "== 目录里的 symvers 产物 =="
-          for f in vmlinux.symvers Module.symvers; do
-            if [ -s "$f" ]; then echo "  $f  $(wc -l < "$f") 行"; else echo "  $f  无"; fi
-          done
-          if [ ! -s vmlinux.symvers ] && [ ! -s Module.symvers ]; then
-            echo "!! 完整构建没有产出任何 symvers，rc=$RC"
-            exit 1
+          echo "== Wind-Tomie =="
+          if [ -n "${{ matrix.llvmver }}" ]; then
+            clang-${{ matrix.llvmver }} --version | head -1
+          else
+            aarch64-linux-gnu-gcc --version | head -1
           fi
-          if [ "$RC" -ne 0 ]; then
-            echo "!! 完整内核构建 rc=$RC，但已产出 symvers，继续（只要模块能链上）"
-          fi
-          echo "== 实际 kernelrelease =="
-          GOT=$(make -s ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- kernelrelease)
-          echo "$GOT"
-          grep -m1 UTS_RELEASE include/generated/utsrelease.h || true
-          if [ -n "${{ matrix.kernel_version }}" ]; then
-            WANT="${{ matrix.kernel_version }}${{ matrix.localversion }}-4k"
-            if [ "$GOT" != "$WANT" ]; then
-              echo "!! kernelrelease=$GOT 与设备 $WANT 不一致，insmod 会报 version magic"
-            else
-              echo "kernelrelease 与设备 uname -r 一致：$GOT"
-            fi
-          fi
+          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" -O modules_prepare \
+            > /tmp/prepare.log 2>&1 \
+            || { echo "=== prepare FAILED, tail 120 lines ==="; tail -120 /tmp/prepare.log; exit 1; }
 
       - name: Get Module.symvers
         run: |
           cd kernel-src
-          # genksyms CRC 由源码 C 声明决定，与 LTO / CFI / 编译器版本无关，
-          # 和内核同源，直接拿来当 Module.symvers，模块里带 __versions，
-          # 加载时内核会按 vermagic + 每个符号的 CRC 双重校验。
-          if [ -s vmlinux.symvers ]; then
-            cp vmlinux.symvers Module.symvers
-            echo "取自 vmlinux.symvers"
-          elif [ -s Module.symvers ]; then
-            echo "取自根 Module.symvers"
+          # 方案 G: 自编译 vmlinux.symvers (genksyms CRC)。CRC 只由 C 声明决定，
+          # 与 LTO / CFI / 编译器版本无关，和内核同源，直接拿来当 Module.symvers。
+          #
+          # 5.10 / 5.15 的顶层 Makefile 没有 `PHONY += modpost`，`make modpost` 会报
+          # No rule to make target，symvers 只能由完整构建产出，所以这两行走 full。
+          if [ "${{ matrix.mode }}" = "full" ]; then
+            make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules \
+              || echo "!! 完整构建非零退出，先看有没有 symvers"
+            if [ -s vmlinux.symvers ]; then
+              cp vmlinux.symvers Module.symvers
+              echo "取自 vmlinux.symvers"
+            elif [ -s Module.symvers ]; then
+              echo "取自根 Module.symvers"
+            else
+              echo "!! 没有产出 symvers"; exit 1
+            fi
           else
-            echo "!! 完整构建没有产出任何 symvers"
-            exit 1
+            make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modpost
+            test -s vmlinux.symvers
+            cp vmlinux.symvers Module.symvers
           fi
-          echo "行数 $(wc -l < Module.symvers)"
-          grep -c . Module.symvers
+          # 不按 abi 白名单过滤：5.10 / 5.15 的 prebuilt 目录里根本没有
+          # abi_symbollist（5.10 叫 abi_symbol_list，5.15 两个都没有），
+          # 而且驱动要用的 register_kprobe / filp_open 也不在冻结 ABI 表里。
+          test -s Module.symvers
+          wc -l Module.symvers
 
       - name: Verify config & module_layout CRC
         run: |
           cd kernel-src
-          echo "== MODVERSIONS 状态 =="
-          grep -E "CONFIG_MODVERSIONS|CONFIG_MODULE_SIG" .config || echo "!! MODVERSIONS 未开，symvers 里 CRC 会全 0"
-          echo "== symvers 前两行 =="
-          head -2 Module.symvers || true
           echo "== CFI/LTO 状态 (必须 CFI_CLANG=y) =="
-          grep -E "CONFIG_CFI=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG|CONFIG_CFI_ICALL_NORMALIZE_INTEGERS" .config || echo "!! CFI/LTO 未启用"
+          grep -E "CONFIG_CFI_CLANG|CONFIG_LTO_CLANG|CONFIG_LTO_CLANG_THIN" .config || echo "!! CFI/LTO 未启用"
           echo "== module_layout 在 Module.symvers 里的 CRC =="
           grep -E "module_layout" Module.symvers || echo "!! module_layout 不在 Module.symvers"
-          echo "== 模块用到的关键符号在 Module.symvers 里 =="
-          for s in register_kprobe unregister_kprobe filp_open kernel_read; do
-            if grep -qE "^[^[:space:]]+[[:space:]]+$s[[:space:]]" Module.symvers; then
-              echo "  $s OK"
+          echo "== 关键符号 =="
+          for sym in register_kprobe unregister_kprobe filp_open kernel_read; do
+            if grep -qE "^[^[:space:]]+[[:space:]]+$sym[[:space:]]" Module.symvers; then
+              echo "  $sym OK"
             else
-              echo "  $s 缺（modpost 已打补丁，运行时可能要 kallsyms 兜底）"
+              echo "  $sym 缺"
             fi
           done
 
