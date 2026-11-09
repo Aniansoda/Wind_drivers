@@ -41,6 +41,10 @@ typedef void (*wind_perf_overflow_handler_t)(struct perf_event *,
 pte_t wind_ptep_get(pte_t *ptep);
 unsigned long wind_clear_user(void __user *to, unsigned long n);
 
+/* mm 借用 (真机未导出 kthread_use_mm/kthread_unuse_mm, 运行时解析) */
+int wind_kthread_use_mm(struct mm_struct *mm);
+void wind_kthread_unuse_mm(struct mm_struct *mm);
+
 /* 重写的页表权限 (arm64 set_memory_* 非白名单) */
 int wind_set_memory_rw(unsigned long addr, int numpages);
 int wind_set_memory_ro(unsigned long addr, int numpages);

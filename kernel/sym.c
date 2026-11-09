@@ -105,6 +105,12 @@ static unregister_wide_hw_breakpoint_fn g_unregister_wide_hw_breakpoint = NULL;
 typedef void (*fpsimd_preserve_fn)(void);
 static fpsimd_preserve_fn g_fpsimd_preserve = NULL;
 
+/* kthread_use_mm / kthread_unuse_mm (白名单外, 真机未导出) */
+typedef void (*kthread_use_mm_fn)(struct mm_struct *);
+typedef void (*kthread_unuse_mm_fn)(struct mm_struct *);
+static kthread_use_mm_fn g_kthread_use_mm = NULL;
+static kthread_unuse_mm_fn g_kthread_unuse_mm = NULL;
+
 /* nofault 拷贝 (白名单外) */
 typedef long (*copy_from_user_nofault_fn)(void *, const void __user *, size_t);
 typedef long (*copy_to_user_nofault_fn)(void __user *, const void *, size_t);
@@ -215,6 +221,23 @@ int wind_set_memory_ro(unsigned long addr, int numpages)
 	if (!g_set_memory_ro)
 		return -EOPNOTSUPP;
 	return g_set_memory_ro(addr, numpages);
+}
+
+int wind_kthread_use_mm(struct mm_struct *mm)
+{
+	if (!mm)
+		return -EINVAL;
+	if (!g_kthread_use_mm)
+		return -EOPNOTSUPP;
+	g_kthread_use_mm(mm);
+	return 0;
+}
+
+void wind_kthread_unuse_mm(struct mm_struct *mm)
+{
+	if (!mm || !g_kthread_unuse_mm)
+		return;
+	g_kthread_unuse_mm(mm);
 }
 
 void wind_mmput(struct mm_struct *mm)
@@ -439,12 +462,19 @@ int wind_sym_init(void)
 			wind_kprobe_resolve("__netlink_kernel_release");
 	g_netlink_unicast = (netlink_unicast_fn)wind_kprobe_resolve("netlink_unicast");
 	g_alloc_skb = (alloc_skb_fn)wind_kprobe_resolve("__alloc_skb");
+	g_kthread_use_mm = (kthread_use_mm_fn)wind_kprobe_resolve("kthread_use_mm");
+	g_kthread_unuse_mm = (kthread_unuse_mm_fn)wind_kprobe_resolve("kthread_unuse_mm");
 
 	pr_info("wind: sym misc=%px/%px nl=%px/%px/%px/%px skb=%px\n",
 		(void *)g_misc_register, (void *)g_misc_deregister,
 		(void *)g_netlink_kernel_create, (void *)g_netlink_kernel_create_mod,
 		(void *)g_netlink_kernel_release, (void *)g_netlink_unicast,
 		(void *)g_alloc_skb);
+
+	pr_info("wind: sym use_mm=%px/%px\n",
+		(void *)g_kthread_use_mm, (void *)g_kthread_unuse_mm);
+	if (!g_kthread_use_mm || !g_kthread_unuse_mm)
+		pr_warn("wind: kthread_use_mm 未解析到, 影子页跳板不可用\n");
 
 	pr_info("wind: sym vmap=%px/%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px/%px nofault=%px/%px misc=%px/%px\n",
 		(void *)g_free_vm_area, (void *)g_vunmap, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
@@ -487,4 +517,6 @@ void wind_sym_exit(void)
 	g_netlink_kernel_release = NULL;
 	g_netlink_unicast = NULL;
 	g_alloc_skb = NULL;
+	g_kthread_use_mm = NULL;
+	g_kthread_unuse_mm = NULL;
 }

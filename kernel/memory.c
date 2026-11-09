@@ -722,7 +722,11 @@ static void wind_remote_map_work(struct work_struct *work)
 		return;
 	}
 
-	kthread_use_mm(r->mm);
+	if (wind_kthread_use_mm(r->mm) != 0) {
+		r->ret = -EOPNOTSUPP;
+		complete(&r->done);
+		return;
+	}
 	if (r->unmap) {
 		r->ret = vm_munmap(r->addr, r->len);
 	} else {
@@ -738,7 +742,7 @@ static void wind_remote_map_work(struct work_struct *work)
 			r->ret = 0;
 		}
 	}
-	kthread_unuse_mm(r->mm);
+	wind_kthread_unuse_mm(r->mm);
 	complete(&r->done);
 }
 
