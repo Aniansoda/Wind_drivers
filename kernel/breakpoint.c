@@ -17,8 +17,6 @@
  *     -EOPNOTSUPP 并打印候选符号; 可用替代是 VBAR_EL1 向量表改写(未实现)。
  *   - ptebp 命中后恢复 PTE 属一次性断点; 透明持续命中需单步(MDSCR_EL1.SS
  *     + hook 单步异常), 受 NOKPROBE 限制, 未完整实现。
- *   - ETM/Coresight 已删除: 它只能观测, 物理上没有改寄存器的能力, 留着
- *     只会让「ETM 模式」看起来能追踪而实际不动弹道。
  */
 
 #include <linux/kernel.h>

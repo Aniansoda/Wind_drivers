@@ -70,7 +70,6 @@ int bp_diag_get(WIND_BP_DIAG *out);
 /* ---- 三族一次性全关 (拆除 + 关改写 + 清记录), 换追踪方式时用 ---- */
 int bp_all_off(void);
 
-/* ETM/Coresight 分支追踪已删除 (硬件只能观测, 无法改写寄存器) */
 
 /* ---- UDP 断点 (kprobe udp_send_skb / udp_queue_rcv_skb, 按 pid/端口/方向过滤) ---- */
 int udpbp_set(int32_t slot_index, const UDPBP_POINT_CONFIG *point, int32_t *slot_out);

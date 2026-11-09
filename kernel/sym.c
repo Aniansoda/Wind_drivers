@@ -446,7 +446,7 @@ int wind_sym_init(void)
 		(void *)g_netlink_kernel_release, (void *)g_netlink_unicast,
 		(void *)g_alloc_skb);
 
-	pr_info("wind: sym vmap=%px/%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px nofault=%px/%px misc=%px/%px\n",
+	pr_info("wind: sym vmap=%px/%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px/%px nofault=%px/%px misc=%px/%px\n",
 		(void *)g_free_vm_area, (void *)g_vunmap, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
 		(void *)g_filp_open, (void *)g_kernel_read, (void *)g_file_path,
 		(void *)g_register_user_hw_breakpoint, (void *)g_unregister_hw_breakpoint,

@@ -59,9 +59,6 @@ enum OPERATIONS
 	OP_BRKBP_SET_RECORD   = WIND_OP_BASE + 0x24,
 	OP_BRKBP_CLEAR_RECORDS= WIND_OP_BASE + 0x25,
 
-	/* ---- 0x26..0x2B 原 ETM/Coresight, 已删除; 号段保留不再复用 ---- */
-	/* 0x26..0x2B 已由 WRP 数据断点接管 (见下方) */
-
 	/* ---- 陀螺仪停止/恢复 (暂停/恢复篡改, 保留 hook) ---- */
 	OP_GYRO_STOP         = WIND_OP_BASE + 0x2C,
 	OP_GYRO_RESUME       = WIND_OP_BASE + 0x2D,
@@ -89,14 +86,14 @@ enum OPERATIONS
 	OP_HWBP_REFRESH       = WIND_OP_BASE + 0x37,
 
 	/* ---- WRP 数据断点追踪: 盯住向量, 命中即写回 ----
-	 * 直接接管原 ETM/Coresight 的号段 0x26..0x2B: 老客户端发的 0x26/0x27
+	 * 使用 0x26..0x2B 号段: 老客户端发的 0x26/0x27
 	 * 现在被解释成 WRP 安装/拆除, 点结构恰好也是 24 字节, 不浪费号段 */
-	OP_WRPBP_SET          = WIND_OP_BASE + 0x26, /* 原 ETM_SET */
-	OP_WRPBP_REMOVE       = WIND_OP_BASE + 0x27, /* 原 ETM_REMOVE */
-	OP_WRPBP_GET_CONFIG   = WIND_OP_BASE + 0x28, /* 原 ETM_GET_CONFIG */
-	OP_WRPBP_GET_RECORDS  = WIND_OP_BASE + 0x29, /* 原 ETM_GET_RECORDS */
-	OP_WRPBP_SET_VEC      = WIND_OP_BASE + 0x2A, /* 原 ETM_SET_RECORD */
-	OP_WRPBP_CLEAR_RECORDS= WIND_OP_BASE + 0x2B, /* 原 ETM_CLEAR_RECORDS */
+	OP_WRPBP_SET          = WIND_OP_BASE + 0x26,
+	OP_WRPBP_REMOVE       = WIND_OP_BASE + 0x27,
+	OP_WRPBP_GET_CONFIG   = WIND_OP_BASE + 0x28,
+	OP_WRPBP_GET_RECORDS  = WIND_OP_BASE + 0x29,
+	OP_WRPBP_SET_VEC      = WIND_OP_BASE + 0x2A,
+	OP_WRPBP_CLEAR_RECORDS= WIND_OP_BASE + 0x2B,
 
 	/* ---- 三族断点运行期诊断快照 (计数/最近命中/最近写回值) ---- */
 	OP_BP_DIAG            = WIND_OP_BASE + 0x3E,
@@ -360,66 +357,6 @@ typedef struct _BRKBP_CLEAR_REQUEST
 	int32_t point_index;
 	uint32_t reserved;
 } BRKBP_CLEAR_REQUEST, *PBRKBP_CLEAR_REQUEST;
-
-/*
- * ---- ETM/PTM 分支追踪断点 ----
- * 通过 Coresight ETM 硬件追踪执行流 (分支/指令), 不改 debug 寄存器、
- * 不改代码、不改页表, 纯被动观测, 隐藏性最高。
- * 地址过滤: 只在 [start,end) 区间内记录执行流。
- */
-typedef struct _ETMBP_POINT_CONFIG
-{
-	uint64_t start;   /* 追踪区间起始地址 */
-	uint64_t end;     /* 追踪区间结束地址 (开区间) */
-	uint32_t flags;   /* 0=分支追踪 1=指令追踪 */
-	uint32_t reserved;
-} ETMBP_POINT_CONFIG, *PETMBP_POINT_CONFIG;
-
-typedef struct _ETMBP_CONFIG
-{
-	uint32_t active_count;
-	uint32_t trace_id;   /* 本 trace 会话 ID (sink 关联) */
-	uint32_t reserved;
-} ETMBP_CONFIG, *PETMBP_CONFIG;
-
-typedef struct _ETMBP_RECORD
-{
-	uint64_t addr;       /* 追踪到的地址 (分支源/目标) */
-	uint64_t timestamp;  /* 相对时间戳 */
-	uint32_t flags;      /* bit0=分支 1=异常 2=返回 */
-	uint32_t reserved;
-} ETMBP_RECORD, *PETMBP_RECORD;
-
-typedef struct _ETMBP_SET_REQUEST
-{
-	uint32_t point_count;
-	uint32_t reserved;
-	ETMBP_POINT_CONFIG points[];
-} ETMBP_SET_REQUEST, *PETMBP_SET_REQUEST;
-
-typedef struct _ETMBP_RECORDS_REQUEST
-{
-	uint32_t point_index;
-	uint32_t start_index;
-	uint32_t capacity;
-	uint32_t reserved;
-	ETMBP_RECORD *records;
-	uint32_t *count_out;
-} ETMBP_RECORDS_REQUEST, *PETMBP_RECORDS_REQUEST;
-
-typedef struct _ETMBP_RECORD_REQUEST
-{
-	uint32_t point_index;
-	uint32_t record_index;
-	uint32_t reserved;
-	ETMBP_RECORD record;
-} ETMBP_RECORD_REQUEST, *PETMBP_RECORD_REQUEST;
-
-typedef struct _ETMBP_CLEAR_REQUEST
-{
-	int32_t point_index;
-	uint32_t reserved;
-} ETMBP_CLEAR_REQUEST, *PETMBP_CLEAR_REQUEST;
 
 /* ---- 陀螺仪 ---- */
 typedef struct _GYRO_REQUEST
