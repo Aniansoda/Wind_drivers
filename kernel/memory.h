@@ -21,6 +21,11 @@ struct driver_session
 };
 
 /* ---- 页映射缓存统计 (OP_STATS 返回) ---- */
+/* 这个宏跟着结构体一起出现在头文件里。
+ * memory.c 用它判断「头文件是不是同一版」: 仓库里 memory.c 更新而 memory.h
+ * 没同步时, 编译不会因为多了两个字段而挂, 只是统计里少两项。 */
+#define WIND_HAVE_TR_STATS 1
+
 struct wind_map_stats
 {
 	uint64_t reads;   /* 走物理读的总次数 */
@@ -28,10 +33,13 @@ struct wind_map_stats
 	uint64_t misses;  /* 新建映射 */
 	uint64_t evicts;  /* 淘汰/过期回收 */
 	uint64_t cached;  /* 当前驻留条目数 */
+	uint64_t tr_hits;   /* VA->PA 翻译缓存命中 */
+	uint64_t tr_misses; /* 翻译缓存未命中(需遍历页表) */
 };
 
 void wind_map_cache_purge(void);
 void wind_map_cache_get_stats(struct wind_map_stats *out);
+void wind_tr_cache_purge(void);
 
 /* ---- 页表翻译 ---- */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va);
