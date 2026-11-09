@@ -10,6 +10,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/mm.h>
+#include <linux/sched.h>
 #include <asm/page.h>
 #include <asm/sysreg.h>
 #include "comm.h"
@@ -894,6 +895,24 @@ static int __init driver_entry(void)
 	printk("[+] wind driver_entry");
 	printk(KERN_INFO "wind: build by 川上富江Tomie | transport=%d hook_level=%d install_hook=%d\n",
 	       transport, hook_level, (int)install_hook);
+	/* 编译期结构体偏移打点。
+	 * 厂商内核的 config 会改 struct task_struct / struct inode 的布局,
+	 * 而本模块里 task->mm、current->mm->task_size、inode->i_fop 都是按
+	 * 编译期偏移直接取字段的。这两个数一比就知道偏移对不对:
+	 *   task_struct.mm 在设备 BTF 里的值  vs  这里打出来的值
+	 * 不一致就必须改成走导出函数(get_task_mm / get_pid_task), 不能再碰字段。 */
+	printk(KERN_INFO "wind: layout task_struct={size=%zu mm=%zu usage=%zu pid=%zu comm=%zu} inode={size=%zu i_fop=%zu} mm_struct={size=%zu task_size=%zu}\n",
+	       sizeof(struct task_struct),
+	       offsetof(struct task_struct, mm),
+	       offsetof(struct task_struct, usage),
+	       offsetof(struct task_struct, pid),
+	       offsetof(struct task_struct, comm),
+	       sizeof(struct inode),
+	       offsetof(struct inode, i_fop),
+	       sizeof(struct mm_struct),
+	       offsetof(struct mm_struct, task_size));
+	printk(KERN_INFO "wind: layout2 mm_struct.pgd=%zu  (编译期值; 设备侧真值用 tools/btf_offsets.py 量)\n",
+	       offsetof(struct mm_struct, pgd));
 	ret = wind_sym_init();
 	if (ret)
 		return ret;

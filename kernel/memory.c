@@ -19,6 +19,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/jiffies.h>
+#include <linux/spinlock.h>
 #include <linux/atomic.h>
 
 #include <asm/cpu.h>
@@ -104,6 +105,70 @@ static int wind_ttbr1_vabits(void)
 	return vabits;
 }
 
+/* 厂商内核的 struct mm_struct 布局与 GKI 不同时, mm->pgd 会取到错字段,
+ * 拿一个垃圾指针去翻页表 -> 直接 panic。这两个参数允许装机时用设备 BTF
+ * 量出来的偏移覆盖编译期 offsetof, 不用重新编译。
+ *   insmod wind.ko mm_pgd_off=1234 mm_task_size_off=5678
+ * -1 = 用编译期 offsetof(默认)。 */
+static int mm_pgd_off = -1;
+module_param(mm_pgd_off, int, 0644);
+MODULE_PARM_DESC(mm_pgd_off, "-1=编译期 offsetof(struct mm_struct,pgd); 否则按此字节偏移取");
+
+static int mm_task_size_off = -1;
+module_param(mm_task_size_off, int, 0644);
+MODULE_PARM_DESC(mm_task_size_off, "-1=编译期 offsetof(mm_struct,task_size); 否则按此字节偏移取");
+
+static atomic_t g_pgd_bad = ATOMIC_INIT(0);
+
+/* arm64 内核线性地址高 16 位全 1。pgd 必须是这种指针, 否则就是偏移取错了。
+ * 提前拦下来, 只让这次读返回失败, 不去解引用 -> 不会 panic 重启。 */
+static inline bool wind_kaddr_ok(const void *p)
+{
+	return ((unsigned long)p >> 48) == 0xffffUL;
+}
+
+static inline pgd_t *wind_mm_pgd(struct mm_struct *mm)
+{
+	pgd_t *pgd;
+
+	if (!mm)
+		return NULL;
+	if (mm_pgd_off >= 0 && mm_pgd_off <= 4096)
+		pgd = *(pgd_t **)((char *)mm + mm_pgd_off);
+	else
+		pgd = mm->pgd;
+
+	if (!wind_kaddr_ok(pgd)) {
+		/* 只报前 3 次, 免得刷屏 */
+		if (atomic_inc_return(&g_pgd_bad) <= 3)
+			pr_err("wind: mm->pgd 取到非内核地址 %px (mm=%px, off=%d) —— "
+			       "struct mm_struct 布局不符, 用 mm_pgd_off= 指定真实偏移\n",
+			       pgd, mm, mm_pgd_off);
+		return NULL;
+	}
+	return pgd;
+}
+
+static inline unsigned long wind_mm_task_size(struct mm_struct *mm)
+{
+	if (!mm)
+		return 0;
+	if (mm_task_size_off >= 0 && mm_task_size_off <= 4096)
+		return *(unsigned long *)((char *)mm + mm_task_size_off);
+	return mm->task_size;
+}
+
+/* 读路径分级打点: 前 N 次读每一步打一行, pstore 里最后一行就是死点。 */
+static int trace_read;
+module_param(trace_read, int, 0644);
+MODULE_PARM_DESC(trace_read, ">0 时前 N 次读打印 va/pa/结果, 定位读路径 panic 用");
+static atomic_t g_trace_seq = ATOMIC_INIT(0);
+
+static inline bool wind_tracing(void)
+{
+	return trace_read > 0 && atomic_read(&g_trace_seq) <= trace_read;
+}
+
 static int wind_pgtable_levels(void)
 {
 	int lv = READ_ONCE(wind_pgtable_levels_cached);
@@ -114,7 +179,7 @@ static int wind_pgtable_levels(void)
 
 	vabits = wind_ttbr1_vabits();
 	if (!vabits && current && current->mm) {
-		unsigned long ts = current->mm->task_size;
+		unsigned long ts = wind_mm_task_size(current->mm);
 
 		if (ts >= (1UL << 32))
 			vabits = 63 - __builtin_clzll((unsigned long long)ts);
@@ -131,6 +196,82 @@ static int wind_pgtable_levels(void)
 	return n;
 }
 
+/* ===================== VA -> PA 翻译缓存 =====================
+ * 每次读的瓶颈不是数据页, 是页表遍历: wind_mm_pte_locate_at 要按级
+ * (pgd->pud->pmd->pte, 3~4 级) 每级 wind_map_phys/vunmap 一次, 单次读
+ * 光翻译就是 3~4 次 vmap, 100us 量级。同一批数据在循环里被反复读,
+ * 缓存 VA 页 -> PA 页就够: 稳态下翻译变成一次哈希查表。
+ *
+ * 失效: TTL + bind/destroy/unload 全清。页表变了(COW/mmap)最坏读到旧物理页,
+ * 得到旧数据而不是崩溃 —— 与数据页映射缓存同一取舍。
+ */
+#define WIND_TR_SLOTS 4096
+struct wind_tr_slot {
+	unsigned long va_page;
+	phys_addr_t pa_page;
+	unsigned long stamp;
+};
+
+static struct wind_tr_slot g_tr_slots[WIND_TR_SLOTS];
+static DEFINE_SPINLOCK(g_tr_lock);
+static atomic64_t g_stat_tr_hits = ATOMIC64_INIT(0);
+static atomic64_t g_stat_tr_misses = ATOMIC64_INIT(0);
+
+static int tr_cache = 1;
+module_param(tr_cache, int, 0644);
+MODULE_PARM_DESC(tr_cache, "1=缓存 VA->PA 翻译(默认) 0=每次重新遍历页表");
+
+static int tr_ttl_ms = 2000;
+module_param(tr_ttl_ms, int, 0644);
+MODULE_PARM_DESC(tr_ttl_ms, "翻译缓存存活毫秒数, 默认 2000");
+
+void wind_tr_cache_purge(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_tr_lock, flags);
+	memset(g_tr_slots, 0, sizeof(g_tr_slots));
+	spin_unlock_irqrestore(&g_tr_lock, flags);
+}
+
+static bool wind_tr_lookup(unsigned long va_page, phys_addr_t *pa_page)
+{
+	struct wind_tr_slot *s;
+	bool hit = false;
+
+	if (!tr_cache)
+		return false;
+
+	s = &g_tr_slots[(va_page >> PAGE_SHIFT) & (WIND_TR_SLOTS - 1)];
+	spin_lock(&g_tr_lock);
+	if (s->va_page == va_page && s->pa_page &&
+	    time_before(jiffies, s->stamp + msecs_to_jiffies(tr_ttl_ms))) {
+		*pa_page = s->pa_page;
+		hit = true;
+	}
+	spin_unlock(&g_tr_lock);
+
+	if (hit)
+		atomic64_inc(&g_stat_tr_hits);
+	else
+		atomic64_inc(&g_stat_tr_misses);
+	return hit;
+}
+
+static void wind_tr_store(unsigned long va_page, phys_addr_t pa_page)
+{
+	struct wind_tr_slot *s;
+
+	if (!tr_cache || !pa_page)
+		return;
+	s = &g_tr_slots[(va_page >> PAGE_SHIFT) & (WIND_TR_SLOTS - 1)];
+	spin_lock(&g_tr_lock);
+	s->va_page = va_page;
+	s->pa_page = pa_page & PAGE_MASK;
+	s->stamp = jiffies;
+	spin_unlock(&g_tr_lock);
+}
+
 static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 				    int levels, struct wind_phys_map *out_m)
 {
@@ -145,7 +286,12 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 
 	va &= PAGE_MASK;
 
-	pgd = mm->pgd + wind_lidx(va, levels - 1);
+	pgd = wind_mm_pgd(mm);
+	if (!pgd)
+		return NULL;
+	pgd += wind_lidx(va, levels - 1);
+	if (wind_tracing())
+		pr_info("wind: pgd=%px va=%lx levels=%d\n", pgd, va, levels);
 	val = pgd_val(*pgd);
 	if (!val || (val & 0x3) != 0x3)
 		return NULL;
@@ -205,11 +351,16 @@ static pte_t *wind_mm_pte_locate(struct mm_struct *mm, unsigned long va,
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
 	struct wind_phys_map m = { .area = NULL, .addr = NULL };
+	unsigned long va_page = va & PAGE_MASK;
 	pte_t *pte;
 	phys_addr_t pa;
 
 	if (!mm)
 		return 0;
+
+	/* 命中: 直接算物理地址, 不碰页表 */
+	if (wind_tr_lookup(va_page, &pa))
+		return pa + (va & (PAGE_SIZE - 1));
 
 	pte = wind_mm_pte_locate(mm, va, &m);
 	if (!pte)
@@ -223,6 +374,7 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	pa = (phys_addr_t)(pte_pfn(wind_ptep_get(pte)) << PAGE_SHIFT) +
 	     (va & (PAGE_SIZE - 1));
 	wind_unmap_phys(&m);
+	wind_tr_store(va_page, pa & PAGE_MASK);
 	return pa;
 }
 
@@ -554,8 +706,8 @@ bool wind_write_process_va(struct mm_struct *mm, uintptr_t va, const void *buf, 
 	return wind_process_va_xfer(mm, va, (void *)buf, size, true);
 }
 
-#define WIND_MAP_SLOTS 256
-#define WIND_MAP_TTL   (5 * HZ)
+#define WIND_MAP_SLOTS 1024
+#define WIND_MAP_TTL   (3 * HZ)
 
 struct wind_map_slot {
 	phys_addr_t pa;
@@ -589,6 +741,8 @@ void wind_map_cache_purge(void)
 {
 	int i;
 
+	wind_tr_cache_purge();
+
 	mutex_lock(&g_map_mutex);
 	for (i = 0; i < WIND_MAP_SLOTS; i++)
 		wind_slot_free(&g_map_slots[i]);
@@ -612,44 +766,32 @@ void wind_map_cache_get_stats(struct wind_map_stats *out)
 	out->misses = (uint64_t)atomic64_read(&g_stat_misses);
 	out->evicts = (uint64_t)atomic64_read(&g_stat_evicts);
 	out->cached = (uint64_t)used;
+	out->tr_hits = (uint64_t)atomic64_read(&g_stat_tr_hits);
+	out->tr_misses = (uint64_t)atomic64_read(&g_stat_tr_misses);
+}
+
+/* 直接映射哈希: 槽位下标由物理页号算出, 命中就是一次数组访问 + 一次比较。
+ * 旧实现每次读都要扫 256 个槽位(每个还要 time_after), 单这一项就 1~2us,
+ * 300 次读/帧就是几百 us 白烧。撞槽就回收对方的映射, 用空间换常数时间。 */
+static struct wind_map_slot *wind_slot_of(phys_addr_t pa_page)
+{
+	return &g_map_slots[(pa_page >> PAGE_SHIFT) & (WIND_MAP_SLOTS - 1)];
 }
 
 static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 {
 	unsigned long now = jiffies;
-	unsigned long oldest = ~0UL;
-	int i, free_slot = -1, lru = 0;
-	struct wind_map_slot *s;
+	struct wind_map_slot *s = wind_slot_of(pa_page);
 	struct wind_phys_map m;
 
-	for (i = 0; i < WIND_MAP_SLOTS; i++) {
-		s = &g_map_slots[i];
-		if (!s->area) {
-			if (free_slot < 0)
-				free_slot = i;
-			continue;
-		}
-		if (time_after(now, s->stamp + WIND_MAP_TTL)) {
-			wind_slot_free(s);
-			atomic64_inc(&g_stat_evicts);
-			if (free_slot < 0)
-				free_slot = i;
-			continue;
-		}
-		if (s->pa == pa_page) {
+	if (s->area) {
+		if (s->pa == pa_page && !time_after(now, s->stamp + WIND_MAP_TTL)) {
 			s->stamp = now;
 			atomic64_inc(&g_stat_hits);
 			return s->addr;
 		}
-		if (s->stamp < oldest) {
-			oldest = s->stamp;
-			lru = i;
-		}
-	}
-
-	if (free_slot < 0) {
-		free_slot = lru;
-		wind_slot_free(&g_map_slots[lru]);
+		/* 过期, 或被同槽的别的页挤掉 */
+		wind_slot_free(s);
 		atomic64_inc(&g_stat_evicts);
 	}
 
@@ -658,7 +800,6 @@ static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 	if (!m.addr)
 		return NULL;
 
-	s = &g_map_slots[free_slot];
 	s->pa = pa_page;
 	s->area = m.area;
 	s->addr = m.addr;
@@ -799,10 +940,15 @@ static bool __read_mm(struct mm_struct *mm, uintptr_t addr, void __user *buffer,
 		pa = translate_linear_address(mm, addr);
 		if (!pa)
 		{
+			if (wind_tracing())
+				pr_info("wind: rd va=%lx 翻译失败\n", (unsigned long)addr);
 			break;
 		}
 
 		chunk = min(size, (size_t)(PAGE_SIZE - (addr & (PAGE_SIZE - 1))));
+		if (wind_tracing())
+			pr_info("wind: rd va=%lx -> pa=%llx chunk=%zu\n",
+				(unsigned long)addr, (unsigned long long)pa, chunk);
 		if (!read_physical_address(pa, buffer, chunk, mode))
 			break;
 
@@ -840,6 +986,14 @@ bool read_process_memory(struct driver_session *sess, uintptr_t addr, void __use
 	struct mm_struct *mm;
 	bool result;
 
+	if (trace_read > 0) {
+		int n = atomic_inc_return(&g_trace_seq);
+
+		if (n <= trace_read)
+			pr_info("wind: rd#%d va=%lx size=%zu mode=%d\n",
+				n, (unsigned long)addr, size, sess ? sess->read_mode : -1);
+	}
+
 	if (sess && sess->task && sess->task->mm == current->mm) {
 		void *tmp;
 
@@ -861,10 +1015,17 @@ bool read_process_memory(struct driver_session *sess, uintptr_t addr, void __use
 	}
 
 	mm = session_get_mm(sess);
-	if (!mm)
+	if (!mm) {
+		if (wind_tracing())
+			pr_info("wind: rd 取 mm 失败\n");
 		return false;
+	}
+	if (wind_tracing())
+		pr_info("wind: rd mm=%px pgd=%px\n", mm, wind_mm_pgd(mm));
 
 	result = __read_mm(mm, addr, buffer, size, sess->read_mode);
+	if (wind_tracing())
+		pr_info("wind: rd 完成 result=%d\n", (int)result);
 	wind_mmput(mm);
 	return result;
 }
