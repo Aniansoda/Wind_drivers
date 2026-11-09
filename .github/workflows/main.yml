@@ -99,6 +99,9 @@ jobs:
             ref: android16-6.12.58_r00
             config: ""
             config_file: tools/device/config/android16-6.12.58-device.config
+            # 不想把 480 KB 设备产物塞进仓库时: 传 windpack-*.tar.gz 的直链(Release/对象存储),
+            # 下面 Fetch 步骤会自动解出 config + harvest CRC 表
+            device_pack_url: ""
             localversion: "-android16-6-g7704a1ae279b-ab15213644-4k"
             strict_crc: "1"
             cc: "LLVM=-19"
@@ -128,6 +131,98 @@ jobs:
     steps:
       - name: Checkout driver source
         uses: actions/checkout@v4
+
+      - name: Prepare device artifacts (repo tarball / URL / files)
+        run: |
+          CFG="${{ matrix.config_file }}"
+          SYM="tools/device/symvers/${{ matrix.name }}.symvers"
+          URL="${{ matrix.device_pack_url }}"
+          [ -n "$CFG" ] || exit 0
+          have() { [ -f "$CFG" ] && [ -f "$SYM" ]; }
+          mkdir -p "$(dirname "$CFG")" "$(dirname "$SYM")"
+
+          if have; then
+            echo "== 仓库里已带设备产物 =="
+            ls -l "$CFG" "$SYM"
+            exit 0
+          fi
+
+          # 1) 仓库根放的小包 device-artifacts-*.tar.gz（内部是 tools/device/... 路径）
+          for T in device-artifacts-*.tar.gz tools/device-artifacts-*.tar.gz; do
+            if [ -f "$T" ]; then
+              echo "== 解开仓库里的 $T =="
+              tar xzf "$T"
+            fi
+          done
+          if have; then
+            ls -l "$CFG" "$SYM"
+            exit 0
+          fi
+
+          # 2) 需要设备包：优先仓库/工作区里的 windpack，其次 device_pack_url
+          PACK=""
+          for P in windpack-*.tar.gz device-pack-*.tar.gz tools/windpack-*.tar.gz; do
+            if [ -f "$P" ]; then PACK="$P"; break; fi
+          done
+          if [ -z "$PACK" ]; then
+            if [ -z "$URL" ]; then
+              echo "::error::没有设备产物: 仓库根放 device-artifacts-*.tar.gz 或 windpack-*.tar.gz, 或设 device_pack_url"
+              exit 1
+            fi
+            echo "== 下载设备包 $URL =="
+            curl -fL --retry 3 --connect-timeout 20 -o /tmp/pack.tgz "$URL"
+            PACK=/tmp/pack.tgz
+          fi
+
+          echo "== 用设备包 $PACK 提取 config + CRC 表 =="
+          mkdir -p /tmp/dp
+          tar xzf "$PACK" -C /tmp/dp
+          if [ ! -f "$CFG" ]; then
+            SRC=$(find /tmp/dp -maxdepth 2 -name 'config.gz' | head -1)
+            [ -n "$SRC" ] || { echo "::error::设备包里没有 config.gz"; exit 1; }
+            if gzip -t "$SRC" 2>/dev/null; then zcat "$SRC" > "$CFG"; else cp "$SRC" "$CFG"; fi
+            echo "config 行数: $(wc -l < "$CFG")"
+          fi
+          if [ ! -f "$SYM" ]; then
+            FIRST=""
+            for c in mods-vendor_dlkm.tar.gz mods-vendor.tar.gz; do
+              if [ -f "/tmp/dp/$c" ]; then FIRST="/tmp/dp/$c"; break; fi
+            done
+            [ -n "$FIRST" ] || FIRST=$(ls /tmp/dp/mods-*.tar.gz 2>/dev/null | head -1)
+            if [ -n "$FIRST" ]; then
+              echo "== 解开模块包 $(basename "$FIRST") =="
+              tar xzf "$FIRST" -C /tmp/dp
+            fi
+            N=$(find /tmp/dp -name '*.ko' | wc -l)
+            echo "设备包里 .ko: $N 个"
+            if [ "$N" -lt 50 ]; then echo "::error::设备包里 ko 太少($N), CRC 表不可信"; exit 1; fi
+            python3 tools/dump_kcrc.py harvest "$SYM" $(find /tmp/dp -name '*.ko')
+          fi
+          ls -l "$CFG" "$SYM"
+
+      - name: Preflight device artifacts
+        run: |
+          CFG="${{ matrix.config_file }}"
+          SYM="tools/device/symvers/${{ matrix.name }}.symvers"
+          want_sym="${{ matrix.strict_crc }}"
+          [ -n "$CFG" ] || exit 0
+          miss=0
+          if [ ! -f "$CFG" ]; then
+            echo "::error::缺少真机 config: $CFG"
+            miss=1
+          fi
+          if [ -n "$want_sym" ] && [ ! -f "$SYM" ]; then
+            echo "::error::缺少真机 CRC 表: $SYM"
+            miss=1
+          fi
+          if [ "$miss" = "1" ]; then
+            echo "两个文件都是**设备产物**, 必须随仓库一起推上去(或设 device_pack_url 走外链):"
+            echo "  zcat config.gz > $CFG"
+            echo "  python3 tools/dump_kcrc.py harvest $SYM \$(find /tmp/devmods -name '*.ko')"
+            echo "  来源: 设备 /proc/config.gz 与 /vendor_dlkm/lib/modules/*.ko"
+            exit 1
+          fi
+          ls -l "$CFG" "$SYM" 2>/dev/null || true
 
       - name: Add swap (LTO 兜底)
         run: |
@@ -333,6 +428,10 @@ jobs:
             python3 ../tools/dump_kcrc.py diff /tmp/self.symvers "$SRC" | tee /tmp/crc_diff.txt
             set -e
             if [ -n "${{ matrix.strict_crc }}" ]; then
+              if ! grep -q "cmd == 'count'" ../tools/dump_kcrc.py; then
+                echo "::error::../tools/dump_kcrc.py 是旧版(没有 count 子命令), 把仓库里这份一起更新后再跑"
+                exit 1
+              fi
               # count 子命令直接给 "不一致数 交集数", 不依赖日志文案
               COUNTS=$(python3 ../tools/dump_kcrc.py count /tmp/self.symvers "$SRC")
               BAD=${COUNTS%% *}; COMMON=${COUNTS##* }
