@@ -93,6 +93,18 @@ typedef void (*unregister_hw_breakpoint_fn)(struct perf_event *);
 static register_user_hw_breakpoint_fn g_register_user_hw_breakpoint = NULL;
 static unregister_hw_breakpoint_fn g_unregister_hw_breakpoint = NULL;
 
+/* per-CPU 全域断点 (白名单外) */
+typedef struct perf_event * __percpu *(*register_wide_hw_breakpoint_fn)(struct perf_event_attr *,
+								       perf_overflow_handler_t,
+								       void *);
+typedef void (*unregister_wide_hw_breakpoint_fn)(struct perf_event * __percpu *);
+static register_wide_hw_breakpoint_fn g_register_wide_hw_breakpoint = NULL;
+static unregister_wide_hw_breakpoint_fn g_unregister_wide_hw_breakpoint = NULL;
+
+/* FP 状态同步 (白名单外) */
+typedef void (*fpsimd_preserve_fn)(void);
+static fpsimd_preserve_fn g_fpsimd_preserve = NULL;
+
 /* nofault 拷贝 (白名单外) */
 typedef long (*copy_from_user_nofault_fn)(void *, const void __user *, size_t);
 typedef long (*copy_to_user_nofault_fn)(void __user *, const void *, size_t);
@@ -351,6 +363,30 @@ void wind_unregister_hw_breakpoint(struct perf_event *bp)
 		g_unregister_hw_breakpoint(bp);
 }
 
+struct perf_event * __percpu *wind_register_wide_hw_breakpoint(struct perf_event_attr *attr,
+							       wind_perf_overflow_handler_t triggered,
+							       void *context)
+{
+	if (!g_register_wide_hw_breakpoint)
+		return ERR_PTR(-EOPNOTSUPP);
+	return g_register_wide_hw_breakpoint(attr, (perf_overflow_handler_t)triggered,
+					     context);
+}
+
+void wind_unregister_wide_hw_breakpoint(struct perf_event * __percpu *cpu_events)
+{
+	if (g_unregister_wide_hw_breakpoint && cpu_events)
+		g_unregister_wide_hw_breakpoint(cpu_events);
+}
+
+bool wind_fpsimd_preserve_current_state(void)
+{
+	if (!g_fpsimd_preserve)
+		return false;
+	g_fpsimd_preserve();
+	return true;
+}
+
 long wind_copy_from_user_nofault(void *dst, const void __user *src, size_t size)
 {
 	if (!g_copy_from_user_nofault)
@@ -383,6 +419,12 @@ int wind_sym_init(void)
 	g_file_path = (file_path_fn)wind_kprobe_resolve("file_path");
 	g_register_user_hw_breakpoint = (register_user_hw_breakpoint_fn)wind_kprobe_resolve("register_user_hw_breakpoint");
 	g_unregister_hw_breakpoint = (unregister_hw_breakpoint_fn)wind_kprobe_resolve("unregister_hw_breakpoint");
+	g_register_wide_hw_breakpoint = (register_wide_hw_breakpoint_fn)
+		wind_kprobe_resolve("register_wide_hw_breakpoint");
+	g_unregister_wide_hw_breakpoint = (unregister_wide_hw_breakpoint_fn)
+		wind_kprobe_resolve("unregister_wide_hw_breakpoint");
+	g_fpsimd_preserve = (fpsimd_preserve_fn)
+		wind_kprobe_resolve("fpsimd_preserve_current_state");
 	g_copy_from_user_nofault = (copy_from_user_nofault_fn)wind_kprobe_resolve("copy_from_user_nofault");
 	g_copy_to_user_nofault = (copy_to_user_nofault_fn)wind_kprobe_resolve("copy_to_user_nofault");
 	g_misc_register = (misc_register_fn)wind_kprobe_resolve("misc_register");
@@ -408,6 +450,7 @@ int wind_sym_init(void)
 		(void *)g_free_vm_area, (void *)g_vunmap, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,
 		(void *)g_filp_open, (void *)g_kernel_read, (void *)g_file_path,
 		(void *)g_register_user_hw_breakpoint, (void *)g_unregister_hw_breakpoint,
+		(void *)g_register_wide_hw_breakpoint,
 		(void *)g_copy_from_user_nofault, (void *)g_copy_to_user_nofault,
 		(void *)g_misc_register, (void *)g_misc_deregister);
 
@@ -432,6 +475,9 @@ void wind_sym_exit(void)
 	g_file_path = NULL;
 	g_register_user_hw_breakpoint = NULL;
 	g_unregister_hw_breakpoint = NULL;
+	g_register_wide_hw_breakpoint = NULL;
+	g_unregister_wide_hw_breakpoint = NULL;
+	g_fpsimd_preserve = NULL;
 	g_copy_from_user_nofault = NULL;
 	g_copy_to_user_nofault = NULL;
 	g_misc_register = NULL;

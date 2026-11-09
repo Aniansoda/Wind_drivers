@@ -80,6 +80,9 @@ enum OPERATIONS
 
 	/* ---- 读取路径统计 (页映射缓存命中率, 调优用) ---- */
 	OP_STATS              = WIND_OP_BASE + 0x33,
+
+	/* ---- 硬件断点命中时改写 FP 寄存器 (对齐 DUJIA/GTV 的 v3/v4/v5 语义) ---- */
+	OP_HWBP_SET_REGS      = WIND_OP_BASE + 0x34,
 };
 
 /* ---- 读取模式 ---- */
@@ -403,6 +406,20 @@ typedef struct _GYRO_REQUEST
 {
 	u32 rx, ry, rz;  /* 目标三轴角速度, float 位模式 (IEEE 754)。内核态禁用 FP 寄存器 */
 } GYRO_REQUEST, *PGYRO_REQUEST;
+
+/*
+ * ---- 硬件断点命中改写请求 ----
+ * 命中执行断点时把 v3/v4/v5 的低 32 位改成给定 float 位模式, 再让内核在
+ * 返回用户态时重载 FP 状态。point_index = -1 表示全部点位。
+ * enable = 0 时只清改写配置 (断点保留)。
+ */
+typedef struct _HWBP_REG_REQUEST
+{
+	int32_t  point_index;
+	uint32_t enable;
+	uint32_t rx, ry, rz;   /* float 位模式 */
+	uint32_t reserved;
+} HWBP_REG_REQUEST, *PHWBP_REG_REQUEST;
 
 /*
  * ---- UDP 断点 ----

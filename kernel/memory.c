@@ -766,8 +766,10 @@ void wind_map_cache_get_stats(struct wind_map_stats *out)
 	out->misses = (uint64_t)atomic64_read(&g_stat_misses);
 	out->evicts = (uint64_t)atomic64_read(&g_stat_evicts);
 	out->cached = (uint64_t)used;
+#ifdef WIND_HAVE_TR_STATS
 	out->tr_hits = (uint64_t)atomic64_read(&g_stat_tr_hits);
 	out->tr_misses = (uint64_t)atomic64_read(&g_stat_tr_misses);
+#endif
 }
 
 /* 直接映射哈希: 槽位下标由物理页号算出, 命中就是一次数组访问 + 一次比较。

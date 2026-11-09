@@ -44,6 +44,9 @@
 #include <asm/ptrace.h>
 #include <asm/sysreg.h>
 #include <asm/pgtable.h>
+#include <asm/processor.h>
+#include <asm/fpsimd.h>
+#include <linux/thread_info.h>
 #include "breakpoint.h"
 #include "sym.h"
 #include "memory.h"
@@ -146,12 +149,89 @@ static uint32_t bp_op_mask(uint32_t bp_type, unsigned long pc)
  * =================================================================== */
 struct hwbp_slot
 {
-	struct perf_event *bp;
+	void *bp;      /* per-CPU 数组 或 单任务 event, 由 wide 区分 */
+	bool wide;
 	uint64_t addr;
 	uint32_t type;
 	uint32_t length;
 	bool active;
 };
+
+/* 命中时改写 v3/v4/v5 (对齐 DUJIA/GTV 语义): rx/ry/rz 为 float 位模式 */
+struct hwbp_regmod
+{
+	bool enabled;
+	u32 rx, ry, rz;
+};
+
+static struct hwbp_regmod hwbp_regmod[BP_SLOT_MAX];
+/* 断点绑的是 VA: per-CPU 全域断点会命中任何映射到同址的进程,
+ * 命中侧按 tgid 过滤, 只认 bind 的那个进程。 */
+static pid_t hwbp_tgid;
+
+/* 命中改写去重: 准心函数可能每帧命中上千次, 每次都做 FP 同步 + 重载会
+ * 直接吃掉帧率并拉高功耗。只在数值真的变了、且距上次写入超过
+ * HWBP_REG_MIN_INTERVAL_MS 时才落一次。 */
+#define HWBP_REG_MIN_INTERVAL_MS 4
+
+/* 命中上下文: 先同步 FP 状态到内存 -> 改 s3/s4/s5 -> 标记 FOREIGN,
+ * 返回用户态时按内存重载, 改写才真正落到浮点寄存器上。 */
+static u32 hwbp_last_regs[BP_SLOT_MAX][3];
+static unsigned long hwbp_last_regs_jiffies[BP_SLOT_MAX];
+
+static void hwbp_apply_fp_regs(int slot, const struct hwbp_regmod *cfg)
+{
+	u32 *v;
+	unsigned long flags, now;
+
+	if (hwbp_last_regs[slot][0] == cfg->rx &&
+	    hwbp_last_regs[slot][1] == cfg->ry &&
+	    hwbp_last_regs[slot][2] == cfg->rz)
+		return; /* 同一组角度, 再写一遍没有意义 */
+
+	now = jiffies;
+	if (hwbp_last_regs_jiffies[slot] &&
+	    time_before(now, hwbp_last_regs_jiffies[slot] +
+			     msecs_to_jiffies(HWBP_REG_MIN_INTERVAL_MS)))
+		return; /* 限速: 最快 250 Hz 落一次 */
+
+	if (!wind_fpsimd_preserve_current_state())
+		return; /* 解析不到同步函数就不改, 避免打乱其余寄存器 */
+
+	local_irq_save(flags);
+	v = (u32 *)&current->thread.uw.fpsimd_state.vregs[3];
+	v[0] = cfg->rx;
+	v = (u32 *)&current->thread.uw.fpsimd_state.vregs[4];
+	v[0] = cfg->ry;
+	v = (u32 *)&current->thread.uw.fpsimd_state.vregs[5];
+	v[0] = cfg->rz;
+	set_thread_flag(TIF_FOREIGN_FPSTATE);
+	local_irq_restore(flags);
+
+	hwbp_last_regs[slot][0] = cfg->rx;
+	hwbp_last_regs[slot][1] = cfg->ry;
+	hwbp_last_regs[slot][2] = cfg->rz;
+	hwbp_last_regs_jiffies[slot] = now;
+}
+
+int hwbp_set_reg_modify(int point_index, u32 enable, u32 rx, u32 ry, u32 rz)
+{
+	int i, lo = 0, hi = BP_SLOT_MAX - 1;
+
+	if (point_index >= BP_SLOT_MAX)
+		return -EINVAL;
+	if (point_index >= 0)
+		lo = hi = point_index;
+
+	for (i = lo; i <= hi; i++)
+	{
+		hwbp_regmod[i].enabled = (enable != 0);
+		hwbp_regmod[i].rx = rx;
+		hwbp_regmod[i].ry = ry;
+		hwbp_regmod[i].rz = rz;
+	}
+	return 0;
+}
 
 static struct hwbp_slot hwbp_slots[BP_SLOT_MAX];
 static HWBP_RECORD hwbp_recs[BP_SLOT_MAX][BP_REC_PER_SLOT];
@@ -164,9 +244,14 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 	int i;
 	HWBP_RECORD rec;
 
+	if (hwbp_tgid && current->tgid != hwbp_tgid)
+		return;
+
 	for (i = 0; i < BP_SLOT_MAX; i++)
 	{
-		if (hwbp_slots[i].active && hwbp_slots[i].bp == bp)
+		/* wide 断点的回调给的是 per-CPU 事件, 不是注册时拿到的数组指针,
+		 * 只能按断点地址认领槽位。 */
+		if (hwbp_slots[i].active && hwbp_slots[i].addr == bp->attr.bp_addr)
 		{
 			memset(&rec, 0, sizeof(rec));
 			rec.trigger_pc = instruction_pointer(regs);
@@ -174,6 +259,9 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 			rec.op_mask = bp_op_mask(hwbp_slots[i].type, rec.trigger_pc);
 			bp_rec_push(hwbp_recs[i], sizeof(HWBP_RECORD),
 				    &hwbp_head[i], &hwbp_count[i], &rec);
+			if (hwbp_regmod[i].enabled &&
+			    hwbp_slots[i].type == BP_TYPE_EXEC)
+				hwbp_apply_fp_regs(i, &hwbp_regmod[i]);
 			break;
 		}
 	}
@@ -181,11 +269,15 @@ static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 
 static void hwbp_clear_slot(int i)
 {
-	if (hwbp_slots[i].bp)
-	{
-		wind_unregister_hw_breakpoint(hwbp_slots[i].bp);
+	if (hwbp_slots[i].bp) {
+		if (hwbp_slots[i].wide)
+			wind_unregister_wide_hw_breakpoint(
+				(struct perf_event * __percpu *)hwbp_slots[i].bp);
+		else
+			wind_unregister_hw_breakpoint((struct perf_event *)hwbp_slots[i].bp);
 		hwbp_slots[i].bp = NULL;
 	}
+	hwbp_slots[i].wide = false;
 	hwbp_slots[i].active = false;
 }
 
@@ -200,11 +292,13 @@ int hwbp_set(struct driver_session *sess, const HWBP_POINT_CONFIG *points,
 		return -EINVAL;
 
 	hwbp_remove();
+	hwbp_tgid = sess->task->tgid;
 
 	for (i = 0; i < (int)point_count; i++)
 	{
 		struct perf_event_attr attr;
-		struct perf_event *bp;
+		void *bp;
+		bool wide = true;
 
 		hwtype = bp_type_to_hw(points[i].type);
 		hwlen = bp_len_to_hw(points[i].length ? points[i].length : BP_LEN_8);
@@ -216,11 +310,25 @@ int hwbp_set(struct driver_session *sess, const HWBP_POINT_CONFIG *points,
 
 		hw_breakpoint_init(&attr);
 		attr.bp_addr = points[i].addr;
+#if defined(CONFIG_ARM64)
+		/* arm64 执行断点只接受 LEN_4, 传 8 直接 -EINVAL */
+		if (hwtype == HW_BREAKPOINT_X)
+			hwlen = HW_BREAKPOINT_LEN_4;
+#endif
 		attr.bp_len = hwlen;
 		attr.bp_type = hwtype;
 
-		bp = wind_register_user_hw_breakpoint(&attr, hwbp_triggered, NULL,
-						     sess->task);
+		/* 全域断点: 目标进程的准心计算跑在工作线程上, 绑主线程的
+		 * 单任务断点基本不命中。命中侧按 tgid 过滤。 */
+		bp = wind_register_wide_hw_breakpoint(&attr, hwbp_triggered, NULL);
+		if (IS_ERR(bp) && PTR_ERR(bp) == -EOPNOTSUPP)
+		{
+			/* 内核解析不到 register_wide_hw_breakpoint 时退回单任务断点,
+			 * 只能命中被绑线程, 但至少不是完全装不上。 */
+			wide = false;
+			bp = wind_register_user_hw_breakpoint(&attr, hwbp_triggered, NULL,
+							     sess->task);
+		}
 		if (IS_ERR(bp))
 		{
 			ret = PTR_ERR(bp);
@@ -229,6 +337,7 @@ int hwbp_set(struct driver_session *sess, const HWBP_POINT_CONFIG *points,
 		}
 
 		hwbp_slots[i].bp = bp;
+		hwbp_slots[i].wide = wide;
 		hwbp_slots[i].addr = points[i].addr;
 		hwbp_slots[i].type = points[i].type;
 		hwbp_slots[i].length = points[i].length;
@@ -246,6 +355,10 @@ int hwbp_remove(void)
 	int i;
 	for (i = 0; i < BP_SLOT_MAX; i++)
 		hwbp_clear_slot(i);
+	memset(hwbp_regmod, 0, sizeof(hwbp_regmod));
+	memset(hwbp_last_regs, 0, sizeof(hwbp_last_regs));
+	memset(hwbp_last_regs_jiffies, 0, sizeof(hwbp_last_regs_jiffies));
+	hwbp_tgid = 0;
 	return 0;
 }
 

@@ -20,6 +20,7 @@ int brk_clear(pid_t pid, uintptr_t addr);
 
 /* ---- 硬件断点 (BRP/WRP debug 寄存器, 16 点 + 记录) ---- */
 int hwbp_set(struct driver_session *sess, const HWBP_POINT_CONFIG *points, size_t point_count);
+int hwbp_set_reg_modify(int point_index, u32 enable, u32 rx, u32 ry, u32 rz);
 int hwbp_remove(void);
 int hwbp_get_config(HWBP_CONFIG *config_out);
 int hwbp_get_records(uint32_t point_index, uint32_t start_index,

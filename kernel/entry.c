@@ -447,6 +447,15 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		return hwbp_clear_records(req.point_index);
 	}
+	case OP_HWBP_SET_REGS:
+	{
+		HWBP_REG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return hwbp_set_reg_modify(req.point_index, req.enable,
+					   req.rx, req.ry, req.rz);
+	}
 
 	/* ---- PTE 影子页执行断点 ---- */
 	case OP_PTEBP_SET:

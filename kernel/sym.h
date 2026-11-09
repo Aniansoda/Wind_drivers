@@ -88,6 +88,19 @@ struct perf_event *wind_register_user_hw_breakpoint(struct perf_event_attr *attr
 						    void *context, struct task_struct *tsk);
 void wind_unregister_hw_breakpoint(struct perf_event *bp);
 
+/* per-CPU 全域硬件断点: 绑进程主线程的 user 断点抓不到工作线程
+ * (system_server 的 sensor 投递在 binder 线程上跑), 这类场景必须用
+ * 全域断点 + 命中后按 tgid 过滤。返回 __percpu 指针数组, 失败返回 ERR_PTR。 */
+struct perf_event * __percpu *wind_register_wide_hw_breakpoint(struct perf_event_attr *attr,
+							      wind_perf_overflow_handler_t triggered,
+							      void *context);
+void wind_unregister_wide_hw_breakpoint(struct perf_event * __percpu *cpu_events);
+
+/* 把当前线程的 FP/SIMD 状态落盘到 task_struct (白名单外, 运行时解析)。
+ * 命中改写 v3/v4/v5 前必须先同步, 否则内存里是旧值, 回用户态重载会打乱
+ * 其余寄存器。解析不到返回 false, 调用方必须放弃改写。 */
+bool wind_fpsimd_preserve_current_state(void);
+
 /* nofault 拷贝 (白名单外, 运行时解析) */
 long wind_copy_from_user_nofault(void *dst, const void __user *src, size_t size);
 long wind_copy_to_user_nofault(void __user *dst, const void *src, size_t size);

@@ -48,12 +48,19 @@
 #define SENSOR_EVENT_TYPE_OFF   0x08   /* int32_t type */
 #define SENSOR_EVENT_DATA_OFF   0x18   /* float data[16]; gyro x/y/z = data[0..2] */
 #define SENSOR_TYPE_GYROSCOPE   4
+/* HAL: SENSOR_TYPE_GYROSCOPE_UNCALIBRATED = 16。UE/Unity 的陀螺仪插件
+ * 多半读未校准事件 (data[0..2] 是 x/y/z, data[3..5] 是 bias), 只认 4
+ * 会漏掉一半目标。两个 type 的 x/y/z 都在 data[0..2], 改写方式一致。 */
+#define SENSOR_TYPE_GYRO_UNCAL  16
 
 /* 单次 sendObjects 最多处理的事件数 (防御越界) */
 #define GYRO_MAX_EVENTS         1024
 
 /* ---- 全局状态 ---- */
-static struct perf_event *gyro_bp;      /* 硬件执行断点 */
+static struct perf_event * __percpu *gyro_bp; /* per-CPU 执行断点 (wide) */
+static bool gyro_bp_wide = true;              /* false = 退回单任务断点 */
+static struct perf_event *gyro_single_bp;     /* 退回路径的单任务断点 */
+static atomic64_t gyro_hits = ATOMIC64_INIT(0); /* 命中计数, 诊断用 */
 static pid_t gyro_pid;                  /* 目标进程 */
 static unsigned long gyro_addr;         /* sendObjects 运行时地址 */
 static bool gyro_active;
@@ -264,6 +271,12 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 	if (!READ_ONCE(gyro_active) || !READ_ONCE(gyro_enabled))
 		return;
 
+	/* wide 断点挂在 per-CPU 上: 同一个 VA 在别的进程里也可能被映射到同址,
+	 * 只处理目标 tgid, 否则会改到无关进程的 sensor 数据。 */
+	if (gyro_pid && current->tgid != gyro_pid)
+		return;
+	atomic64_inc(&gyro_hits);
+
 	mm = current->mm; /* 断点在目标进程上下文触发 */
 	if (!mm)
 		return;
@@ -289,7 +302,7 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 
 		if (!gyro_read_mem(mm, ev + SENSOR_EVENT_TYPE_OFF, &type, sizeof(type)))
 			continue;
-		if (type != SENSOR_TYPE_GYROSCOPE)
+		if (type != SENSOR_TYPE_GYROSCOPE && type != SENSOR_TYPE_GYRO_UNCAL)
 			continue;
 
 		/* 篡改 gyro x/y/z = data[0..2] (float 位模式, 不做 FP 运算) */
@@ -336,7 +349,9 @@ static int gyro_bind(struct task_struct *task)
 	base = gyro_find_module_base(task, GYRO_LIBSENSOR_NAME);
 	if (!base)
 	{
-		printk(KERN_ERR "gyro: failed to grab target inode\n");
+		printk(KERN_ERR "gyro: pid %d 没有加载 %s: hook 必须装在真正执行 "
+		       "BitTube::sendObjects 的进程 (system_server)\n",
+		       gyro_pid, GYRO_LIBSENSOR_NAME);
 		return -ENOENT;
 	}
 
@@ -344,17 +359,45 @@ static int gyro_bind(struct task_struct *task)
 
 	hw_breakpoint_init(&attr);
 	attr.bp_addr = gyro_addr;
-	attr.bp_len = HW_BREAKPOINT_LEN_8; /* arm64 执行断点 */
+	/* arm64 的 arch_build_bp_info 只接受 LEN_4 的执行断点, 写 LEN_8
+	 * 会直接 -EINVAL (旧版 gyro 就死在这一步, dmesg 里是 register failed -22)。 */
+#if defined(CONFIG_ARM64)
+	attr.bp_len = HW_BREAKPOINT_LEN_4;
+#else
+	attr.bp_len = HW_BREAKPOINT_LEN_1;
+#endif
 	attr.bp_type = HW_BREAKPOINT_X;
 
-	gyro_bp = wind_register_user_hw_breakpoint(&attr, gyro_breakpoint_handler, NULL, task);
+	/* 必须用 per-CPU 全域断点: sendObjects 由 system_server 的 binder 线程
+	 * 执行, 只绑一个 task 的断点永远不命中。命中侧按 tgid 过滤。 */
+	gyro_bp_wide = true;
+	gyro_bp = wind_register_wide_hw_breakpoint(&attr, gyro_breakpoint_handler, NULL);
+	if (IS_ERR(gyro_bp) && PTR_ERR(gyro_bp) == -EOPNOTSUPP)
+	{
+		/* 解析不到 register_wide_hw_breakpoint: 退回绑单个 task 的断点。
+		 * 这条路径只覆盖被绑线程, sensor 投递在 binder 线程上, 大概率零命中。 */
+		gyro_bp_wide = false;
+		gyro_bp = NULL;
+		gyro_single_bp = wind_register_user_hw_breakpoint(
+			&attr, gyro_breakpoint_handler, NULL, task);
+		if (IS_ERR(gyro_single_bp))
+		{
+			ret = PTR_ERR(gyro_single_bp);
+			gyro_single_bp = NULL;
+			printk(KERN_ERR "gyro: single-task bp register failed %d\n", ret);
+			return ret;
+		}
+		printk(KERN_WARNING "gyro: wide bp 不可用, 退回单任务断点 (可能零命中)\n");
+		return 0;
+	}
 	if (IS_ERR(gyro_bp))
 	{
 		ret = PTR_ERR(gyro_bp);
 		gyro_bp = NULL;
-		printk(KERN_ERR "gyro: uprobe register failed %d\n", ret);
+		printk(KERN_ERR "gyro: wide breakpoint register failed %d\n", ret);
 		return ret;
 	}
+	printk(KERN_INFO "gyro: wide bp armed addr=0x%lx tgid=%d\n", gyro_addr, gyro_pid);
 	return 0;
 }
 
@@ -368,6 +411,11 @@ int gyro_install(pid_t pid)
 
 	if (gyro_active)
 		return -EBUSY;
+	if (pid <= 0)
+	{
+		printk(KERN_ERR "gyro: 需要显式传入 system_server 的 pid (不是游戏 pid)\n");
+		return -EINVAL;
+	}
 
 	gyro_pid = pid;
 	task = gyro_get_task();
@@ -386,8 +434,10 @@ int gyro_install(pid_t pid)
 	}
 
 	gyro_active = true;
+	atomic64_set(&gyro_hits, 0);
 	WRITE_ONCE(gyro_enabled, true);
-	printk(KERN_INFO "gyro: registered successfully (pid=%d addr=0x%lx)\n", pid, gyro_addr);
+	printk(KERN_INFO "gyro: registered successfully (pid=%d addr=0x%lx wide=%d hits=%lld)\n",
+	       pid, gyro_addr, (int)gyro_bp_wide, (long long)atomic64_read(&gyro_hits));
 	return 0;
 }
 
@@ -395,9 +445,15 @@ void gyro_remove(void)
 {
 	if (gyro_bp)
 	{
-		wind_unregister_hw_breakpoint(gyro_bp);
+		wind_unregister_wide_hw_breakpoint(gyro_bp);
 		gyro_bp = NULL;
 	}
+	if (gyro_single_bp)
+	{
+		wind_unregister_hw_breakpoint(gyro_single_bp);
+		gyro_single_bp = NULL;
+	}
+	gyro_bp_wide = true;
 	gyro_active = false;
 	WRITE_ONCE(gyro_enabled, false);
 	gyro_pid = 0;
@@ -444,7 +500,7 @@ int gyro_resume(void)
 	if (!task)
 		return -ESRCH;
 
-	if (!gyro_bp)
+	if (!gyro_bp && !gyro_single_bp)
 	{
 		ret = gyro_bind(task);
 		if (ret)
