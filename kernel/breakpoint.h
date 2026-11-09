@@ -20,7 +20,9 @@ int brk_clear(pid_t pid, uintptr_t addr);
 
 /* ---- 硬件断点 (BRP/WRP debug 寄存器, 16 点 + 记录) ---- */
 int hwbp_set(struct driver_session *sess, const HWBP_POINT_CONFIG *points, size_t point_count);
-int hwbp_set_reg_modify(int point_index, u32 enable, u32 rx, u32 ry, u32 rz);
+int hwbp_set_reg_modify(int point_index, u32 enable, u32 rx, u32 ry, u32 rz,
+			u32 mask);
+int hwbp_refresh(void);
 int hwbp_remove(void);
 int hwbp_get_config(HWBP_CONFIG *config_out);
 int hwbp_get_records(uint32_t point_index, uint32_t start_index,
@@ -31,6 +33,9 @@ int hwbp_clear_records(int32_t point_index);
 
 /* ---- PTE 影子页执行断点 (16 点 + 记录, 不用 debug 寄存器) ---- */
 int ptebp_set(struct driver_session *sess, const PTEBP_POINT_CONFIG *points, size_t point_count);
+int ptebp_set_regs(int point_index, u32 enable, u32 rx, u32 ry, u32 rz,
+		   u32 mask);
+int ptebp_refresh(void);
 int ptebp_remove(void);
 int ptebp_get_config(PTEBP_CONFIG *config_out);
 int ptebp_get_records(uint32_t point_index, uint32_t start_index,
@@ -49,14 +54,20 @@ int brkbp_set_record(uint32_t point_index, uint32_t record_index,
 		     const BRKBP_RECORD *record);
 int brkbp_clear_records(int32_t point_index);
 
-/* ---- ETM/PTM 分支追踪断点 (Coresight, 全局执行流观测) ---- */int etmbp_set(const ETMBP_POINT_CONFIG *points, size_t point_count);
-int etmbp_remove(void);
-int etmbp_get_config(ETMBP_CONFIG *config_out);
-int etmbp_get_records(uint32_t point_index, uint32_t start_index,
-		      ETMBP_RECORD *records, uint32_t capacity, uint32_t *count_out);
-int etmbp_set_record(uint32_t point_index, uint32_t record_index,
-		     const ETMBP_RECORD *record);
-int etmbp_clear_records(int32_t point_index);
+/* ---- WRP 数据断点追踪 (观察点 + 命中写回, 最隐蔽的一族) ---- */
+int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
+	      size_t point_count);
+int wrpbp_set_vec(int32_t point_index, u32 enable, u32 x, u32 y, u32 z, u32 mask);
+int wrpbp_get_config(WRPBP_CONFIG *out);
+int wrpbp_get_records(uint32_t point_index, uint32_t start_index,
+		      HWBP_RECORD *records, uint32_t capacity, uint32_t *count_out);
+int wrpbp_clear_records(int32_t point_index);
+int wrpbp_remove(void);
+
+/* ---- 三族诊断快照 ---- */
+int bp_diag_get(WIND_BP_DIAG *out);
+
+/* ETM/Coresight 分支追踪已删除 (硬件只能观测, 无法改写寄存器) */
 
 /* ---- UDP 断点 (kprobe udp_send_skb / udp_queue_rcv_skb, 按 pid/端口/方向过滤) ---- */
 int udpbp_set(int32_t slot_index, const UDPBP_POINT_CONFIG *point, int32_t *slot_out);

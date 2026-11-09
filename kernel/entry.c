@@ -148,8 +148,6 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 	case OP_PTEBP_GET_RECORDS: case OP_PTEBP_SET_RECORD: case OP_PTEBP_CLEAR_RECORDS:
 	case OP_BRKBP_SET: case OP_BRKBP_REMOVE: case OP_BRKBP_GET_CONFIG:
 	case OP_BRKBP_GET_RECORDS: case OP_BRKBP_SET_RECORD: case OP_BRKBP_CLEAR_RECORDS:
-	case OP_ETMBP_SET: case OP_ETMBP_REMOVE: case OP_ETMBP_GET_CONFIG:
-	case OP_ETMBP_GET_RECORDS: case OP_ETMBP_SET_RECORD: case OP_ETMBP_CLEAR_RECORDS:
 		if (!g_sess || !g_sess->bound || !g_sess->task || !g_sess->task->mm)
 			return -ENOTCONN;
 		break;
@@ -454,7 +452,8 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
 			return -EFAULT;
 		return hwbp_set_reg_modify(req.point_index, req.enable,
-					   req.rx, req.ry, req.rz);
+					   req.rx, req.ry, req.rz,
+					   req.reserved);
 	}
 
 	/* ---- PTE 影子页执行断点 ---- */
@@ -483,8 +482,119 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		kfree(req);
 		return ret;
 	}
-	case OP_PTEBP_REMOVE:
-		return ptebp_remove();
+	case OP_PTEBP_SET_REGS:
+	{
+		HWBP_REG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return ptebp_set_regs(req.point_index, req.enable,
+				      req.rx, req.ry, req.rz,
+				      req.reserved);
+	}
+	case OP_PTEBP_REFRESH:
+		return ptebp_refresh();
+	case OP_HWBP_REFRESH:
+		return hwbp_refresh();
+
+	/* ---- WRP 数据断点: 最隐蔽的一族, 不动代码不动页表 ---- */
+	case OP_WRPBP_SET:
+	{
+		WRPBP_SET_REQUEST head;
+		PWRPBP_SET_REQUEST req;
+		size_t total;
+		int ret;
+
+		if (!g_sess)
+			return -ESRCH;
+		if (copy_from_user(&head, (void __user *)arg, sizeof(head)) != 0)
+			return -EFAULT;
+		if (head.point_count == 0 || head.point_count > 16)
+			return -EINVAL;
+		total = sizeof(WRPBP_SET_REQUEST) +
+			head.point_count * sizeof(WRPBP_POINT_CONFIG);
+		req = kmalloc(total, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		if (copy_from_user(req, (void __user *)arg, total) != 0) {
+			kfree(req);
+			return -EFAULT;
+		}
+		ret = wrpbp_set(g_sess, req->points, head.point_count);
+		kfree(req);
+		return ret;
+	}
+	case OP_WRPBP_SET_VEC:
+	{
+		HWBP_REG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return wrpbp_set_vec(req.point_index, req.enable, req.rx, req.ry,
+				     req.rz, req.reserved);
+	}
+	case OP_WRPBP_REMOVE:
+		return wrpbp_remove();
+	case OP_WRPBP_GET_CONFIG:
+	{
+		WRPBP_CONFIG cfg;
+		int ret = wrpbp_get_config(&cfg);
+
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_WRPBP_GET_RECORDS:
+	{
+		HWBP_RECORDS_REQUEST req;
+		HWBP_RECORD *kbuf;
+		uint32_t count = 0;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		if (req.capacity == 0 || req.capacity > 256)
+			return -EINVAL;
+		kbuf = kmalloc(req.capacity * sizeof(HWBP_RECORD), GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		ret = wrpbp_get_records(req.point_index, req.start_index, kbuf,
+					req.capacity, &count);
+		if (ret == 0 && count &&
+		    copy_to_user((void __user *)req.records, kbuf,
+				 count * sizeof(HWBP_RECORD)) != 0)
+			ret = -EFAULT;
+		kfree(kbuf);
+		if (ret)
+			return ret;
+		if (req.count_out &&
+		    copy_to_user((void __user *)req.count_out, &count, sizeof(count)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_WRPBP_CLEAR_RECORDS:
+	{
+		HWBP_CLEAR_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return wrpbp_clear_records(req.point_index);
+	}
+
+	/* ---- 三族诊断 ---- */
+	case OP_BP_DIAG:
+	{
+		WIND_BP_DIAG diag;
+
+		if (bp_diag_get(&diag) != 0)
+			return -EINVAL;
+		if (copy_to_user((void __user *)arg, &diag, sizeof(diag)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+
 	case OP_PTEBP_GET_CONFIG:
 	{
 		PTEBP_CONFIG cfg;
@@ -619,46 +729,41 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return brkbp_clear_records(req.point_index);
 	}
 
-	/* ---- ETM/PTM 分支追踪 ---- */
-	case OP_ETMBP_SET:
+
+	/* ---- UDP 断点 (kprobe 内核 UDP 收发路径) ---- */
+	case OP_UDPBP_SET:
 	{
-		ETMBP_SET_REQUEST head;
-		PETMBP_SET_REQUEST req;
-		size_t total;
+		UDPBP_SET_REQUEST req;
+		int32_t slot = -1;
 		int ret;
 
-		if (copy_from_user(&head, (void __user *)arg, sizeof(head)) != 0)
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
 			return -EFAULT;
-		if (head.point_count == 0 || head.point_count > 16)
-			return -EINVAL;
-		total = sizeof(ETMBP_SET_REQUEST) + head.point_count * sizeof(ETMBP_POINT_CONFIG);
-		req = kmalloc(total, GFP_KERNEL);
-		if (!req)
-			return -ENOMEM;
-		if (copy_from_user(req, (void __user *)arg, total) != 0) {
-			kfree(req);
+		ret = udpbp_set(req.slot_index, &req.point, &slot);
+		if (ret)
+			return ret;
+		if (req.slot_out &&
+		    copy_to_user((void __user *)req.slot_out, &slot, sizeof(slot)) != 0)
 			return -EFAULT;
-		}
-		ret = etmbp_set(req->points, head.point_count);
-		kfree(req);
-		return ret;
+		return 0;
 	}
-	case OP_ETMBP_REMOVE:
-		return etmbp_remove();
-	case OP_ETMBP_GET_CONFIG:
+	case OP_UDPBP_REMOVE:
+		return udpbp_remove((int32_t)arg);
+	case OP_UDPBP_GET_CONFIG:
 	{
-		ETMBP_CONFIG cfg;
-		int ret = etmbp_get_config(&cfg);
+		UDPBP_CONFIG cfg;
+		int ret = udpbp_get_config(&cfg);
+
 		if (ret)
 			return ret;
 		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
 			return -EFAULT;
 		return 0;
 	}
-	case OP_ETMBP_GET_RECORDS:
+	case OP_UDPBP_GET_RECORDS:
 	{
-		ETMBP_RECORDS_REQUEST req;
-		ETMBP_RECORD *kbuf;
+		UDPBP_RECORDS_REQUEST req;
+		UDPBP_RECORD *kbuf;
 		uint32_t count = 0;
 		int ret;
 
@@ -666,14 +771,14 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		if (req.capacity == 0 || req.capacity > 4096)
 			return -EINVAL;
-		kbuf = kmalloc(req.capacity * sizeof(ETMBP_RECORD), GFP_KERNEL);
+		kbuf = kmalloc(req.capacity * sizeof(UDPBP_RECORD), GFP_KERNEL);
 		if (!kbuf)
 			return -ENOMEM;
-		ret = etmbp_get_records(req.point_index, req.start_index, kbuf,
+		ret = udpbp_get_records(req.slot_index, req.start_index, kbuf,
 					req.capacity, &count);
 		if (ret == 0 && count)
 			if (copy_to_user((void __user *)req.records, kbuf,
-					 count * sizeof(ETMBP_RECORD)) != 0)
+					 count * sizeof(UDPBP_RECORD)) != 0)
 				ret = -EFAULT;
 		kfree(kbuf);
 		if (ret)
@@ -683,20 +788,379 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		return 0;
 	}
-	case OP_ETMBP_SET_RECORD:
+	case OP_UDPBP_CLEAR_RECORDS:
 	{
-		ETMBP_RECORD_REQUEST req;
+		UDPBP_CLEAR_REQUEST req;
+
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
 			return -EFAULT;
-		return etmbp_set_record(req.point_index, req.record_index, &req.record);
+		return udpbp_clear_records(req.slot_index);
 	}
-	case OP_ETMBP_CLEAR_RECORDS:
+
+	/* ---- 硬件断点 (BRP/WRP) ---- */
+	case OP_HWBP_SET:
 	{
-		ETMBP_CLEAR_REQUEST req;
+		HWBP_SET_REQUEST head;
+		PHWBP_SET_REQUEST req;
+		size_t total;
+		int ret;
+
+		if (!g_sess)
+			return -ESRCH;
+		if (copy_from_user(&head, (void __user *)arg, sizeof(head)) != 0)
+			return -EFAULT;
+		if (head.point_count == 0 || head.point_count > 16)
+			return -EINVAL;
+		total = sizeof(HWBP_SET_REQUEST) + head.point_count * sizeof(HWBP_POINT_CONFIG);
+		req = kmalloc(total, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		if (copy_from_user(req, (void __user *)arg, total) != 0) {
+			kfree(req);
+			return -EFAULT;
+		}
+		ret = hwbp_set(g_sess, req->points, head.point_count);
+		kfree(req);
+		return ret;
+	}
+	case OP_HWBP_REMOVE:
+		return hwbp_remove();
+	case OP_HWBP_GET_CONFIG:
+	{
+		HWBP_CONFIG cfg;
+		int ret = hwbp_get_config(&cfg);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_HWBP_GET_RECORDS:
+	{
+		HWBP_RECORDS_REQUEST req;
+		HWBP_RECORD *kbuf;
+		uint32_t count = 0;
+		int ret;
+
 		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
 			return -EFAULT;
-		return etmbp_clear_records(req.point_index);
+		if (req.capacity == 0 || req.capacity > 4096)
+			return -EINVAL;
+		kbuf = kmalloc(req.capacity * sizeof(HWBP_RECORD), GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		ret = hwbp_get_records(req.point_index, req.start_index, kbuf,
+				       req.capacity, &count);
+		if (ret == 0 && count)
+			if (copy_to_user((void __user *)req.records, kbuf,
+					 count * sizeof(HWBP_RECORD)) != 0)
+				ret = -EFAULT;
+		kfree(kbuf);
+		if (ret)
+			return ret;
+		if (req.count_out && copy_to_user((void __user *)req.count_out,
+						  &count, sizeof(count)) != 0)
+			return -EFAULT;
+		return 0;
 	}
+	case OP_HWBP_SET_RECORD:
+	{
+		HWBP_RECORD_REQUEST req;
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return hwbp_set_record(req.point_index, req.record_index, &req.record);
+	}
+	case OP_HWBP_CLEAR_RECORDS:
+	{
+		HWBP_CLEAR_REQUEST req;
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return hwbp_clear_records(req.point_index);
+	}
+	case OP_HWBP_SET_REGS:
+	{
+		HWBP_REG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return hwbp_set_reg_modify(req.point_index, req.enable,
+					   req.rx, req.ry, req.rz,
+					   req.reserved);
+	}
+
+	/* ---- PTE 影子页执行断点 ---- */
+	case OP_PTEBP_SET:
+	{
+		PTEBP_SET_REQUEST head;
+		PPTEBP_SET_REQUEST req;
+		size_t total;
+		int ret;
+
+		if (!g_sess)
+			return -ESRCH;
+		if (copy_from_user(&head, (void __user *)arg, sizeof(head)) != 0)
+			return -EFAULT;
+		if (head.point_count == 0 || head.point_count > 16)
+			return -EINVAL;
+		total = sizeof(PTEBP_SET_REQUEST) + head.point_count * sizeof(PTEBP_POINT_CONFIG);
+		req = kmalloc(total, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		if (copy_from_user(req, (void __user *)arg, total) != 0) {
+			kfree(req);
+			return -EFAULT;
+		}
+		ret = ptebp_set(g_sess, req->points, head.point_count);
+		kfree(req);
+		return ret;
+	}
+	case OP_PTEBP_SET_REGS:
+	{
+		HWBP_REG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return ptebp_set_regs(req.point_index, req.enable,
+				      req.rx, req.ry, req.rz,
+				      req.reserved);
+	}
+	case OP_PTEBP_REFRESH:
+		return ptebp_refresh();
+	case OP_HWBP_REFRESH:
+		return hwbp_refresh();
+
+	/* ---- WRP 数据断点: 最隐蔽的一族, 不动代码不动页表 ---- */
+	case OP_WRPBP_SET:
+	{
+		WRPBP_SET_REQUEST head;
+		PWRPBP_SET_REQUEST req;
+		size_t total;
+		int ret;
+
+		if (!g_sess)
+			return -ESRCH;
+		if (copy_from_user(&head, (void __user *)arg, sizeof(head)) != 0)
+			return -EFAULT;
+		if (head.point_count == 0 || head.point_count > 16)
+			return -EINVAL;
+		total = sizeof(WRPBP_SET_REQUEST) +
+			head.point_count * sizeof(WRPBP_POINT_CONFIG);
+		req = kmalloc(total, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		if (copy_from_user(req, (void __user *)arg, total) != 0) {
+			kfree(req);
+			return -EFAULT;
+		}
+		ret = wrpbp_set(g_sess, req->points, head.point_count);
+		kfree(req);
+		return ret;
+	}
+	case OP_WRPBP_SET_VEC:
+	{
+		HWBP_REG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return wrpbp_set_vec(req.point_index, req.enable, req.rx, req.ry,
+				     req.rz, req.reserved);
+	}
+	case OP_WRPBP_REMOVE:
+		return wrpbp_remove();
+	case OP_WRPBP_GET_CONFIG:
+	{
+		WRPBP_CONFIG cfg;
+		int ret = wrpbp_get_config(&cfg);
+
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_WRPBP_GET_RECORDS:
+	{
+		HWBP_RECORDS_REQUEST req;
+		HWBP_RECORD *kbuf;
+		uint32_t count = 0;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		if (req.capacity == 0 || req.capacity > 256)
+			return -EINVAL;
+		kbuf = kmalloc(req.capacity * sizeof(HWBP_RECORD), GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		ret = wrpbp_get_records(req.point_index, req.start_index, kbuf,
+					req.capacity, &count);
+		if (ret == 0 && count &&
+		    copy_to_user((void __user *)req.records, kbuf,
+				 count * sizeof(HWBP_RECORD)) != 0)
+			ret = -EFAULT;
+		kfree(kbuf);
+		if (ret)
+			return ret;
+		if (req.count_out &&
+		    copy_to_user((void __user *)req.count_out, &count, sizeof(count)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_WRPBP_CLEAR_RECORDS:
+	{
+		HWBP_CLEAR_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return wrpbp_clear_records(req.point_index);
+	}
+
+	/* ---- 三族诊断 ---- */
+	case OP_BP_DIAG:
+	{
+		WIND_BP_DIAG diag;
+
+		if (bp_diag_get(&diag) != 0)
+			return -EINVAL;
+		if (copy_to_user((void __user *)arg, &diag, sizeof(diag)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+
+	case OP_PTEBP_GET_CONFIG:
+	{
+		PTEBP_CONFIG cfg;
+		int ret = ptebp_get_config(&cfg);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_PTEBP_GET_RECORDS:
+	{
+		PTEBP_RECORDS_REQUEST req;
+		PTEBP_RECORD *kbuf;
+		uint32_t count = 0;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		if (req.capacity == 0 || req.capacity > 4096)
+			return -EINVAL;
+		kbuf = kmalloc(req.capacity * sizeof(PTEBP_RECORD), GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		ret = ptebp_get_records(req.point_index, req.start_index, kbuf,
+					req.capacity, &count);
+		if (ret == 0 && count)
+			if (copy_to_user((void __user *)req.records, kbuf,
+					 count * sizeof(PTEBP_RECORD)) != 0)
+				ret = -EFAULT;
+		kfree(kbuf);
+		if (ret)
+			return ret;
+		if (req.count_out && copy_to_user((void __user *)req.count_out,
+						  &count, sizeof(count)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_PTEBP_SET_RECORD:
+	{
+		PTEBP_RECORD_REQUEST req;
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return ptebp_set_record(req.point_index, req.record_index, &req.record);
+	}
+	case OP_PTEBP_CLEAR_RECORDS:
+	{
+		PTEBP_CLEAR_REQUEST req;
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return ptebp_clear_records(req.point_index);
+	}
+
+	/* ---- BRK 软断点 ---- */
+	case OP_BRKBP_SET:
+	{
+		BRKBP_SET_REQUEST head;
+		PBRKBP_SET_REQUEST req;
+		size_t total;
+		int ret;
+
+		if (!g_sess)
+			return -ESRCH;
+		if (copy_from_user(&head, (void __user *)arg, sizeof(head)) != 0)
+			return -EFAULT;
+		if (head.point_count == 0 || head.point_count > 16)
+			return -EINVAL;
+		total = sizeof(BRKBP_SET_REQUEST) + head.point_count * sizeof(BRKBP_POINT_CONFIG);
+		req = kmalloc(total, GFP_KERNEL);
+		if (!req)
+			return -ENOMEM;
+		if (copy_from_user(req, (void __user *)arg, total) != 0) {
+			kfree(req);
+			return -EFAULT;
+		}
+		ret = brkbp_set(g_sess, req->points, head.point_count);
+		kfree(req);
+		return ret;
+	}
+	case OP_BRKBP_REMOVE:
+		return brkbp_remove();
+	case OP_BRKBP_GET_CONFIG:
+	{
+		BRKBP_CONFIG cfg;
+		int ret = brkbp_get_config(&cfg);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_BRKBP_GET_RECORDS:
+	{
+		BRKBP_RECORDS_REQUEST req;
+		BRKBP_RECORD *kbuf;
+		uint32_t count = 0;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		if (req.capacity == 0 || req.capacity > 4096)
+			return -EINVAL;
+		kbuf = kmalloc(req.capacity * sizeof(BRKBP_RECORD), GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		ret = brkbp_get_records(req.point_index, req.start_index, kbuf,
+					req.capacity, &count);
+		if (ret == 0 && count)
+			if (copy_to_user((void __user *)req.records, kbuf,
+					 count * sizeof(BRKBP_RECORD)) != 0)
+				ret = -EFAULT;
+		kfree(kbuf);
+		if (ret)
+			return ret;
+		if (req.count_out && copy_to_user((void __user *)req.count_out,
+						  &count, sizeof(count)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_BRKBP_SET_RECORD:
+	{
+		BRKBP_RECORD_REQUEST req;
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return brkbp_set_record(req.point_index, req.record_index, &req.record);
+	}
+	case OP_BRKBP_CLEAR_RECORDS:
+	{
+		BRKBP_CLEAR_REQUEST req;
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return brkbp_clear_records(req.point_index);
+	}
+
 	default:
 		return -ENOTTY;
 	}

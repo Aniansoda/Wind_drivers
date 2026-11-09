@@ -6,6 +6,7 @@
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/gfp.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
@@ -21,6 +22,10 @@
 #include <linux/jiffies.h>
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
+#include <linux/err.h>
+#include <linux/kthread.h>
+#include <linux/completion.h>
+#include <linux/workqueue.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -29,11 +34,6 @@
 #include <asm/memory.h>
 #include <asm/cacheflush.h>
 #include <asm/sysreg.h>
-
-struct wind_phys_map {
-	struct vm_struct *area;
-	void *addr;
-};
 
 static struct wind_phys_map wind_map_phys(phys_addr_t pa, size_t size)
 {
@@ -652,12 +652,339 @@ int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, p
 	return 0;
 }
 
+/* ---- 代码页改写 / 远端可执行页映射 ---- */
+
+/* I/D cache 一致: 逐 64B 行 clean+invalidate, 用内核 VA (线性映射) */
+static void wind_flush_code_range(void *kaddr, size_t len)
+{
+	unsigned long a = (unsigned long)kaddr & ~63UL;
+	unsigned long end = ((unsigned long)kaddr + len + 63UL) & ~63UL;
+	unsigned long p;
+
+	for (p = a; p < end; p += 64)
+		asm volatile("dc cvau, %0" : : "r"(p) : "memory");
+	asm volatile("dsb ish" : : : "memory");
+	for (p = a; p < end; p += 64)
+		asm volatile("ic ivau, %0" : : "r"(p) : "memory");
+	asm volatile("dsb ish\n\tisb" : : : "memory");
+}
+
+/* 改写目标进程代码页字节。
+ * 代码页是 file-backed 只读映射, 直接写物理页会污染 page cache (所有加载
+ * 同一 .so 的进程一起变), 所以先走 GUP(FOLL_WRITE) 让内核按 MAP_PRIVATE
+ * 语义做出私有副本, 再在内核里改这份副本并刷 I/D cache。
+ * 只能在进程上下文 (ioctl / 工作队列) 调用。 */
+int wind_patch_process_code(struct mm_struct *mm, unsigned long va,
+			    const void *buf, size_t len)
+{
+	struct page *page = NULL;
+	unsigned long off = va & (PAGE_SIZE - 1);
+	void *k;
+	long got;
+
+	if (!mm || !buf || !len || off + len > PAGE_SIZE)
+		return -EINVAL;
+
+	got = kh_get_user_pages_remote(mm, va & PAGE_MASK, 1, FOLL_WRITE, &page);
+	if (got != 1 || !page)
+		return got < 0 ? (int)got : -EFAULT;
+
+	k = kmap_local_page(page);
+	memcpy((u8 *)k + off, buf, len);
+	wind_flush_code_range((u8 *)k + off, len);
+	kunmap_local(k);
+
+	set_page_dirty_lock(page);
+	put_page(page);
+	return 0;
+}
+
+struct wind_remote_map_req {
+	struct work_struct work;
+	struct completion done;
+	struct mm_struct *mm;
+	unsigned long hint;
+	unsigned long len;
+	unsigned long addr;   /* unmap 时是入参, map 时是出参 */
+	int unmap;
+	int ret;
+};
+
+/* 在目标 mm 里 mmap/munmap 需要目标 mm 成为 current->mm, 只有内核线程能
+ * 这么干, 所以丢给工作队列 (worker 是 kthread), 调用方等完成。 */
+static void wind_remote_map_work(struct work_struct *work)
+{
+	struct wind_remote_map_req *r = container_of(work, struct wind_remote_map_req, work);
+
+	if (!r->mm) {
+		r->ret = -EINVAL;
+		complete(&r->done);
+		return;
+	}
+
+	kthread_use_mm(r->mm);
+	if (r->unmap) {
+		r->ret = vm_munmap(r->addr, r->len);
+	} else {
+		unsigned long a = vm_mmap(NULL, r->hint, r->len,
+					  PROT_READ | PROT_WRITE | PROT_EXEC,
+					  MAP_PRIVATE | MAP_ANONYMOUS |
+					  MAP_FIXED_NOREPLACE, 0);
+		if (IS_ERR_VALUE(a)) {
+			r->addr = 0;
+			r->ret = (int)a;
+		} else {
+			r->addr = a;
+			r->ret = 0;
+		}
+	}
+	kthread_unuse_mm(r->mm);
+	complete(&r->done);
+}
+
+/* 调用方负责持住 mm 引用 (mmget_not_zero), 这里不再动引用计数 */
+static int wind_remote_map(struct mm_struct *mm, unsigned long hint,
+			   unsigned long len, int unmap, unsigned long *addr)
+{
+	struct wind_remote_map_req r;
+
+	memset(&r, 0, sizeof(r));
+	INIT_WORK(&r.work, wind_remote_map_work);
+	init_completion(&r.done);
+	r.mm = mm;
+	r.hint = hint & PAGE_MASK;
+	r.len = PAGE_ALIGN(len);
+	r.unmap = unmap;
+	r.addr = addr ? (*addr & PAGE_MASK) : 0;
+
+	schedule_work(&r.work);
+	wait_for_completion(&r.done);
+
+	if (r.ret)
+		return r.ret;
+	if (addr && !unmap)
+		*addr = r.addr;
+	return 0;
+}
+
+/* 在目标 mm 里拿一页 RWX 当跳板, 地址尽量贴着 hint (b imm26 只能 ±128MB) */
+unsigned long wind_map_exec_page_in(struct mm_struct *mm, unsigned long hint)
+{
+	unsigned long cand, got = 0;
+	int i;
+
+	if (!mm || !mmget_not_zero(mm))
+		return 0;
+
+	/* 先试 hint 附近 2MB 对齐的落点, 都被占了再让内核随便选 */
+	for (i = 0; i < 8; i++) {
+		cand = (hint & ~((1UL << 21) - 1)) + ((unsigned long)(i + 1) << 21);
+		if (wind_remote_map(mm, cand, PAGE_SIZE, 0, &got) == 0 && got)
+			goto out;
+	}
+	if (wind_remote_map(mm, 0, PAGE_SIZE, 0, &got) != 0)
+		got = 0;
+	if (got) {
+		/* 落点必须能被 b imm26 够到 (±128MB) */
+		unsigned long d = got > hint ? got - hint : hint - got;
+		if (d >= (1UL << 27)) {
+			unsigned long tmp = got;
+			wind_remote_map(mm, tmp, PAGE_SIZE, 1, &tmp);
+			got = 0;
+		}
+	}
+out:
+	wind_mmput(mm);
+	return got;
+}
+
+int wind_unmap_in(struct mm_struct *mm, unsigned long addr, unsigned long len)
+{
+	int ret;
+
+	if (!mm || !addr)
+		return -EINVAL;
+	if (!mmget_not_zero(mm))
+		return -ESRCH;
+	ret = wind_remote_map(mm, addr, len, 1, &addr);
+	wind_mmput(mm);
+	return ret;
+}
+
+/* ---- 页表项钉住 (原子上下文安全) ---- */
+int wind_pte_pin(struct mm_struct *mm, unsigned long va, struct wind_pte_pin *pin)
+{
+	pte_t *pte;
+
+	if (!mm || !pin)
+		return -EINVAL;
+
+	memset(pin, 0, sizeof(*pin));
+	pte = wind_mm_pte_locate(mm, va, &pin->map);
+	if (!pte)
+		return -EFAULT;
+
+	pin->pte = (pteval_t *)pte;
+	pin->valid = true;
+	return 0;
+}
+
+void wind_pte_unpin(struct wind_pte_pin *pin)
+{
+	if (!pin || !pin->valid)
+		return;
+
+	wind_unmap_phys(&pin->map);
+	pin->pte = NULL;
+	pin->valid = false;
+}
+
+pteval_t wind_pte_pin_get(struct wind_pte_pin *pin)
+{
+	if (!pin || !pin->valid)
+		return 0;
+	return READ_ONCE(*pin->pte);
+}
+
+void wind_pte_pin_write(struct wind_pte_pin *pin, unsigned long va,
+			pteval_t mask, pteval_t val)
+{
+	pteval_t old, new;
+
+	if (!pin || !pin->valid)
+		return;
+
+	old = READ_ONCE(*pin->pte);
+	new = (old & ~mask) | (val & mask);
+	WRITE_ONCE(*pin->pte, new);
+
+	asm volatile("dsb ishst\n"
+		     "\ttlbi vaae1is, %0\n"
+		     "\ttlbi vale1is, %0\n"
+		     "\tdsb ish\n"
+		     "\tisb\n"
+		     : : "r" (va & PAGE_MASK) : "memory");
+}
+
+/* 供 breakpoint.c 在影子页 / 跳板页里改完字节后刷 I/D cache */
+void wind_flush_code(void *kaddr, size_t len)
+{
+	wind_flush_code_range(kaddr, len);
+}
+
+/* ---- 影子页: 把一份私有副本映射到目标 VA, 原页与文件都不动 ----
+ *
+ * 思路就是 HookPTE 那套: 不去改 .so 的代码页 (page cache 里那份), 而是
+ *   原页 pin 住  ->  alloc_page 复制一份  ->  改副本  ->  把目标 VA 的 PTE
+ *   输出地址换成副本  ->  卸载时把 PTE 换回原页
+ * 目标进程取指、CRC 比对文件时看到的都还是原始内容, 补丁只在私有副本里。
+ */
+int wind_shadow_attach(struct mm_struct *mm, unsigned long va, struct wind_shadow *sh)
+{
+	struct page *sp;
+	pteval_t old, new;
+	void *src;
+	long got;
+
+	if (!mm || !sh)
+		return -EINVAL;
+	memset(sh, 0, sizeof(*sh));
+
+	if (wind_pte_pin(mm, va, &sh->pin) != 0)
+		return -EFAULT;
+
+	old = wind_pte_pin_get(&sh->pin);
+
+	/* 连续 PTE (CONTPTE): 单改 4K 项会破坏整块的 contiguous 语义, 拆块
+	 * 要相邻 16 项一起失效, 这里不做 —— 如实拒绝, 上层退回 COW 写路径 */
+	if (old & PTE_CONT) {
+		wind_pte_unpin(&sh->pin);
+		return -EOPNOTSUPP;
+	}
+
+	got = kh_get_user_pages_remote(mm, va & PAGE_MASK, 1, 0, &sh->orig);
+	if (got != 1 || !sh->orig) {
+		wind_pte_unpin(&sh->pin);
+		return got < 0 ? (int)got : -EFAULT;
+	}
+
+	sp = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!sp) {
+		put_page(sh->orig);
+		wind_pte_unpin(&sh->pin);
+		return -ENOMEM;
+	}
+
+	src = kmap_local_page(sh->orig);
+	memcpy(page_address(sp), src, PAGE_SIZE);
+	kunmap_local(src);
+	flush_dcache_page(sp);
+
+	/* 只换输出地址: UXN/AP/AF 等属性位全部沿用原 PTE, 执行权限不变 */
+	new = (old & ~PTE_ADDR_MASK) | (pteval_t)page_to_phys(sp);
+	new |= PTE_AF;
+	wind_pte_pin_write(&sh->pin, va, ~(pteval_t)0, new);
+
+	sh->page = sp;
+	sh->saved = old;
+	sh->kva = page_address(sp);
+	sh->remapped = true;
+	/* UXN=0 才是 EL0 可执行页: 跳板要跳到这页里, 数据页跳进去直接
+	 * instruction abort, 所以候选页必须过这一关 */
+	sh->exec_ok = !(old & PTE_UXN);
+	return 0;
+}
+
+int wind_shadow_detach(struct mm_struct *mm, unsigned long va, struct wind_shadow *sh)
+{
+	if (!sh || !sh->remapped)
+		return -EINVAL;
+
+	/* 先把 PTE 换回原页 (整页内容随之回到原始状态), 再释放副本 */
+	wind_pte_pin_write(&sh->pin, va, ~(pteval_t)0, sh->saved);
+	wind_pte_unpin(&sh->pin);
+
+	if (sh->orig)
+		put_page(sh->orig);
+	if (sh->page)
+		__free_pages(sh->page, 0);
+
+	memset(sh, 0, sizeof(*sh));
+	return 0;
+}
+
+/* 断点/陀螺仪/kprobe 回调里调用本函数时, 上下文是「关中断 + 可能持有
+ * 页表锁」, 此时 wind_map_phys 的 get_vm_area/vmap 会睡眠:
+ *   BUG: sleeping function called from invalid context
+ * 或者在 vmap_lock 上死等, 整机卡死。arm64 GKI 拿不到 memstart_addr,
+ * phys_to_virt 也不可用, 唯一原子安全的路子是 nofault uaccess —— 回调
+ * 一定跑在目标进程上下文, 所以直接对目标 VA 做 copy_{from,to}_user_nofault。 */
+static bool wind_va_nofault_xfer(uintptr_t va, void *buf, size_t size, bool write)
+{
+	/* 走 sym.c 里 kallsyms 解析出来的 copy_*_user_nofault: 内部自带
+	 * pagefault_disable, 缺页返回 -EFAULT 而不是睡眠; 解析不到就明确失败 */
+	if (write)
+		return wind_copy_to_user_nofault((void __user *)va, buf, size) == 0;
+	return wind_copy_from_user_nofault(buf, (const void __user *)va, size) == 0;
+}
+
 static bool wind_process_va_xfer(struct mm_struct *mm, uintptr_t va,
 				 void *buf, size_t size, bool write)
 {
 	uintptr_t cur = va;
 	char *b = buf;
 	size_t left = size;
+
+	if (!mm || !buf)
+		return false;
+
+	/* 回调上下文: 不能 vmap, 只能 nofault 直取 (mm 必须是 current->mm,
+	 * 回调天然满足; 不满足就明确失败, 绝不在原子上下文里睡) */
+	if (in_atomic() || irqs_disabled()) {
+		if (mm != current->mm)
+			return false;
+		return wind_va_nofault_xfer(cur, b, left, write);
+	}
 
 	while (left)
 	{
@@ -809,9 +1136,16 @@ static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 	return s->addr;
 }
 
+/* 锁内只做「取映射 + memcpy 到内核缓冲」, copy_to_user 一律放到锁外。
+ * 旧实现在 g_map_mutex 里直接 copy_to_user: 用户页缺页、进程被冻结、
+ * 线程被 SIGSTOP 时, 整个驱动的读路径(含别的线程)全部卡在这把全局锁上,
+ * 表现就是「开几枪之后读一次不动一次」。同时改成 trylock: 争用就退回
+ * 一次性映射, 不排队等锁, 读路径上没有无界等待。
+ * 32 字节以内走栈上缓冲, 更大的块直接退回一次性映射, 不占内核栈。 */
 static bool wind_read_cached_page(phys_addr_t pa_page, size_t off,
 				  void __user *buffer, size_t size, bool safe)
 {
+	u8 tmp[32];
 	void *kva;
 	bool ok = false;
 
@@ -820,16 +1154,24 @@ static bool wind_read_cached_page(phys_addr_t pa_page, size_t off,
 	 * "BUG: sleeping function called from invalid context" → panic。 */
 	if (!map_cache || in_atomic() || irqs_disabled())
 		return false;
+	if (off + size > PAGE_SIZE || size > sizeof(tmp))
+		return false;
 
-	mutex_lock(&g_map_mutex);
+	if (!mutex_trylock(&g_map_mutex))
+		return false;
+
 	kva = wind_slot_lookup_locked(pa_page);
 	if (kva) {
 		if (safe)
 			kh_dcache_clean_inval_poc((char *)kva + off, size);
-		ok = copy_to_user(buffer, (char *)kva + off, size) == 0;
+		memcpy(tmp, (char *)kva + off, size);
+		ok = true;
 	}
 	mutex_unlock(&g_map_mutex);
-	return ok;
+
+	if (!ok)
+		return false;
+	return copy_to_user(buffer, tmp, size) == 0;
 }
 
 static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t size)

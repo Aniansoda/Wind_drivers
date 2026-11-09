@@ -4,6 +4,8 @@
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/mm_types.h>
+#include <linux/vmalloc.h>
+#include <linux/pgtable.h>
 #include <linux/spinlock.h>
 #include "comm.h"
 
@@ -12,6 +14,12 @@
  * 缓存 task 引用避免每次 find_get_pid + get_pid_task;
  * mm 每次 get_task_mm (轻量, 且规避 mm 生命周期与 exec 换 mm 的野指针问题)。
  */
+/* vmap/ioremap 出来的物理页映射, 定义放这里因为 wind_pte_pin 内嵌它 */
+struct wind_phys_map {
+	struct vm_struct *area;
+	void *addr;
+};
+
 struct driver_session
 {
 	struct task_struct *task; /* get_task_struct 持有引用 */
@@ -57,9 +65,47 @@ int wind_kernel_page_ro_state(unsigned long va, bool *is_ro);
 int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, pteval_t val);
 pteval_t wind_shadow_pte_get(struct mm_struct *mm, unsigned long va, int *err);
 
+/* 页表项钉住: 装断点时把 PTE 所在页 vmap 一次并留着, 之后断层上下文里
+ * 只做一次 WRITE_ONCE + TLBI, 不再 get_vm_area/ioremap (会睡眠)。
+ * mm 必须活到 unpin; 页表页在 mm 存活期间不会被释放。 */
+struct wind_pte_pin {
+	struct wind_phys_map map;   /* 必须放在第一个, 便于整体清零 */
+	pteval_t *pte;
+	bool valid;
+};
+int wind_pte_pin(struct mm_struct *mm, unsigned long va, struct wind_pte_pin *pin);
+void wind_pte_unpin(struct wind_pte_pin *pin);
+pteval_t wind_pte_pin_get(struct wind_pte_pin *pin);
+void wind_pte_pin_write(struct wind_pte_pin *pin, unsigned long va,
+			pteval_t mask, pteval_t val);
+
 /* ---- 内核态跨进程读写 (非 __user, 供 BRK 断点改指令用) ---- */
 bool wind_read_process_va(struct mm_struct *mm, uintptr_t va, void *buf, size_t size);
 bool wind_write_process_va(struct mm_struct *mm, uintptr_t va, const void *buf, size_t size);
+
+/* 代码页改写: GUP(FOLL_WRITE) 做出私有副本后改字节 + 刷 I/D cache。
+ * 内联 hook 的唯一写入口, 进程上下文调用。 */
+int wind_patch_process_code(struct mm_struct *mm, unsigned long va,
+			    const void *buf, size_t len);
+/* 在目标 mm 里拿/还一页 RWX 跳板 (工作队列里 kthread_use_mm + vm_mmap) */
+unsigned long wind_map_exec_page_in(struct mm_struct *mm, unsigned long hint);
+int wind_unmap_in(struct mm_struct *mm, unsigned long addr, unsigned long len);
+
+/* 改完字节后刷 I/D cache (影子页 / 跳板页) */
+void wind_flush_code(void *kaddr, size_t len);
+
+/* ---- 影子页: 私有副本映射到目标 VA, 原页与文件不动 ---- */
+struct wind_shadow {
+	struct page *page;   /* 影子页 (我们自己 alloc 的) */
+	struct page *orig;   /* 原页 (pin 住, 卸载时映射回去) */
+	struct wind_pte_pin pin;
+	pteval_t saved;      /* 原始 PTE 值 */
+	void *kva;           /* 影子页内核 VA */
+	bool remapped;
+	bool exec_ok;        /* 原 PTE 允许 EL0 取指 (UXN=0), 跳板才能搬进来 */
+};
+int wind_shadow_attach(struct mm_struct *mm, unsigned long va, struct wind_shadow *sh);
+int wind_shadow_detach(struct mm_struct *mm, unsigned long va, struct wind_shadow *sh);
 
 /* ---- 物理读写 (模式自适应) ---- */
 bool read_physical_address(phys_addr_t pa, void __user *buffer, size_t size, int mode);

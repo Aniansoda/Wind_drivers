@@ -46,7 +46,12 @@ uintptr_t get_module_base(struct driver_session *sess, char *name)
 			path_nm = wind_file_path(vma->vm_file, buf, ARC_PATH_MAX - 1);
 			if (!IS_ERR(path_nm) && !strcmp(kbasename(path_nm), name))
 			{
-				base_addr = vma->vm_start;
+				/* 加载基址 ≠ 这个 VMA 的起点: bionic 按 PT_LOAD 分段映射,
+				 * 每段的起点是 base + (p_vaddr & PAGE_MASK), vm_pgoff 记录
+				 * 该段在文件里的偏移。不减掉它, 命中重定位段时算出的
+				 * 「基址」偏出去一整段, 断点地址跟着错位 -> 永远零命中。 */
+				base_addr = vma->vm_start -
+					    (uintptr_t)(vma->vm_pgoff << PAGE_SHIFT);
 				break;
 			}
 		}

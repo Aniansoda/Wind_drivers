@@ -59,13 +59,8 @@ enum OPERATIONS
 	OP_BRKBP_SET_RECORD   = WIND_OP_BASE + 0x24,
 	OP_BRKBP_CLEAR_RECORDS= WIND_OP_BASE + 0x25,
 
-	/* ---- ETM/PTM 分支追踪断点 (Coresight, 硬件级执行流观测) ---- */
-	OP_ETMBP_SET          = WIND_OP_BASE + 0x26,
-	OP_ETMBP_REMOVE       = WIND_OP_BASE + 0x27,
-	OP_ETMBP_GET_CONFIG   = WIND_OP_BASE + 0x28,
-	OP_ETMBP_GET_RECORDS  = WIND_OP_BASE + 0x29,
-	OP_ETMBP_SET_RECORD   = WIND_OP_BASE + 0x2A,
-	OP_ETMBP_CLEAR_RECORDS= WIND_OP_BASE + 0x2B,
+	/* ---- 0x26..0x2B 原 ETM/Coresight, 已删除; 号段保留不再复用 ---- */
+	/* 0x26..0x2B 已由 WRP 数据断点接管 (见下方) */
 
 	/* ---- 陀螺仪停止/恢复 (暂停/恢复篡改, 保留 hook) ---- */
 	OP_GYRO_STOP         = WIND_OP_BASE + 0x2C,
@@ -83,6 +78,28 @@ enum OPERATIONS
 
 	/* ---- 硬件断点命中时改写 FP 寄存器 (对齐 DUJIA/GTV 的 v3/v4/v5 语义) ---- */
 	OP_HWBP_SET_REGS      = WIND_OP_BASE + 0x34,
+
+	/* ---- PTE 内联钩子改写目标方向 (改跳板里的 s3/s4/s5 立即数) ---- */
+	OP_PTEBP_SET_REGS     = WIND_OP_BASE + 0x35,
+
+	/* ---- PTE 钩子自检/自愈: 校验操作码与影子页映射是否还在原位 ---- */
+	OP_PTEBP_REFRESH      = WIND_OP_BASE + 0x36,
+
+	/* ---- HWBP 自检/重挂: CPU 热插拔或 perf 侧失效后把事件重新 enable ---- */
+	OP_HWBP_REFRESH       = WIND_OP_BASE + 0x37,
+
+	/* ---- WRP 数据断点追踪: 盯住向量, 命中即写回 ----
+	 * 直接接管原 ETM/Coresight 的号段 0x26..0x2B: 老客户端发的 0x26/0x27
+	 * 现在被解释成 WRP 安装/拆除, 点结构恰好也是 24 字节, 不浪费号段 */
+	OP_WRPBP_SET          = WIND_OP_BASE + 0x26, /* 原 ETM_SET */
+	OP_WRPBP_REMOVE       = WIND_OP_BASE + 0x27, /* 原 ETM_REMOVE */
+	OP_WRPBP_GET_CONFIG   = WIND_OP_BASE + 0x28, /* 原 ETM_GET_CONFIG */
+	OP_WRPBP_GET_RECORDS  = WIND_OP_BASE + 0x29, /* 原 ETM_GET_RECORDS */
+	OP_WRPBP_SET_VEC      = WIND_OP_BASE + 0x2A, /* 原 ETM_SET_RECORD */
+	OP_WRPBP_CLEAR_RECORDS= WIND_OP_BASE + 0x2B, /* 原 ETM_CLEAR_RECORDS */
+
+	/* ---- 三族断点运行期诊断快照 (计数/最近命中/最近写回值) ---- */
+	OP_BP_DIAG            = WIND_OP_BASE + 0x3E,
 };
 
 /* ---- 读取模式 ---- */
@@ -420,6 +437,64 @@ typedef struct _HWBP_REG_REQUEST
 	uint32_t rx, ry, rz;   /* float 位模式 */
 	uint32_t reserved;
 } HWBP_REG_REQUEST, *PHWBP_REG_REQUEST;
+/* 注: 上面 reserved 字段当 mask 用, bit0=s3/x bit1=s4/y bit2=s5/z, 0 视为 0x7 */
+
+/* ---- WRP 数据断点 (观察点写回, 不碰代码也不碰页表) ---- */
+typedef struct _WRPBP_POINT_CONFIG
+{
+	uint64_t watch_addr;  /* 弹道/朝向向量首地址 */
+	uint32_t watch_len;   /* 1/2/4/8: 单个观察点覆盖的字节数 */
+	uint32_t type;        /* BP_TYPE_WRITE / BP_TYPE_RW */
+	uint32_t components;  /* bit0=x bit1=y bit2=z: 要写回哪些分量 */
+	uint32_t reserved;
+} WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
+
+typedef struct _WRPBP_SET_REQUEST
+{
+	uint32_t point_count;
+	uint32_t reserved;
+	WRPBP_POINT_CONFIG points[]; /* 变长 */
+} WRPBP_SET_REQUEST, *PWRPBP_SET_REQUEST;
+
+/* 写回向量: 布局与 HWBP_REG_REQUEST 一致, point_index=-1 表示全部 */
+typedef struct _WRPBP_VEC_REQUEST
+{
+	int32_t  point_index;
+	uint32_t enable;
+	uint32_t x, y, z;     /* float 位模式 */
+	uint32_t mask;        /* bit0=x bit1=y bit2=z, 0 视为 0x7 */
+} WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
+
+typedef struct _WRPBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t watch_addr_lo;  /* 仅供调试观察 */
+	uint32_t watch_addr_hi;
+	uint32_t reserved;
+} WRPBP_CONFIG, *PWRPBP_CONFIG;
+
+/* ---- 三族断点诊断快照 ---- */
+typedef struct _WIND_BP_DIAG
+{
+	uint64_t last_hit_pc;    /* 最近一次任何断点命中的 PC */
+	uint32_t hwbp_armed;
+	uint32_t hwbp_hits;
+	uint32_t hwbp_writes;
+	uint32_t hwbp_write_fails;
+	uint32_t ptebp_armed;
+	uint32_t ptebp_reloads;
+	uint32_t ptebp_heal_ok;
+	uint32_t ptebp_heal_fail;
+	uint32_t wrpbp_armed;
+	uint32_t wrpbp_hits;
+	uint32_t wrpbp_writes;
+	uint32_t wrpbp_skips;
+	uint32_t wrpbp_fails;
+	uint32_t last_rx;        /* 最近一次写回的 x/y/z (float 位模式) */
+	uint32_t last_ry;
+	uint32_t last_rz;
+	uint32_t reserved;
+} WIND_BP_DIAG, *PWIND_BP_DIAG;
 
 /*
  * ---- UDP 断点 ----

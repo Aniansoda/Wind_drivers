@@ -28,6 +28,8 @@
 #include <linux/fs.h>
 #include <linux/elf.h>
 #include <linux/string_helpers.h>
+#include <linux/percpu.h>
+#include <linux/jiffies.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/sched.h>
@@ -43,9 +45,16 @@
 #include "memory.h"
 #include "compat.h"
 
-/* ---- sensors_event_t 布局 (Android HAL, arm64, 未验证) ---- */
+/* ---- sensors_event_t 布局 (Android HAL, arm64) ----
+ * HAL 版结构 (BitTube 传的就是它):
+ *   0x00 int32 version | 0x04 int32 sensor | 0x08 int32 type | 0x0C int32 reserved0
+ *   0x10 int64 timestamp | 0x18 float data[16] | 0x58 uint32 flags
+ * 注意 NDK 的 ASensorEvent 把 version/sensor 并成 union, type 落在 0x04;
+ * 两种都可能遇到, 所以下面用「先 0x08, 找不到 gyro 再试 0x04」自动挑。
+ * x/y/z 在 data[0..2], z 在 0x20。 */
 #define SENSOR_EVENT_SIZE       0x68   /* sizeof(sensors_event_t) */
-#define SENSOR_EVENT_TYPE_OFF   0x08   /* int32_t type */
+#define SENSOR_EVENT_TYPE_OFF   0x08   /* int32_t type (HAL 布局) */
+#define SENSOR_EVENT_TYPE_OFF_NDK 0x04 /* int32_t type (NDK ASensorEvent 布局) */
 #define SENSOR_EVENT_DATA_OFF   0x18   /* float data[16]; gyro x/y/z = data[0..2] */
 #define SENSOR_TYPE_GYROSCOPE   4
 /* HAL: SENSOR_TYPE_GYROSCOPE_UNCALIBRATED = 16。UE/Unity 的陀螺仪插件
@@ -56,6 +65,22 @@
 /* 单次 sendObjects 最多处理的事件数 (防御越界) */
 #define GYRO_MAX_EVENTS         1024
 
+/* BitTube 的实现在 libui.so 里, 不在 libsensor.so。老实现只认 libsensor.so,
+ * 在原生 AOSP 上直接 -ENOENT 装不上 —— 这里按候选表逐个试 */
+struct gyro_lib_cand
+{
+	const char *name;
+	const char *path;
+};
+
+static const struct gyro_lib_cand gyro_libs[] = {
+	{ "libui.so",            "/system/lib64/libui.so" },
+	{ "libsensor.so",        "/system/lib64/libsensor.so" },
+	{ "libsensorservice.so", "/system/lib64/libsensorservice.so" },
+	{ "libgui.so",           "/system/lib64/libgui.so" },
+};
+#define GYRO_LIB_COUNT ((int)ARRAY_SIZE(gyro_libs))
+
 /* ---- 全局状态 ---- */
 static struct perf_event * __percpu *gyro_bp; /* per-CPU 执行断点 (wide) */
 static bool gyro_bp_wide = true;              /* false = 退回单任务断点 */
@@ -65,7 +90,27 @@ static pid_t gyro_pid;                  /* 目标进程 */
 static unsigned long gyro_addr;         /* sendObjects 运行时地址 */
 static bool gyro_active;
 static bool gyro_enabled;
-static u32 gyro_rx, gyro_ry, gyro_rz; /* 目标角速度, float 位模式 (rad/s) */
+static u32 gyro_rx, gyro_ry; /* 目标角速度 x/y, float 位模式 (rad/s); z 恒不动 */
+static u32 gyro_rz_unused;   /* 兼容旧 set 接口, 不再写进事件 */
+
+/* ---- WRP 数据断点: 学到事件缓冲地址后, 只盯 x/y 那 8 字节 ----
+ * 这一步把执行断点从 system_server 里彻底摘掉: 稳态只剩一个写观察点,
+ * 不改任何代码, 不占 BRP, 也不在 system_server 的指令流里留下 perf 事件 */
+static struct perf_event * __percpu *gyro_wrp[2];
+static struct perf_event *gyro_wrp_single[2];
+static bool gyro_wrp_wide[2];
+static uint64_t gyro_wrp_addr[2];       /* 各观察点盯住的用户 VA */
+static int gyro_wrp_count;
+static bool gyro_wrp_ready;
+static uint64_t gyro_wrp_pending;       /* 待转换的地址 (中断上下文只记, 不注册) */
+static atomic64_t gyro_wrp_hits = ATOMIC64_INIT(0);
+static atomic64_t gyro_writes = ATOMIC64_INIT(0);
+static unsigned long gyro_wrp_last_seen;
+static DEFINE_PER_CPU(int, gyro_wrp_busy);
+static const char *gyro_lib_used;
+static int gyro_mode;   /* 0=学到后自动转 WRP 1=只用执行断点 2=已转 WRP */
+module_param(gyro_mode, int, 0644);
+MODULE_PARM_DESC(gyro_mode, "0=自动(默认): 执行断点学一次地址后转 WRP 数据断点; 1=只用执行断点");
 
 /* ===================================================================
  * 非睡眠内存读写: 断点回调运行在目标进程上下文 (current = 目标进程),
@@ -89,7 +134,7 @@ static bool gyro_write_mem(struct mm_struct *mm, uintptr_t va, const void *buf, 
  * ELF 符号解析: 读 libsensor.so 的 .dynsym/.dynstr, 返回 sendObjects
  * 的 st_value (PIE 下即文件内偏移)。
  * =================================================================== */
-static int gyro_resolve_symbol(unsigned long *out_offset)
+static int gyro_resolve_symbol(const char *path, unsigned long *out_offset)
 {
 	struct file *f;
 	Elf64_Ehdr ehdr;
@@ -102,7 +147,7 @@ static int gyro_resolve_symbol(unsigned long *out_offset)
 	int ret = -ENOENT;
 	int i;
 
-	f = wind_filp_open(GYRO_LIBSENSOR_PATH, O_RDONLY, 0);
+	f = wind_filp_open(path, O_RDONLY, 0);
 	if (IS_ERR(f))
 		return PTR_ERR(f);
 
@@ -243,7 +288,10 @@ static unsigned long gyro_find_module_base(struct task_struct *task, const char 
 
 			if (!IS_ERR(p) && !strcmp(kbasename(p), name))
 			{
-				base = vma->vm_start;
+				/* 同 process.c: 必须减掉 vm_pgoff 才是 load bias,
+				 * 否则 sendObjects 的运行时地址整体错位, 断点装了不响 */
+				base = vma->vm_start -
+				       (unsigned long)(vma->vm_pgoff << PAGE_SHIFT);
 				break;
 			}
 		}
@@ -257,13 +305,162 @@ static unsigned long gyro_find_module_base(struct task_struct *task, const char 
  * 断点回调: 拦截 sendObjects 的 sensor 数据, 篡改陀螺仪角速度。
  * arm64: x1 = events (void const*), x2 = count (unsigned long)。
  * =================================================================== */
-static void gyro_breakpoint_handler(struct perf_event *bp,
-                                    struct perf_sample_data *data,
-                                    struct pt_regs *regs)
+static struct task_struct *gyro_get_task(void);
+
+/* ---- WRP 观察点命中: 只写 x/y 两个分量, z 恒不动 ---- */
+static void gyro_wrp_handler(struct perf_event *bp, struct perf_sample_data *data,
+			     struct pt_regs *regs)
 {
 	struct mm_struct *mm;
-	unsigned long events, count;
+	u32 v[2];
+
+	(void)bp;
+	(void)data;
+
+	if (!READ_ONCE(gyro_active) || !READ_ONCE(gyro_enabled))
+		return;
+	if (gyro_pid && current->tgid != gyro_pid)
+		return;
+	/* 我们自己写回也会命中这个观察点: 内核上下文 + per-CPU busy 双闸 */
+	if (!user_mode(regs))
+		return;
+	if (this_cpu_read(gyro_wrp_busy))
+		return;
+
+	mm = current->mm;
+	if (!mm)
+		return;
+
+	atomic64_inc(&gyro_wrp_hits);
+	gyro_wrp_last_seen = jiffies;
+
+	v[0] = gyro_rx;
+	v[1] = gyro_ry;
+	/* 观察窗口就是 x/y 那 8 字节: 写回长度 8, z 所在 0x20 一个字节都不碰 */
+	this_cpu_inc(gyro_wrp_busy);
+	if (gyro_write_mem(mm, (uintptr_t)gyro_wrp_addr[0], v, sizeof(v)))
+		atomic64_inc(&gyro_writes);
+	this_cpu_dec(gyro_wrp_busy);
+
+	if (atomic64_read(&gyro_wrp_hits) <= 3)
+		printk(KERN_INFO "gyro-wrp: hit #%lld addr=%llx x=%08x y=%08x\n",
+		       (long long)atomic64_read(&gyro_wrp_hits),
+		       (unsigned long long)gyro_wrp_addr[0], gyro_rx, gyro_ry);
+}
+
+/* 把一个观察点挂上去 (重试逻辑与执行断点一致) */
+static int gyro_wrp_arm_one(int idx, struct task_struct *task)
+{
+	struct perf_event_attr attr;
+	void *ev;
+	bool wide = true;
+
+	hw_breakpoint_init(&attr);
+	attr.bp_addr = gyro_wrp_addr[idx];
+	attr.bp_len = HW_BREAKPOINT_LEN_8;   /* x + y 一起盯, z 在下一格 */
+	attr.bp_type = HW_BREAKPOINT_W;
+
+	ev = wind_register_wide_hw_breakpoint(&attr, gyro_wrp_handler, NULL);
+	if (IS_ERR(ev) && PTR_ERR(ev) == -EOPNOTSUPP)
+	{
+		wide = false;
+		ev = wind_register_user_hw_breakpoint(&attr, gyro_wrp_handler, NULL,
+						      task);
+	}
+	if (IS_ERR(ev))
+	{
+		printk(KERN_ERR "gyro-wrp: 观察点注册失败 %ld\n", PTR_ERR(ev));
+		return (int)PTR_ERR(ev);
+	}
+
+	gyro_wrp[idx] = wide ? ev : NULL;
+	gyro_wrp_single[idx] = wide ? NULL : ev;
+	gyro_wrp_wide[idx] = wide;
+	printk(KERN_INFO "gyro-wrp: 观察点 %d armed addr=%llx len=8 wide=%d\n",
+	       idx, (unsigned long long)gyro_wrp_addr[idx], (int)wide);
+	return 0;
+}
+
+static void gyro_wrp_disarm_all(void)
+{
+	int i;
+
+	for (i = 0; i < 2; i++)
+	{
+		if (gyro_wrp[i])
+		{
+			wind_unregister_wide_hw_breakpoint(gyro_wrp[i]);
+			gyro_wrp[i] = NULL;
+		}
+		if (gyro_wrp_single[i])
+		{
+			wind_unregister_hw_breakpoint(gyro_wrp_single[i]);
+			gyro_wrp_single[i] = NULL;
+		}
+	}
+	gyro_wrp_count = 0;
+	gyro_wrp_ready = false;
+}
+
+/* 执行断点命中 → 记下事件缓冲地址 → 交给进程上下文去完成转换
+ * (不能在 perf 回调里注销自己的事件) */
+static void gyro_learn(uintptr_t event_va)
+{
+	gyro_wrp_pending = (uint64_t)(event_va + SENSOR_EVENT_DATA_OFF);
+}
+
+/* 进程上下文: 把「学到地址」翻译成「摘掉执行断点, 换成写观察点」 */
+static void gyro_try_switch(void)
+{
+	struct task_struct *task;
+	int ret;
+
+	if (!gyro_wrp_pending || gyro_wrp_ready || gyro_mode == 1)
+		return;
+
+	task = gyro_get_task();
+	if (!task)
+		return;
+
+	gyro_wrp_addr[0] = gyro_wrp_pending;
+	ret = gyro_wrp_arm_one(0, task);
+	if (ret)
+	{
+		/* 占不到观察点寄存器就继续用执行断点, 至少还有一条路 */
+		printk(KERN_WARNING "gyro: 转 WRP 失败(%d), 继续用执行断点\n", ret);
+		gyro_wrp_pending = 0;
+		return;
+	}
+
+	gyro_wrp_count = 1;
+	gyro_wrp_ready = true;
+	gyro_wrp_last_seen = jiffies;
+
+	if (gyro_bp)
+	{
+		wind_unregister_wide_hw_breakpoint(gyro_bp);
+		gyro_bp = NULL;
+	}
+	if (gyro_single_bp)
+	{
+		wind_unregister_hw_breakpoint(gyro_single_bp);
+		gyro_single_bp = NULL;
+	}
+
+	gyro_mode = 2;
+	printk(KERN_INFO "gyro: 已转为 WRP 数据断点 addr=%llx, "
+			 "system_server 里不再有执行断点 (代码/BRP 全干净)\n",
+	       (unsigned long long)gyro_wrp_addr[0]);
+}
+
+static void gyro_breakpoint_handler(struct perf_event *bp,
+				    struct perf_sample_data *data,
+				    struct pt_regs *regs)
+{
+	struct mm_struct *mm;
+	unsigned long events, count, stride;
 	unsigned int i;
+	int type_off, pass;
 
 	(void)bp;
 	(void)data;
@@ -284,32 +481,59 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 #if defined(CONFIG_ARM64)
 	events = regs->regs[1];
 	count = regs->regs[2];
+	stride = regs->regs[3];   /* sendObjects 的第 4 个参数就是 objSize */
 #elif defined(CONFIG_X86_64)
 	events = regs->rsi;
 	count = regs->rdx;
+	stride = regs->rcx;
 #else
 	return;
 #endif
 
 	if (!events || !count || count > GYRO_MAX_EVENTS)
 		return;
+	/* 第 4 参为空就按 HAL 的 sizeof(sensors_event_t) 兜底 */
+	if (stride < 0x20 || stride > 0x400)
+		stride = SENSOR_EVENT_SIZE;
 
-	for (i = 0; i < count; i++)
+	/* 头 5 次命中记一行: 没有这行分不清「断点没响」和「响了但改不到」 */
+	if (atomic64_read(&gyro_hits) <= 5)
+		printk(KERN_INFO "gyro: hit #%lld pc=%lx events=%lx count=%lu stride=%lu tgid=%d\n",
+		       (long long)atomic64_read(&gyro_hits),
+		       (unsigned long)instruction_pointer(regs),
+		       events, count, stride, (int)current->tgid);
+
+	/* 先按 HAL 布局 (type@0x08) 找, 一件 gyro 都没有就按 NDK 布局
+	 * (type@0x04) 再来一遍 —— 两种拼法在不同 Android 版本上都出现过 */
+	for (pass = 0; pass < 2; pass++)
 	{
-		uintptr_t ev = events + (uintptr_t)i * SENSOR_EVENT_SIZE;
-		int32_t type;
-		u32 v[3];
+		type_off = pass ? SENSOR_EVENT_TYPE_OFF_NDK : SENSOR_EVENT_TYPE_OFF;
 
-		if (!gyro_read_mem(mm, ev + SENSOR_EVENT_TYPE_OFF, &type, sizeof(type)))
-			continue;
-		if (type != SENSOR_TYPE_GYROSCOPE && type != SENSOR_TYPE_GYRO_UNCAL)
-			continue;
+		for (i = 0; i < count; i++)
+		{
+			uintptr_t ev = events + (uintptr_t)i * stride;
+			int32_t type;
+			u32 v[2];
 
-		/* 篡改 gyro x/y/z = data[0..2] (float 位模式, 不做 FP 运算) */
-		v[0] = gyro_rx;
-		v[1] = gyro_ry;
-		v[2] = gyro_rz;
-		gyro_write_mem(mm, ev + SENSOR_EVENT_DATA_OFF, v, sizeof(v));
+			if (!gyro_read_mem(mm, ev + type_off, &type, sizeof(type)))
+				continue;
+			if (type != SENSOR_TYPE_GYROSCOPE &&
+			    type != SENSOR_TYPE_GYRO_UNCAL)
+				continue;
+
+			/* 只写 data[0]/data[1] = x/y, z (data[2], 偏移 0x20) 原样不动 */
+			v[0] = gyro_rx;
+			v[1] = gyro_ry;
+			if (gyro_write_mem(mm, ev + SENSOR_EVENT_DATA_OFF, v, sizeof(v)))
+				atomic64_inc(&gyro_writes);
+
+			/* 第一次找到就把这块缓冲记下来, 之后转成写观察点 */
+			if (!gyro_wrp_pending && !gyro_wrp_ready)
+				gyro_learn(ev);
+			break;
+		}
+		if (i < count)
+			break;   /* 这一种布局里找到了 gyro 事件 */
 	}
 }
 
@@ -336,26 +560,39 @@ static int gyro_bind(struct task_struct *task)
 {
 	unsigned long offset = 0, base = 0;
 	struct perf_event_attr attr;
-	int ret;
+	int ret, i;
 
-	ret = gyro_resolve_symbol(&offset);
-	if (ret)
+	/* 逐个候选库试: 先看文件里有没有这个符号, 再看进程里有没有映射它 */
+	base = 0;
+	offset = 0;
+	for (i = 0; i < GYRO_LIB_COUNT; i++)
 	{
-		printk(KERN_ERR "gyro: symbol %s not found (%d)\n", GYRO_SENDOBJECTS_SYM, ret);
-		return ret;
-	}
-	printk(KERN_INFO "gyro: target offset 0x%lx\n", offset);
+		unsigned long off = 0, b;
 
-	base = gyro_find_module_base(task, GYRO_LIBSENSOR_NAME);
+		if (gyro_resolve_symbol(gyro_libs[i].path, &off) != 0)
+			continue;
+		b = gyro_find_module_base(task, gyro_libs[i].name);
+		if (!b)
+			continue;
+		base = b;
+		offset = off;
+		gyro_lib_used = gyro_libs[i].name;
+		break;
+	}
 	if (!base)
 	{
-		printk(KERN_ERR "gyro: pid %d 没有加载 %s: hook 必须装在真正执行 "
+		printk(KERN_ERR "gyro: %s 在候选库里都没找到 (libui/libsensor/"
+		       "libsensorservice/libgui): hook 必须装在真正执行 "
 		       "BitTube::sendObjects 的进程 (system_server)\n",
-		       gyro_pid, GYRO_LIBSENSOR_NAME);
+		       GYRO_SENDOBJECTS_SYM);
 		return -ENOENT;
 	}
+	printk(KERN_INFO "gyro: 命中 %s off=0x%lx base=0x%lx\n",
+	       gyro_lib_used, offset, base);
 
 	gyro_addr = base + offset;
+	printk(KERN_INFO "gyro: base=0x%lx off=0x%lx addr=0x%lx\n",
+	       base, offset, gyro_addr);
 
 	hw_breakpoint_init(&attr);
 	attr.bp_addr = gyro_addr;
@@ -453,19 +690,46 @@ void gyro_remove(void)
 		wind_unregister_hw_breakpoint(gyro_single_bp);
 		gyro_single_bp = NULL;
 	}
+	gyro_wrp_disarm_all();
+	gyro_wrp_pending = 0;
 	gyro_bp_wide = true;
 	gyro_active = false;
 	WRITE_ONCE(gyro_enabled, false);
 	gyro_pid = 0;
 	gyro_addr = 0;
+	gyro_mode = 0;
 	printk(KERN_INFO "gyro: unregistered\n");
 }
 
 void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 {
+	struct task_struct *task;
+
 	gyro_rx = rx;
 	gyro_ry = ry;
-	gyro_rz = rz;
+	gyro_rz_unused = rz;   /* z 不动: 存下来只为了兼容旧接口 */
+
+	/* 这里有进程上下文: 完成「执行断点 → WRP 观察点」的切换,
+	 * 以及观察点漂了之后的重新学习 */
+	task = gyro_get_task();
+	if (!task)
+		return;
+
+	if (gyro_wrp_pending && !gyro_wrp_ready)
+		gyro_try_switch();
+
+	/* 事件缓冲被回收/重映射时观察点会静默失效: 3 秒零命中就退回执行断点
+	 * 重新学一次地址 */
+	if (gyro_wrp_ready && gyro_mode == 2 &&
+	    time_after(jiffies, gyro_wrp_last_seen + 3 * HZ))
+	{
+		printk(KERN_INFO "gyro: 观察点 3 秒无命中, 重新学习事件缓冲地址\n");
+		gyro_wrp_disarm_all();
+		gyro_wrp_pending = 0;
+		gyro_mode = 0;
+		if (!gyro_bp && !gyro_single_bp)
+			gyro_bind(task);
+	}
 }
 
 void gyro_set_enabled(bool enabled)
@@ -500,12 +764,14 @@ int gyro_resume(void)
 	if (!task)
 		return -ESRCH;
 
-	if (!gyro_bp && !gyro_single_bp)
+	if (!gyro_bp && !gyro_single_bp && !gyro_wrp_ready)
 	{
 		ret = gyro_bind(task);
 		if (ret)
 			return ret;
 	}
+	if (gyro_wrp_ready)
+		gyro_wrp_last_seen = jiffies;
 
 	WRITE_ONCE(gyro_enabled, true);
 	printk(KERN_INFO "gyro: resumed (pid=%d addr=0x%lx)\n", gyro_pid, gyro_addr);
