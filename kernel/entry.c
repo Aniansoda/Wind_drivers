@@ -52,6 +52,15 @@ static bool install_hook = true;
 module_param(install_hook, bool, 0644);
 MODULE_PARM_DESC(install_hook, "install /dev/null fops hook at load time");
 
+/* 回退到 /dev/null i_fop 通道的总闸, 默认关。
+ * 这是唯一"按编译期结构体偏移写内核对象指针"的通道: 厂商 config 与 GKI 不一致
+ * (CONFIG_IMA / CONFIG_SECURITY_* 会改 struct inode 布局) 时, 按 GKI 偏移写
+ * i_fop 是写到别的字段上, 下一次 open /dev/null 直接 panic 重启。 */
+static bool allow_fops_hook = false;
+module_param(allow_fops_hook, bool, 0644);
+MODULE_PARM_DESC(allow_fops_hook,
+	"1=允许在 netlink/misc 都失败时回退到改 /dev/null inode->i_fop; 默认 0");
+
 /* 二分定位用: 0=不装, 1=只把 inode->i_fop 指向副本 (handler 保持真 null_fops),
  * 2=额外覆盖 unlocked_ioctl/mmap (完整通道), 3=保留原 .open (纯诊断, 通道不生效)。 */
 static int hook_level = 2;
@@ -912,6 +921,13 @@ static int __init driver_entry(void)
 		ret = wind_misc_install();
 		if (!ret)
 			return 0;
+		if (!allow_fops_hook) {
+			/* 不默认回退到 fops hook: 那是唯一会按编译期结构体偏移
+			 * 写内核对象指针的通道, 厂商 config 一改偏移就写飞。 */
+			printk(KERN_WARNING "wind: misc 通道失败 %d, 且 allow_fops_hook=0, "
+			       "不回退 transport=1 (模块已加载但无通道)\n", ret);
+			return 0;
+		}
 		printk(KERN_WARNING "wind: misc 通道失败 %d, 回退 transport=1 (/dev/null)\n", ret);
 		transport = 1;
 	}

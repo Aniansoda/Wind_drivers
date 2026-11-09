@@ -47,20 +47,31 @@ static int filldir64_pre_handler(struct kprobe *p, struct pt_regs *regs);
 /* 延迟注册: 首次 hide_* 时设置符号并注册, 避免符号不可见时模块加载失败 */
 static int ensure_registered(void)
 {
-	int ret;
+	static const char *const cands[] = { "filldir64", "filldir" };
+	int ret = -ENOENT;
+	int i;
 
 	if (kp_filldir.addr)
 		return 0;
 
-	kp_filldir.symbol_name = "filldir64";
-	kp_filldir.pre_handler = filldir64_pre_handler;
-	ret = register_kprobe(&kp_filldir);
-	if (ret < 0)
+	/* filldir64 在 GKI 里是 static 符号, 只有 kallsyms 才能查到;
+	 * 不同内核版本可能只剩 filldir, 所以按候选表逐个试。 */
+	for (i = 0; i < (int)ARRAY_SIZE(cands); i++)
 	{
-		/* 符号不可见: 需 CONFIG_KALLSYMS_ALL 或用 kallsyms_lookup_name 兜底 */
-		return ret;
+		memset(&kp_filldir, 0, sizeof(kp_filldir));
+		kp_filldir.symbol_name = cands[i];
+		kp_filldir.pre_handler = filldir64_pre_handler;
+		ret = register_kprobe(&kp_filldir);
+		if (ret == 0)
+		{
+			pr_info("[wind-hide] kprobe 挂在 %s addr=%px\n", cands[i], kp_filldir.addr);
+			return 0;
+		}
+		pr_info("[wind-hide] kprobe 挂 %s 失败 ret=%d\n", cands[i], ret);
+		memset(&kp_filldir, 0, sizeof(kp_filldir));
 	}
-	return 0;
+	/* 两个都挂不上: 用户态看到的"隐藏无效"就是这个原因, 保留错误码上报 */
+	return ret;
 }
 
 static bool name_is_hidden(const char *name, int namlen)
@@ -132,6 +143,7 @@ int hide_file(const char *path)
 {
 	const char *base;
 	int i;
+	int ret;
 
 	base = strrchr(path, '/');
 	base = base ? base + 1 : path;
@@ -148,12 +160,16 @@ int hide_file(const char *path)
 			return ensure_registered();
 
 	strncpy(hidden_files[hidden_file_count++], base, NAME_MAX - 1);
-	return ensure_registered();
+	ret = ensure_registered();
+	if (ret)
+		pr_info("[wind-hide] hide_file(%s) 注册探针失败 ret=%d\n", base, ret);
+	return ret;
 }
 
 int hide_process(pid_t pid)
 {
 	int i;
+	int ret;
 
 	if (hidden_pid_count >= MAX_HIDDEN_PIDS)
 		return -ENOSPC;
@@ -163,7 +179,9 @@ int hide_process(pid_t pid)
 			return ensure_registered();
 
 	hidden_pids[hidden_pid_count++] = pid;
-	return ensure_registered();
+	ret = ensure_registered();
+	pr_info("[wind-hide] hide_process(pid=%d) 探针 ret=%d 已登记=%d\n", pid, ret, hidden_pid_count);
+	return ret;
 }
 
 int unhide_all(void)

@@ -29,16 +29,6 @@
 #include <asm/cacheflush.h>
 #include <asm/sysreg.h>
 
-/* ===================================================================
- * vmap 物理内存映射 (替代 ioremap_cache/iounmap):
- *
- * arm64 的 ioremap_cache 是 static inline, 展开后引用 ioremap_prot
- * (白名单外) 和 __phys_to_virt (引用 memstart_addr/physvirt_offset
- * 数据符号), 均不能在 GKI 下编译期引用。这里改用 vmap 三件套
- * __get_vm_area_caller + ioremap_page_range + vunmap, 三者均
- * 白名单外, 由 sym.c 经 register_kprobe 运行时取地址 (wind_* 包装)。
- * PAGE_KERNEL 为 normal cacheable (等价 ioremap_cache 的 PROT_NORMAL)。
- * =================================================================== */
 struct wind_phys_map {
 	struct vm_struct *area;
 	void *addr;
@@ -69,7 +59,6 @@ static struct wind_phys_map wind_map_phys(phys_addr_t pa, size_t size)
 	end = addr + size;
 	ret = wind_ioremap_page_range(addr, end, pa, PAGE_KERNEL);
 	if (ret) {
-		/* 可能已装了一半页表, 同样走 vunmap 收尾 */
 		wind_vunmap(m.addr, m.area);
 		m.area = NULL;
 		m.addr = NULL;
@@ -81,41 +70,29 @@ static void wind_unmap_phys(struct wind_phys_map *m)
 {
 	if (!m || !m->area)
 		return;
-	/* 必须 vunmap: ioremap_page_range 装了页表, free_vm_area 只放 vmap 区
-	 * 不 purge 页表页, 每次调用漏 3~5 个 order-0 页且留下残留映射。 */
+
 	wind_vunmap(m->addr, m->area);
 	m->area = NULL;
 	m->addr = NULL;
 }
 
-/* 页表层数: GKI arm64 4KB 页下 VA_BITS=39 是 3 级 (pgd -> pmd -> pte),
- * VA_BITS=48 是 4 级 (pgd -> pud -> pmd -> pte)。3 级时没有 pud 层,
- * 顶层项的下一级表直接就是 pmd 表, 必须用 pmd_index(shift 21) 索引;
- * 若按 pud_index(shift 30) 去索引这张 pmd 表会落到空项 (表现为 pud none)。 */
 #if defined(CONFIG_PGTABLE_LEVELS) && (CONFIG_PGTABLE_LEVELS > 0)
 #define WIND_PGTABLE_LEVELS CONFIG_PGTABLE_LEVELS
 #else
 #define WIND_PGTABLE_LEVELS 4
 #endif
 
-/* 每级索引位数 = PAGE_SHIFT - 3 (4KB 页 9 位, 16KB 页 11 位, 64KB 页 13 位);
- * 第 lv 级 (0=pte) 的移位 = PAGE_SHIFT + lv * bits。与内核 VA_BITS 无关,
- * 因此 3/4/5 级页表共用这一套索引。 */
 #define WIND_PT_BITS	(PAGE_SHIFT - 3)
 #define WIND_PT_IDXMASK	((1UL << WIND_PT_BITS) - 1)
-#define WIND_PTE_AF	((pteval_t)1 << 10) /* arm64 末级(page/block) descriptor 的 AF */
+#define WIND_PTE_AF	((pteval_t)1 << 10)
 
 static inline unsigned long wind_lidx(unsigned long va, int lv)
 {
 	return (va >> (PAGE_SHIFT + (unsigned int)lv * WIND_PT_BITS)) & WIND_PT_IDXMASK;
 }
 
-/* 运行时确定内核页表层数。
- * 首选 TCR_EL1.T1SZ (硬件真实配置: 64 - T1SZ = TTBR1 的 VA 位宽),
- * 取不到才退回 task_size。VA_BITS=39 -> 3 级, 48 -> 4 级, 52 -> 5 级。 */
 static int wind_pgtable_levels_cached;
 
-/* TCR_EL1.T1SZ = bits[21:16] */
 static int wind_ttbr1_vabits(void)
 {
 	u64 tcr = read_sysreg(tcr_el1);
@@ -154,8 +131,6 @@ static int wind_pgtable_levels(void)
 	return n;
 }
 
-/* 按指定层数走目标 mm 的页表, 到 pte 级返回该项指针。
- * 成功且 out_m 非空时, *out_m 持有该 pte 表的 vmap, 由调用方 unmap。 */
 static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 				    int levels, struct wind_phys_map *out_m)
 {
@@ -170,10 +145,8 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 
 	va &= PAGE_MASK;
 
-	/* 顶层直接用 mm->pgd (已在直接映射区, 无需 vmap) */
 	pgd = mm->pgd + wind_lidx(va, levels - 1);
 	val = pgd_val(*pgd);
-	/* 顶层是表描述符: bit10 不是 AF, 只校验类型 */
 	if (!val || (val & 0x3) != 0x3)
 		return NULL;
 
@@ -223,22 +196,12 @@ static pte_t *wind_mm_pte_locate_at(struct mm_struct *mm, unsigned long va,
 	return NULL;
 }
 
-/* 按运行时确定的层数走一次。 */
 static pte_t *wind_mm_pte_locate(struct mm_struct *mm, unsigned long va,
 				 struct wind_phys_map *out_m)
 {
 	return wind_mm_pte_locate_at(mm, va, wind_pgtable_levels(), out_m);
 }
 
-/* ===================================================================
- * 页表翻译: 按 3/4/5 级自适应。
- *
- * 这里手动实现各级偏移, 不用 p4d_offset/pud_offset/pmd_offset/
- * pte_offset_kernel 内核宏 —— 它们的 *_page_vaddr 展开会引用 __va,
- * 进而引用 arm64_use_ng_mappings / physvirt_offset 等非白名单符号,
- * GKI 下报 modpost undefined。页表项物理地址用 wind_map_phys 映射
- * (vmap + PAGE_KERNEL, 等价 __va, 不依赖 memstart_addr)。
- * =================================================================== */
 phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 {
 	struct wind_phys_map m = { .area = NULL, .addr = NULL };
@@ -263,8 +226,6 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	return pa;
 }
 
-/* 单地址刷 leaf + walk cache。全刷 vmalle1is 破坏 KPTI 全局 TLB; 只刷
- * vae1is 漏 walk cache 残留旧只读项。 */
 static inline void wind_flush_tlb_va(unsigned long va)
 {
 	asm volatile("dsb ishst\n"
@@ -274,28 +235,10 @@ static inline void wind_flush_tlb_va(unsigned long va)
 		     : : "r" (va) : "memory");
 }
 
-/* ===================================================================
- * 内核镜像 rodata 写保护绕过。
- * arm64 set_memory_rw 只接受线性映射/vmalloc 地址, 对内核镜像 rodata
- * (null_fops 所在段) 返回 -EINVAL。这里直接改内核页表 (TTBR1) 的
- * AP[2] (bit7, 所有 level 同一位) 切 RO/RW。
- *
- * 安全策略: 先做一次 "只读校验遍历" —— 每级必须非零、非叶子级必须是表项
- * (0b11) 且下一级表 PA 页对齐; 叶子必须是 4KB 页 (0b11) 或 block (0b01)
- * 且 AF=1。全部通过才走第二遍真正改写。层数错了会在校验阶段就退出,
- * 不会按错误的 shift 去索引别的区域的表, 避免写坏无关 PTE 导致卡死/重启。
- * 注意: arm64 表描述符的 bit10 不是 AF (内核置 0), 只在末级校验 AF。
- * =================================================================== */
-
-/* 叶子是 block (2MB/1GB) 映射时, 改 AP[2] 会把整块改成可写。
- * 只允许 NX 数据块 (PXN|UXN 都置位, 即 .rodata); 可执行块一律拒绝,
- * 除非显式 allow_block_patch=1 强制。 */
 static bool allow_block_patch;
 module_param(allow_block_patch, bool, 0644);
 MODULE_PARM_DESC(allow_block_patch, "force allow AP[2] patch on executable block leaf");
 
-/* 只读校验: 返回 0 表示整条路径合法; *leaf_block 说明叶子是 block,
- * *leaf_val 输出叶子描述符原始值 (供 NX 判定)。 */
 static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block,
 			       pteval_t *leaf_val)
 {
@@ -338,7 +281,6 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block,
 		}
 
 		if (lv == 0) {
-			/* pte 级: 0b11 = 4KB 页, 叶子 AF 必须置位 */
 			if (type != 0x3) {
 				pr_err("wind: force_rw pte bad va=%lx val=%llx\n",
 				       va, (unsigned long long)val);
@@ -355,7 +297,6 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block,
 		}
 
 		if (type == 0x1) {
-			/* block 叶子 (2MB/1GB): 末级描述符, bit10 是 AF */
 			if (!(val & WIND_PTE_AF)) {
 				pr_err("wind: force_rw lv%d block AF=0 va=%lx val=%llx\n",
 				       lv, va, (unsigned long long)val);
@@ -366,7 +307,6 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block,
 			return 0;
 		}
 
-		/* 表项 (0b11): arm64 表描述符 bit10 不是 AF (内核置 0), 不校验 */
 		if (type != 0x3) {
 			pr_err("wind: force_rw lv%d bad va=%lx val=%llx\n",
 			       lv, va, (unsigned long long)val);
@@ -384,10 +324,9 @@ static int wind_kpage_validate(unsigned long va, int levels, bool *leaf_block,
 	return -EINVAL;
 }
 
-/* 校验通过后再走一遍, 只改叶子项的 AP[2] */
 static int wind_kpage_patch(unsigned long va, bool writable, int levels)
 {
-	const pteval_t AP_RO = (pteval_t)1 << 7; /* AP[2]: 1=只读 0=可写 */
+	const pteval_t AP_RO = (pteval_t)1 << 7;
 	struct wind_phys_map m;
 	phys_addr_t pa;
 	pteval_t val;
@@ -430,7 +369,7 @@ static int wind_kpage_patch(unsigned long va, bool writable, int levels)
 
 int wind_force_kernel_page_rw(unsigned long va, bool writable)
 {
-	const pteval_t PXN = (pteval_t)1 << 53; /* 特权执行禁止: 1 = 数据段 */
+	const pteval_t PXN = (pteval_t)1 << 53;
 	const pteval_t UXN = (pteval_t)1 << 54;
 	bool leaf_block = false;
 	pteval_t leaf_val = 0;
@@ -444,7 +383,6 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	if (ret)
 		return ret;
 
-	/* block 叶子: 只允许 NX 数据块 (rodata)。可执行块需显式强制。 */
 	if (leaf_block) {
 		bool nx = (leaf_val & PXN) && (leaf_val & UXN);
 
@@ -471,8 +409,6 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 	return ret;
 }
 
-/* 只读探测: 整条路径校验通过后读叶子 AP[2], 不写任何东西。
- * *is_ro = true 表示叶子当前只读。 */
 int wind_kernel_page_ro_state(unsigned long va, bool *is_ro)
 {
 	const pteval_t AP_RO = (pteval_t)1 << 7;
@@ -514,12 +450,6 @@ int wind_kernel_page_ro_state(unsigned long va, bool *is_ro)
 	return -EINVAL;
 }
 
-/* ===================================================================
- * 影子页操作: 直接改目标进程页表中目标地址的 PTE 权限位。
- * 与 wind_force_kernel_page_rw 同构, 但目标是传入的 mm (用户态地址,
- * TTBR0), 且按 mask/val 位域改写 (UXN/PXN/RDONLY/VALID/AF 等)。
- * flush 用 vaae1is 刷所有 ASID 的目标地址 (断点进程非 current 时也生效)。
- * =================================================================== */
 pteval_t wind_shadow_pte_get(struct mm_struct *mm, unsigned long va, int *err)
 {
 	struct wind_phys_map m = { .area = NULL, .addr = NULL };
@@ -558,7 +488,6 @@ int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, p
 	old = pte_val(wind_ptep_get(pte));
 	new = (old & ~mask) | (val & mask);
 
-	/* 直接写 PTE 值, 写后单地址刷 leaf + walk cache (同 wind_force_kernel_page_rw) */
 	WRITE_ONCE(*(pteval_t *)pte, new);
 	asm volatile("dsb ishst\n"
 		     "\ttlbi vaae1is, %0\n"
@@ -571,10 +500,6 @@ int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, p
 	return 0;
 }
 
-/* ===================================================================
- * 内核态跨进程读写 (非 __user buffer)。按页翻译物理地址, vmap 后
- * memcpy。BRK 软断点改目标进程指令字节用。
- * =================================================================== */
 static bool wind_process_va_xfer(struct mm_struct *mm, uintptr_t va,
 				 void *buf, size_t size, bool write)
 {
@@ -592,7 +517,7 @@ static bool wind_process_va_xfer(struct mm_struct *mm, uintptr_t va,
 		if (!pa)
 			return false;
 
-		pa &= PAGE_MASK; /* 页内偏移由 off 处理, 物理地址必须页对齐 */
+		pa &= PAGE_MASK;
 		off = cur & (PAGE_SIZE - 1);
 		chunk = PAGE_SIZE - off;
 		if (chunk > left)
@@ -629,28 +554,6 @@ bool wind_write_process_va(struct mm_struct *mm, uintptr_t va, const void *buf, 
 	return wind_process_va_xfer(mm, va, (void *)buf, size, true);
 }
 
-/* ===================================================================
- * 快速路径: vmap + copy (cacheable, 等价 phys_to_virt 直读)。
- * GKI 拿不到 memstart_addr, 无法重写 phys_to_virt, 改用 wind_map_phys
- * (wind_get_vm_area_caller + wind_ioremap_page_range, PAGE_KERNEL cacheable,
- * 运行时解析)。进程上下文 (ioctl) 可睡眠, vmap 合法。
- * =================================================================== */
-
-/* ===================================================================
- * 单页映射缓存 —— 读取性能的主开关
- *
- * 旧路径每次 read 都是: get_vm_area_caller -> ioremap_page_range -> 读 ->
- * vunmap。这三步都在 vmalloc 全局锁下, 而 vunmap 还要做 TLB shootdown,
- * 向所有 CPU 发 IPI。单次开销 20~60us, 一帧几百个字段读就是几毫秒纯开销,
- * 实测只有个位数帧率。
- *
- * 这里把最近用过的单页映射留着复用: 命中时只剩一次 copy_to_user。
- * 只缓存读。写路径仍走一次性映射 —— 目标物理页被回收后复用同一物理页的
- * 是别的进程, 缓存的映射写下去会写到别人内存里, 读最坏只是读到脏数据,
- * 两者风险不对等。
- *
- * 失效: session_bind / session_destroy / 模块卸载 全清; 条目另有 5s TTL。
- * =================================================================== */
 #define WIND_MAP_SLOTS 256
 #define WIND_MAP_TTL   (5 * HZ)
 
@@ -660,6 +563,13 @@ struct wind_map_slot {
 	void *addr;
 	unsigned long stamp;
 };
+
+/* map_cache=0 → 完全退回旧的「每次读都 vmap/vunmap」路径。
+ * 刷入就重启时用 insmod wind.ko map_cache=0 一条命令就能判定是不是这段引起的,
+ * 不需要重新编译。 */
+static bool map_cache = true;
+module_param(map_cache, bool, 0644);
+MODULE_PARM_DESC(map_cache, "1=复用单页映射(默认, 快) 0=每次读重新映射(旧行为, 慢)");
 
 static struct wind_map_slot g_map_slots[WIND_MAP_SLOTS];
 static DEFINE_MUTEX(g_map_mutex);
@@ -704,7 +614,6 @@ void wind_map_cache_get_stats(struct wind_map_stats *out)
 	out->cached = (uint64_t)used;
 }
 
-/* 调用方必须持有 g_map_mutex。返回页对齐 pa 的 kernel 映射。 */
 static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 {
 	unsigned long now = jiffies;
@@ -720,7 +629,6 @@ static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 				free_slot = i;
 			continue;
 		}
-		/* 过期条目顺手回收, TTL 不依赖额外定时器 */
 		if (time_after(now, s->stamp + WIND_MAP_TTL)) {
 			wind_slot_free(s);
 			atomic64_inc(&g_stat_evicts);
@@ -740,7 +648,7 @@ static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 	}
 
 	if (free_slot < 0) {
-		free_slot = lru;                     /* 全满: 淘汰最久未用 */
+		free_slot = lru;
 		wind_slot_free(&g_map_slots[lru]);
 		atomic64_inc(&g_stat_evicts);
 	}
@@ -758,12 +666,17 @@ static void *wind_slot_lookup_locked(phys_addr_t pa_page)
 	return s->addr;
 }
 
-/* 页内小读走缓存; 失败返回 false 让上层决定是否回落整段映射 */
 static bool wind_read_cached_page(phys_addr_t pa_page, size_t off,
 				  void __user *buffer, size_t size, bool safe)
 {
 	void *kva;
 	bool ok = false;
+
+	/* mutex 不能在原子上下文/关中断里拿。断点、trace、netfilter 这些回调
+	 * 里如果走到物理读, 必须退回一次性映射, 否则就是
+	 * "BUG: sleeping function called from invalid context" → panic。 */
+	if (!map_cache || in_atomic() || irqs_disabled())
+		return false;
 
 	mutex_lock(&g_map_mutex);
 	kva = wind_slot_lookup_locked(pa_page);
@@ -783,11 +696,10 @@ static bool read_physical_direct(phys_addr_t pa, void __user *buffer, size_t siz
 	struct wind_phys_map m;
 
 	atomic64_inc(&g_stat_reads);
-	/* 页内读走缓存: 这是热路径, 一次 copy_to_user 就完事 */
-	if (off + size <= PAGE_SIZE)
-		return wind_read_cached_page(base, off, buffer, size, false);
+	/* 页内读走缓存; 缓存被关/在原子上下文/映射失败时回落一次性映射 */
+	if (off + size <= PAGE_SIZE && wind_read_cached_page(base, off, buffer, size, false))
+		return true;
 
-	/* 跨页 / 大块读: 一次性映射整段, 不进缓存 (缓存只养单页) */
 	m = wind_map_phys(base, PAGE_ALIGN(off + size));
 	if (!m.addr)
 		return false;
@@ -811,20 +723,11 @@ static bool write_physical_direct(phys_addr_t pa, const void __user *buffer, siz
 		wind_unmap_phys(&m);
 		return false;
 	}
-	/*
-	 * 写回主存并失效对应 cache 行, 保证 GPU/ION/非 cache 映射观察者可见,
-	 * 修复 mm cache 别名导致的图形缓冲不一致 (黑屏)。
-	 */
 	kh_flush_dcache((char *)m.addr + off, size);
 	wind_unmap_phys(&m);
 	return true;
 }
 
-/* ===================================================================
- * 安全路径: vmap + flush (读前 invalidate 防 stale, 近似无缓存语义)
- * ioremap_nocache (arm64 展开为 ioremap_prot, 白名单外) 已移除, 改用
- * vmap + dc civac 维持一致性; 完整 nocache 属性后续可加 prot 参数恢复。
- * =================================================================== */
 static bool read_physical_nocache(phys_addr_t pa, void __user *buffer, size_t size)
 {
 	phys_addr_t base = pa & PAGE_MASK;
@@ -832,9 +735,8 @@ static bool read_physical_nocache(phys_addr_t pa, void __user *buffer, size_t si
 	struct wind_phys_map m;
 
 	atomic64_inc(&g_stat_reads);
-	/* 安全模式同样吃缓存: 每读前 dc civac invalidate, 语义与一次性映射一致 */
-	if (off + size <= PAGE_SIZE)
-		return wind_read_cached_page(base, off, buffer, size, true);
+	if (off + size <= PAGE_SIZE && wind_read_cached_page(base, off, buffer, size, true))
+		return true;
 
 	m = wind_map_phys(base, PAGE_ALIGN(off + size));
 	if (!m.addr)
@@ -880,15 +782,6 @@ bool write_physical_address(phys_addr_t pa, const void __user *buffer, size_t si
 	return write_physical_direct(pa, buffer, size);
 }
 
-/* ===================================================================
- * swap 兜底已移除: get_user_pages_remote / put_page / find_vma 均不在
- * 官方 prebuilt .ko 的 __versions 段 (modpost undefined), 且 swap 页
- * 换入属于辅助路径。核心物理内存读写不依赖换入, 缺页时直接失败。
- * =================================================================== */
-
-/* ===================================================================
- * 进程内存读写 (使用会话缓存 task)
- * =================================================================== */
 static struct mm_struct *session_get_mm(struct driver_session *sess)
 {
 	if (!sess || !sess->task)
@@ -896,11 +789,6 @@ static struct mm_struct *session_get_mm(struct driver_session *sess)
 	return kh_get_task_mm(sess->task);
 }
 
-/*
- * 内部实现: 复用已获取的 mm, 不负责 mm 生命周期。
- * 逐页翻译 + 读写, 正确处理跨页 (VA 连续 ≠ PA 连续)。
- * 批量读写用这一层, 一次 get_task_mm 服务 N 个地址。
- */
 static bool __read_mm(struct mm_struct *mm, uintptr_t addr, void __user *buffer, size_t size, int mode)
 {
 	while (size > 0)
@@ -911,7 +799,6 @@ static bool __read_mm(struct mm_struct *mm, uintptr_t addr, void __user *buffer,
 		pa = translate_linear_address(mm, addr);
 		if (!pa)
 		{
-			/* 未映射 / swap 页: 不再换入 (辅助符号已移除), 直接失败 */
 			break;
 		}
 
@@ -953,9 +840,6 @@ bool read_process_memory(struct driver_session *sess, uintptr_t addr, void __use
 	struct mm_struct *mm;
 	bool result;
 
-	/* 绑的是自己时完全不需要走页表: ioctl/netlink 回调就跑在本进程上下文,
-	 * 直接 copy_to_user 拿内核里的临时缓冲即可。这条快路绕开了
-	 * translate_linear_address + wind_map_phys, 是通道自检最稳的一条。 */
 	if (sess && sess->task && sess->task->mm == current->mm) {
 		void *tmp;
 
@@ -990,7 +874,6 @@ bool write_process_memory(struct driver_session *sess, uintptr_t addr, const voi
 	struct mm_struct *mm;
 	bool result;
 
-	/* 同上: 写自己直接 copy_to_user 到目标 VA */
 	if (sess && sess->task && sess->task->mm == current->mm) {
 		void *tmp;
 
@@ -1020,9 +903,6 @@ bool write_process_memory(struct driver_session *sess, uintptr_t addr, const voi
 	return result;
 }
 
-/* ===================================================================
- * 批量读写: 一次 ioctl 处理多个离散地址, 且只取一次 mm
- * =================================================================== */
 long read_process_memory_batch(struct driver_session *sess, PBATCH_REQUEST req)
 {
 	struct mm_struct *mm;
@@ -1067,9 +947,6 @@ long write_process_memory_batch(struct driver_session *sess, PBATCH_REQUEST req)
 	return done;
 }
 
-/* ===================================================================
- * mmap: 把目标进程一段虚拟地址映射到用户态, 零 ioctl 直接指针读写
- * =================================================================== */
 int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
                         uintptr_t target_va, size_t length)
 {
@@ -1085,11 +962,9 @@ int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
 
 	if (sess->read_mode == MODE_SAFE) {
 		wind_mmput(mm);
-		/* 安全映射不缓存, 逐页 ioremap_nocache 语义, 通过缺页回调处理 */
 		return -EOPNOTSUPP;
 	}
 
-	/* 逐页 remap_pfn_range, 用目标物理页 */
 	for (va = target_va & PAGE_MASK, off = vma->vm_start;
 	     va < target_va + length;
 	     va += PAGE_SIZE, off += PAGE_SIZE) {
@@ -1108,9 +983,6 @@ int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
 	return (off > vma->vm_start) ? 0 : ret;
 }
 
-/* ===================================================================
- * 会话管理
- * =================================================================== */
 struct driver_session *session_create(void)
 {
 	struct driver_session *sess;
@@ -1131,11 +1003,8 @@ void session_bind(struct driver_session *sess, pid_t pid)
 	if (!sess)
 		return;
 
-	/* 换目标 pid 前把页映射缓存清掉: 旧目标的物理页可能已回收 */
 	wind_map_cache_purge();
 
-	/* 解绑旧的: 同时把 bound 清掉, 否则下面任何一步失败都会留下
-	 * bound=true + task=NULL 的半绑定状态, 读取路径一解引用就是 NULL panic。 */
 	if (sess->task) {
 		put_task_struct(sess->task);
 		sess->task = NULL;
@@ -1145,12 +1014,11 @@ void session_bind(struct driver_session *sess, pid_t pid)
 	pid_struct = find_get_pid(pid);
 	if (!pid_struct)
 		return;
-	task = pid_task(pid_struct, PIDTYPE_PID); /* 不持引用, 下面显式 get_task_struct */
+	task = pid_task(pid_struct, PIDTYPE_PID);
 	put_pid(pid_struct);
 	if (!task)
 		return;
 
-	/* 内核线程 / 已退出的进程没有 mm, 绑定它们只会在第一次读写时踩空指针。 */
 	if (!task->mm)
 		return;
 
