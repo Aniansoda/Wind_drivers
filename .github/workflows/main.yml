@@ -12,19 +12,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: android13-5.10.226
-            kernel_version: "5.10.226"
-            urls: >-
-              https://android.googlesource.com/kernel/common
-              https://github.com/aosp-mirror/kernel_common.git
-              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
-            ref: android13-5.10.226_r00
-            config: gki_defconfig
-            cc: "LLVM=1"
-            llvmver: "14"
-            llvm_unprefixed: "1"
-            no_lto: "1"
-            mode: full
           - name: android12-5.10.198
             kernel_version: "5.10.198"
             urls: >-
@@ -34,19 +21,6 @@ jobs:
             config: gki_defconfig
             cc: "LLVM=1"
             llvmver: "14"
-            llvm_unprefixed: "1"
-            no_lto: "1"
-            mode: full
-          - name: android14-5.15.167
-            kernel_version: "5.15.167"
-            urls: >-
-              https://android.googlesource.com/kernel/common
-              https://github.com/aosp-mirror/kernel_common.git
-              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
-            ref: android14-5.15.167_r00
-            config: gki_defconfig
-            cc: "LLVM=1"
-            llvmver: "17"
             llvm_unprefixed: "1"
             no_lto: "1"
             mode: full
@@ -104,16 +78,12 @@ jobs:
             device_pack_url: ""
             localversion: "-android16-6-g7704a1ae279b-ab15213644-4k"
             strict_crc: "1"
-            cc: "LLVM=-19"
-            llvmver: "19"
-            mode: modpost
-          - name: android16-6.12.69
-            kernel_version: "6.12.69"
-            urls: >-
-              https://android.googlesource.com/kernel/common
-              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
-            ref: android16-6.12.69_r00
-            config: gki_defconfig
+            # 零 CRC 路线(6.12.sh 内置 ko 的双胞胎做法):
+            # 编译后把 __versions / __version_ext_* 段长度清零 -> 内核 check_version()
+            # 走 "Broken toolchain. Warn once, then let it go.." 分支整段放行;
+            # 同时 __versions 段存在 => same_magic(has_crcs=1) 只比 vermagic 尾巴。
+            # 前提: config 必须仍与真机同构(否则 CFI/结构体不符照样崩), 所以 strict_crc 照留。
+            zero_versions: "1"
             cc: "LLVM=-19"
             llvmver: "19"
             mode: modpost
@@ -349,7 +319,13 @@ jobs:
             --disable CONFIG_GENDWARFKSYMS \
             --disable CONFIG_MEM_ALLOC_PROFILING \
             --disable CONFIG_WERROR \
+            --disable CONFIG_TRIM_UNUSED_KSYMS \
+            --set-str CONFIG_UNUSED_KSYMS_WHITELIST "" \
             || true
+          # 真机 config = CONFIG_TRIM_UNUSED_KSYMS=y + WHITELIST="abi_symbollist.raw",
+          # 那个文件只有 Android build/abi 工具产出, 裸 ACK 树里没有; scripts/Makefile.modpost
+          # 把它塞进 modpost-deps -> "No rule to make target 'abi_symbollist.raw', needed by 'Module.symvers'"。
+          # 关掉 TRIM 后 Module.symvers 收全量导出符号; 我们既不依赖裁剪, 也不依赖它的 CRC(零 CRC 路线)。
           if [ -n "${{ matrix.config_file }}" ]; then
             # 真机 config 带 oplus 的 MODULE_SIG_PROTECT / MODULE_SIG_ALL,
             # ACK 里没有这些符号, olddefconfig 会丢; 这里显式关掉签名, 免得 CI 卡在生成密钥。
@@ -376,6 +352,10 @@ jobs:
               || true
           fi
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          if grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' .config; then
+            echo "::error::TRIM_UNUSED_KSYMS 还是 y, modpost 会去找 abi_symbollist.raw 然后失败"
+            exit 1
+          fi
           echo "== 关键配置 =="
           grep -E "^CONFIG_(LTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|WERROR|DEBUG_INFO_BTF|KPROBES)[= ]" .config || true
 
@@ -447,11 +427,17 @@ jobs:
               fi
               echo "[OK] 自建 CRC 与真机 $COMMON 个交集符号 100% 一致, 不需要 merge"
             fi
-            echo "== 用设备 crc 覆盖: $SRC =="
-            python3 ../tools/dump_kcrc.py merge Module.symvers "$SRC" /tmp/merged.symvers
-            mv /tmp/merged.symvers Module.symvers
-            echo "== 合并后 module_layout =="
-            grep -m1 module_layout Module.symvers
+            if [ -n "${{ matrix.zero_versions }}" ]; then
+              # 零 CRC 路线: Module.symvers 保持自建值, 一个字都不覆盖。
+              # 上面那次 diff/count 只作为"config 与真机同构"的证据, 不用来替换 CRC。
+              echo "== 零 CRC 路线: 不覆盖 Module.symvers (自建 module_layout $(grep -m1 module_layout Module.symvers | awk '{print $1}')) =="
+            else
+              echo "== 用设备 crc 覆盖: $SRC =="
+              python3 ../tools/dump_kcrc.py merge Module.symvers "$SRC" /tmp/merged.symvers
+              mv /tmp/merged.symvers Module.symvers
+              echo "== 合并后 module_layout =="
+              grep -m1 module_layout Module.symvers
+            fi
           else
             echo "没有 $SRC，直接用自建 crc（只在纯 GKI 机型上能加载）"
           fi
@@ -524,6 +510,47 @@ jobs:
           cd kernel-src
           make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" M=drivers/wind modules
 
+      - name: Zero __versions (no-CRC route)
+        if: matrix.zero_versions
+        run: |
+          cd kernel-src
+          KM=drivers/wind/wind.ko
+          python3 ../tools/zero_versions.py "$KM"
+          python3 - "$KM" <<'PY'
+          import struct, sys
+          p = sys.argv[1]
+          d = open(p, 'rb').read()
+          shoff = struct.unpack_from('<Q', d, 0x28)[0]
+          es = struct.unpack_from('<H', d, 0x3A)[0]
+          n = struct.unpack_from('<H', d, 0x3C)[0]
+          si = struct.unpack_from('<H', d, 0x3E)[0]
+          so = struct.unpack_from('<Q', d, shoff + si * es + 24)[0]
+          ss = struct.unpack_from('<Q', d, shoff + si * es + 32)[0]
+          nm = d[so:so + ss]
+          secs = {}
+          for k in range(n):
+              o = shoff + k * es
+              no = struct.unpack_from('<I', d, o)[0]
+              secs[nm[no:nm.index(b'\0', no)].decode('latin1')] = (
+                  struct.unpack_from('<Q', d, o + 24)[0],
+                  struct.unpack_from('<Q', d, o + 32)[0])
+          if '__versions' not in secs:
+              raise SystemExit('::error::没有 __versions 段; 这条路依赖它"存在但长度 0", 缺段只能 insmod -f')
+          left = {k: v[1] for k, v in secs.items()
+                  if (k == '__versions' or k.endswith('version_ext_crcs')
+                      or k.endswith('version_ext_names')) and v[1] != 0}
+          print('version 类段:', {k: v[1] for k, v in secs.items() if 'version' in k})
+          if left:
+              raise SystemExit('::error::段还没清零: %s' % left)
+          off, size = secs['.modinfo']
+          vm = [x for x in d[off:off + size].split(b'\0') if x.startswith(b'vermagic=')]
+          want_tail = b'SMP preempt mod_unload modversions aarch64'
+          if not vm or not vm[0].endswith(want_tail):
+              raise SystemExit('::error::vermagic 尾巴不对: %s' % (vm[0].decode() if vm else '缺'))
+          print('[OK] __versions 全 0, vermagic 尾巴匹配 -> 内核整段跳过 CRC 比对')
+          print('     ', vm[0].decode())
+          PY
+
       - name: Show module info
         run: |
           KM=kernel-src/drivers/wind/wind.ko
@@ -532,9 +559,19 @@ jobs:
           ls -lh "$KM"
           WANT="${{ matrix.device_vermagic_prefix }}"
           if [ -n "$WANT" ]; then
-            GOT=$(modinfo -F vermagic "$KM" | awk '{print $1}')
+            VM=$(modinfo -F vermagic "$KM")
+            GOT=$(printf '%s' "$VM" | awk '{print $1}')
+            TAIL=$(printf '%s' "$VM" | cut -d' ' -f2-)
             echo "vermagic 版本段: $GOT  (真机 $WANT)"
-            if [ "$GOT" != "$WANT" ]; then
+            if [ -n "${{ matrix.zero_versions }}" ]; then
+              echo "零 CRC 路线: __versions 段存在 -> has_crcs=1, 内核只比尾巴"
+              if [ "$TAIL" = "SMP preempt mod_unload modversions aarch64" ]; then
+                echo "[OK] vermagic 尾巴匹配"
+              else
+                echo "::error::vermagic 尾巴不对: [$TAIL]"
+                exit 1
+              fi
+            elif [ "$GOT" != "$WANT" ]; then
               echo "::error::vermagic 与真机不一致, 装上去会被拒或崩"
               exit 1
             fi
