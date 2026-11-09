@@ -704,7 +704,7 @@ static u32 ptebp_ldr_s(u32 rt, u32 delta)
 }
 
 /* b <to>, 相对该指令自身 PC */
-static u32 ptepb_b(u64 from, u64 to)
+static u32 ptebp_b(u64 from, u64 to)
 {
 	s64 d = ((s64)to - (s64)from) >> 2;
 
@@ -739,10 +739,10 @@ static void ptebp_build_tramp(u32 *t, u64 tramp_pc, u64 hook_addr, u32 insn)
 {
 	memset(t, 0, PTEBP_TRAMP_SZ);
 	t[0] = ptebp_ldr_s(3, PTEBP_LIT_OFF);
-	t[1] = ptepb_ldr_s(4, PTEBP_LIT_OFF - 4);
-	t[2] = ptepb_ldr_s(5, PTEBP_LIT_OFF - 8);
+	t[1] = ptebp_ldr_s(4, PTEBP_LIT_OFF - 4);
+	t[2] = ptebp_ldr_s(5, PTEBP_LIT_OFF - 8);
 	t[3] = insn;
-	t[4] = ptepb_b(tramp_pc + 16, hook_addr + 4);
+	t[4] = ptebp_b(tramp_pc + 16, hook_addr + 4);
 }
 
 /* 在候选页里给跳板找位置:
@@ -887,7 +887,7 @@ int ptebp_set(struct driver_session *sess, const PTEBP_POINT_CONFIG *points,
 			goto fail;
 		}
 
-		hook = ptepb_b(points[i].addr, sl->tramp_pc);
+		hook = ptebp_b(points[i].addr, sl->tramp_pc);
 
 		if (sl->pg)
 		{
@@ -1028,7 +1028,7 @@ int ptebp_refresh(void)
 		}
 
 		/* b. 钩子字节还在不在 */
-		hook = ptepb_b(sl->addr, sl->tramp_pc);
+		hook = ptebp_b(sl->addr, sl->tramp_pc);
 		if (sl->pg)
 		{
 			u32 cur_hook = 0;
@@ -1611,20 +1611,19 @@ static int brkbp_pre(struct kprobe *p, struct pt_regs *regs)
 	return 0;
 }
 
-int brkbp_set(struct driver_session *sess, const BRKBP_POINT_CONFIG *points,
-	      size_t point_count)
+/* mm 的所有权在本函数手里: 成功时交给 g_brkbp_mm, 失败时自己 mmput */
+static int brkbp_set_mm(struct mm_struct *mm,
+			const BRKBP_POINT_CONFIG *points, size_t point_count)
 {
-	struct mm_struct *mm;
 	int i, ret;
 
-	if (!sess || !sess->task)
-		return -ESRCH;
-	if (!points || point_count == 0 || point_count > BP_SLOT_MAX)
-		return -EINVAL;
-
-	mm = get_task_mm(sess->task);
 	if (!mm)
 		return -ESRCH;
+	if (!points || point_count == 0 || point_count > BP_SLOT_MAX)
+	{
+		wind_mmput(mm);
+		return -EINVAL;
+	}
 
 	brkbp_remove();
 
@@ -1681,6 +1680,68 @@ fail:
 fail_mm:
 	wind_mmput(mm);
 	return ret;
+}
+
+int brkbp_set(struct driver_session *sess, const BRKBP_POINT_CONFIG *points,
+	      size_t point_count)
+{
+	if (!sess || !sess->task)
+		return -ESRCH;
+	return brkbp_set_mm(get_task_mm(sess->task), points, point_count);
+}
+
+/* ---- 老接口 OP_BRK_SET / OP_BRK_CLEAR ----
+ * 同一个机制: 把目标指令换成 BRK, 命中由 kprobe 接住。这里只做 pid 解析,
+ * 之后全部交给 brkbp_set_mm, 不再复制一份断点实现。 */
+int brk_set(pid_t pid, uintptr_t addr, int type)
+{
+	BRKBP_POINT_CONFIG pt;
+	struct pid *pidp;
+	struct task_struct *task;
+	struct mm_struct *mm;
+
+	if (pid <= 1 || !addr)
+		return -EINVAL;
+	if (type != BP_TYPE_EXEC)
+		return -EINVAL;
+
+	pidp = find_get_pid(pid);
+	if (!pidp)
+		return -ESRCH;
+	task = pid_task(pidp, PIDTYPE_PID);
+	if (!task)
+	{
+		put_pid(pidp);
+		return -ESRCH;
+	}
+	get_task_struct(task);
+	put_pid(pidp);
+	mm = get_task_mm(task);
+	put_task_struct(task);
+	if (!mm)
+		return -ESRCH;
+
+	memset(&pt, 0, sizeof(pt));
+	pt.addr = addr;
+	pt.type = BP_TYPE_EXEC;
+	pt.length = 4;
+	return brkbp_set_mm(mm, &pt, 1);
+}
+
+int brk_clear(pid_t pid, uintptr_t addr)
+{
+	int i, hit = 0;
+
+	if (pid <= 1)
+		return -EINVAL;
+
+	for (i = 0; i < BP_SLOT_MAX; i++)
+		if (brkbp_slots[i].active &&
+		    (!addr || brkbp_slots[i].addr == addr))
+			hit = 1;
+	if (!hit)
+		return -ENOENT;
+	return brkbp_remove();
 }
 
 int brkbp_remove(void)
@@ -2305,8 +2366,6 @@ int bp_diag_get(WIND_BP_DIAG *out)
  * =================================================================== */
 void wind_bp_exit(void)
 {
-	int i;
-
 	hwbp_remove();
 	ptebp_remove();
 	wrpbp_remove();
@@ -2336,10 +2395,4 @@ void wind_bp_exit(void)
 		g_brkbp_kp = NULL;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(brk_slots); i++)
-		if (brk_slots[i].active)
-		{
-			wind_unregister_hw_breakpoint(brk_slots[i].bp);
-			memset(&brk_slots[i], 0, sizeof(brk_slots[i]));
-		}
 }
