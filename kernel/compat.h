@@ -15,6 +15,7 @@
 #include <linux/io.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
+#include <linux/highmem.h>
 #include <asm/cacheflush.h>
 #include <asm/cache.h>
 
@@ -126,5 +127,47 @@ static inline void kh_dcache_clean_inval_poc(void *addr, size_t size)
 #undef arm64_use_ng_mappings
 #endif
 #define arm64_use_ng_mappings false
+
+/* ---- kmap_local_page / kunmap_local ----
+ * 5.11 才有 local 版 (可嵌套、返回地址按 task 记录)。5.10 及更早没有, 退到
+ * kmap_atomic/kunmap_atomic: 同样是「关抢占、不可睡眠」的短临界区, 配对关系
+ * 不变, 对 4K/64K 页都成立。
+ */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)) && !defined(kmap_local_page)
+#define kmap_local_page(page)	kmap_atomic(page)
+#endif
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)) && !defined(kunmap_local)
+#define kunmap_local(addr)	kunmap_atomic(addr)
+#endif
+
+/* ---- PTE 里的物理地址位 ----
+ * 5.11 删掉 PTE_ADDR_MASK, 只留下 PTE_ADDR_LOW / PTE_ADDR_HIGH (后者仅在
+ * CONFIG_ARM64_PA_BITS_52 下存在)。按可用性逐级收敛, 5.4~6.18 用同一份代码:
+ *   - 老内核: 直接用 PTE_ADDR_MASK
+ *   - 5.11+:  LOW | HIGH
+ *   - 无 52 位 PA: LOW
+ *   - 万一两个宏都没有: 按 4K 页 + 52 位 PA 的位形自己算, 保留 51 位以上的
+ *     软件位 (PTE_SPECIAL 等), 只清物理地址
+ */
+#if defined(PTE_ADDR_MASK)
+#define KH_PTE_PA_MASK	((pteval_t)PTE_ADDR_MASK)
+#elif defined(PTE_ADDR_LOW) && defined(PTE_ADDR_HIGH)
+#define KH_PTE_PA_MASK	((pteval_t)(PTE_ADDR_LOW | PTE_ADDR_HIGH))
+#elif defined(PTE_ADDR_LOW)
+#define KH_PTE_PA_MASK	((pteval_t)PTE_ADDR_LOW)
+#else
+#define KH_PTE_PA_MASK	((pteval_t)(PAGE_MASK & GENMASK_ULL(51, 0)))
+#endif
+
+/* ---- 物理地址 → PTE 存放形式 ----
+ * 52 位 PA 的机器上 arm64 把物理地址 [51:50] 挪到 PTE 的 [9:8] (4K 页),
+ * 直接 `| page_to_phys(p)` 会写错位。用内核自己的 __phys_to_pte_val: 它只在
+ * CONFIG_ARM64_PA_BITS_52 下存在, 守卫与内核同一条, 不会悬空。
+ */
+#ifdef CONFIG_ARM64_PA_BITS_52
+#define KH_PHYS_TO_PTE(phys)	((pteval_t)__phys_to_pte_val((phys_addr_t)(phys)))
+#else
+#define KH_PHYS_TO_PTE(phys)	((pteval_t)(phys))
+#endif
 
 #endif /* _KH_COMPAT_H_ */

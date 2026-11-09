@@ -50,6 +50,7 @@
 #include "breakpoint.h"
 #include "sym.h"
 #include "memory.h"
+#include "compat.h"
 
 #define BP_SLOT_MAX       16
 #define BP_REC_PER_SLOT   64
@@ -1038,10 +1039,10 @@ int ptebp_refresh(void)
 		if (sl->pg)
 		{
 			pteval_t cur = wind_pte_pin_get(&sl->pg->sh.pin);
-			pteval_t want = (sl->pg->sh.saved & ~PTE_ADDR_MASK) |
-					(pteval_t)page_to_phys(sl->pg->sh.page);
+			pteval_t want = (sl->pg->sh.saved & ~KH_PTE_PA_MASK) |
+					KH_PHYS_TO_PTE(page_to_phys(sl->pg->sh.page));
 
-			if ((cur & PTE_ADDR_MASK) != (want & PTE_ADDR_MASK))
+			if ((cur & KH_PTE_PA_MASK) != (want & KH_PTE_PA_MASK))
 			{
 				wind_pte_pin_write(&sl->pg->sh.pin, sl->pg->va,
 						   ~(pteval_t)0, want | PTE_AF);
