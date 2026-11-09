@@ -253,11 +253,17 @@ jobs:
             --disable CONFIG_WERROR \
             --disable CONFIG_TRIM_UNUSED_KSYMS \
             --set-str CONFIG_UNUSED_KSYMS_WHITELIST "" \
+            --disable CONFIG_MODULE_SIG_PROTECT \
+            --set-str CONFIG_MODULE_SIG_PROTECT_LIST "" \
             || true
           # 真机 config = CONFIG_TRIM_UNUSED_KSYMS=y + WHITELIST="abi_symbollist.raw",
           # 那个文件只有 Android build/abi 工具产出, 裸 ACK 树里没有; scripts/Makefile.modpost
           # 把它塞进 modpost-deps -> "No rule to make target 'abi_symbollist.raw', needed by 'Module.symvers'"。
           # 关掉 TRIM 后 Module.symvers 收全量导出符号; 我们既不依赖裁剪, 也不依赖它的 CRC(零 CRC 路线)。
+          # 真机 config 里还有 MODULE_SIG_PROTECT_LIST="protected_module_names_list" + MODULE_SIG_PROTECT=y,
+          # 那个名单文件只有 OPPO 的 build/abi 工具会生成; 裸 ACK 树里没有, 于是
+          # scripts/Makefile.modpost: modpost-deps += $(mod-protect-list) -> "No rule to make target
+          # 'protected_module_names_list', needed by 'vmlinux.symvers'"。清空名单, PROTECT 自动变 n。
           if [ -n "${{ matrix.config_file }}" ]; then
             # 真机 config 带 oplus 的 MODULE_SIG_PROTECT / MODULE_SIG_ALL,
             # ACK 里没有这些符号, olddefconfig 会丢; 这里显式关掉签名, 免得 CI 卡在生成密钥。
@@ -288,6 +294,16 @@ jobs:
             echo "::error::TRIM_UNUSED_KSYMS 还是 y, modpost 会去找 abi_symbollist.raw 然后失败"
             exit 1
           fi
+          if grep -q '^CONFIG_MODULE_SIG_PROTECT=y' .config; then
+            echo "::error::MODULE_SIG_PROTECT 还是 y, modpost 会去找 protected_module_names_list 然后失败"
+            exit 1
+          fi
+          SPL=$(sed -n 's/^CONFIG_MODULE_SIG_PROTECT_LIST="\(.*\)"$/\1/p' .config)
+          if [ -n "$SPL" ]; then
+            echo "::error::MODULE_SIG_PROTECT_LIST 还是 \"$SPL\", modpost 会去找这个文件然后失败"
+            exit 1
+          fi
+          echo "[OK] 签名保护名单已清空 (真机原值 protected_module_names_list, 裸树里没有这个文件)"
           echo "== 关键配置 =="
           grep -E "^CONFIG_(LTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|WERROR|DEBUG_INFO_BTF|KPROBES)[= ]" .config || true
 
