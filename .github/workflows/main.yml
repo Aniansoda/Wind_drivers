@@ -18,6 +18,9 @@ jobs:
               https://android.googlesource.com/kernel/common
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android12-5.10.198_r00
+            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
+            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
+            zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=1"
             llvmver: "14"
@@ -31,6 +34,9 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android13-5.15.149_r00
+            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
+            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
+            zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=1"
             llvmver: "14"
@@ -43,6 +49,9 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://android.googlesource.com/kernel/common
             ref: android14-6.1
+            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
+            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
+            zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=-17"
             llvmver: "17"
@@ -53,6 +62,9 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://android.googlesource.com/kernel/common
             ref: android15-6.6.66_r00
+            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
+            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
+            zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=-18"
             llvmver: "18"
@@ -93,6 +105,9 @@ jobs:
               https://android.googlesource.com/kernel/common
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             sha: f957accaf5634f841071adb4f35286ef2779d5b1
+            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
+            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
+            zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=-21"
             llvmver: "21"
@@ -516,9 +531,10 @@ jobs:
           cd kernel-src
           KM=drivers/wind/wind.ko
           python3 ../tools/zero_versions.py "$KM"
-          python3 - "$KM" <<'PY'
-          import struct, sys
+          DEVICE_PREFIX="${{ matrix.device_vermagic_prefix }}" python3 - "$KM" <<'PY'
+          import os, struct, sys
           p = sys.argv[1]
+          prefix = os.environ.get('DEVICE_PREFIX', '')
           d = open(p, 'rb').read()
           shoff = struct.unpack_from('<Q', d, 0x28)[0]
           es = struct.unpack_from('<H', d, 0x3A)[0]
@@ -544,11 +560,17 @@ jobs:
               raise SystemExit('::error::段还没清零: %s' % left)
           off, size = secs['.modinfo']
           vm = [x for x in d[off:off + size].split(b'\0') if x.startswith(b'vermagic=')]
-          want_tail = b'SMP preempt mod_unload modversions aarch64'
-          if not vm or not vm[0].endswith(want_tail):
-              raise SystemExit('::error::vermagic 尾巴不对: %s' % (vm[0].decode() if vm else '缺'))
-          print('[OK] __versions 全 0, vermagic 尾巴匹配 -> 内核整段跳过 CRC 比对')
-          print('     ', vm[0].decode())
+          if not vm:
+              raise SystemExit('::error::.modinfo 里没有 vermagic')
+          tail = vm[0].split(b' ', 1)[1] if b' ' in vm[0] else b''
+          if prefix:
+              if tail != b'SMP preempt mod_unload modversions aarch64':
+                  raise SystemExit('::error::vermagic 尾巴不对: [%s]' % tail.decode())
+          else:
+              if b'modversions' not in tail or not tail.endswith(b'aarch64'):
+                  raise SystemExit('::error::尾巴缺 modversions 或不是 aarch64: [%s]' % tail.decode())
+          print('[OK] __versions 全 0 -> 内核整段跳过 CRC 比对')
+          print('      %s' % vm[0].decode())
           PY
 
       - name: Show module info
@@ -558,6 +580,15 @@ jobs:
           modinfo "$KM" || true
           ls -lh "$KM"
           WANT="${{ matrix.device_vermagic_prefix }}"
+          if [ -z "$WANT" ] && [ -n "${{ matrix.zero_versions }}" ]; then
+            VM=$(modinfo -F vermagic "$KM")
+            TAIL=$(printf '%s' "$VM" | cut -d' ' -f2-)
+            echo "零 CRC 路线(通用行): vermagic 尾巴 = [$TAIL]"
+            case "$TAIL" in
+              *modversions*aarch64*) echo "[OK] 尾巴带 modversions 且为 aarch64" ;;
+              *) echo "::error::尾巴缺 modversions 或不是 aarch64: [$TAIL]"; exit 1 ;;
+            esac
+          fi
           if [ -n "$WANT" ]; then
             VM=$(modinfo -F vermagic "$KM")
             GOT=$(printf '%s' "$VM" | awk '{print $1}')
