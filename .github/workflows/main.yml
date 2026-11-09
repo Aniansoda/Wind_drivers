@@ -83,13 +83,24 @@ jobs:
             cc: "LLVM=-18"
             llvmver: "18"
             mode: modpost
-          - name: android16-6.12.58
+          # 真机 OP6547L1 (6.12.58-android16-6-g7704a1ae279b-ab15213644-4k)
+          #   config    : 设备 /proc/config.gz 原样, 放在 tools/device/config/
+          #   vermagic  : 用 CONFIG_LOCALVERSION 强制成设备同一串
+          #   strict_crc: 编出来的 CRC 必须与设备 454 个 vendor ko harvest 的表 100% 一致, 否则失败
+          #               (一致 ⇒ 源码+config 与真机同构, 不需要任何 CRC 手术)
+          - name: android16-6.12.58-device
             kernel_version: "6.12.58"
+            device_sha: "7704a1ae279b"
+            device_vermagic_prefix: "6.12.58-android16-6-g7704a1ae279b-ab15213644-4k"
             urls: >-
               https://android.googlesource.com/kernel/common
+              https://github.com/aosp-mirror/kernel_common.git
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android16-6.12.58_r00
-            config: gki_defconfig
+            config: ""
+            config_file: tools/device/config/android16-6.12.58-device.config
+            localversion: "-android16-6-g7704a1ae279b-ab15213644-4k"
+            strict_crc: "1"
             cc: "LLVM=-19"
             llvmver: "19"
             mode: modpost
@@ -218,7 +229,14 @@ jobs:
       - name: Configure kernel
         run: |
           cd kernel-src
-          make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- ${{ matrix.config }}
+          CFG="${{ matrix.config_file }}"
+          if [ -n "$CFG" ]; then
+            echo "== 用真机 config 当种子: $CFG =="
+            cp "$GITHUB_WORKSPACE/$CFG" .config
+            make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          else
+            make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- ${{ matrix.config }}
+          fi
 
       - name: Enable required configs
         run: |
@@ -237,6 +255,21 @@ jobs:
             --disable CONFIG_MEM_ALLOC_PROFILING \
             --disable CONFIG_WERROR \
             || true
+          if [ -n "${{ matrix.config_file }}" ]; then
+            # 真机 config 带 oplus 的 MODULE_SIG_PROTECT / MODULE_SIG_ALL,
+            # ACK 里没有这些符号, olddefconfig 会丢; 这里显式关掉签名, 免得 CI 卡在生成密钥。
+            ./scripts/config \
+              --disable CONFIG_MODULE_SIG_ALL \
+              --disable CONFIG_MODULE_SIG_FORCE \
+              --disable CONFIG_CFI_PERMISSIVE \
+              --disable CONFIG_WERROR \
+              || true
+            LV="${{ matrix.localversion }}"
+            if [ -n "$LV" ]; then
+              ./scripts/config --set-str CONFIG_LOCALVERSION "$LV" --disable CONFIG_LOCALVERSION_AUTO
+            fi
+            echo "== 强制 LOCALVERSION = $LV (LOCALVERSION_AUTO=n) =="
+          fi
           if [ "${{ matrix.no_lto }}" = "1" ]; then
             ./scripts/config \
               --disable CONFIG_LTO \
@@ -291,8 +324,30 @@ jobs:
       - name: Merge device CRCs (if provided)
         run: |
           cd kernel-src
-          SRC="../tools/device-symvers/${{ matrix.name }}.symvers"
+          SRC="../tools/device/symvers/${{ matrix.name }}.symvers"
+          [ -f "$SRC" ] || SRC="../tools/device-symvers/${{ matrix.name }}.symvers"
           if [ -f "$SRC" ]; then
+            cp Module.symvers /tmp/self.symvers
+            echo "== 先比一次: 自建 vs 真机 (strict_crc=${{ matrix.strict_crc }}) =="
+            set +e
+            python3 ../tools/dump_kcrc.py diff /tmp/self.symvers "$SRC" | tee /tmp/crc_diff.txt
+            set -e
+            if [ -n "${{ matrix.strict_crc }}" ]; then
+              # count 子命令直接给 "不一致数 交集数", 不依赖日志文案
+              COUNTS=$(python3 ../tools/dump_kcrc.py count /tmp/self.symvers "$SRC")
+              BAD=${COUNTS%% *}; COMMON=${COUNTS##* }
+              echo "交集 $COMMON 个符号, 不一致 $BAD 个"
+              if [ "${COMMON:-0}" -lt 50 ]; then
+                echo "::error::真机 CRC 表只对上台 $COMMON 个符号, 表本身或 ko 都不对"
+                exit 1
+              fi
+              if [ "$BAD" != "0" ]; then
+                echo "::error::真机 CRC 有 $BAD/$COMMON 个符号对不上 —— 源码/config 与设备不同构, 不许发包"
+                grep -A40 '不一致清单' /tmp/crc_diff.txt || true
+                exit 1
+              fi
+              echo "[OK] 自建 CRC 与真机 $COMMON 个交集符号 100% 一致, 不需要 merge"
+            fi
             echo "== 用设备 crc 覆盖: $SRC =="
             python3 ../tools/dump_kcrc.py merge Module.symvers "$SRC" /tmp/merged.symvers
             mv /tmp/merged.symvers Module.symvers
@@ -318,6 +373,51 @@ jobs:
             fi
           done
 
+      - name: Verify config matches device (layout critical)
+        if: ${{ matrix.config_file }}
+        run: |
+          cd kernel-src
+          DEV="$GITHUB_WORKSPACE/${{ matrix.config_file }}"
+          bad=0
+          # 这几个直接决定结构体布局 / 非法间接调用会不会 trap: 任何一项与真机不同都不许发包
+          for k in CFI_CLANG CFI_ICALL_NORMALIZE_INTEGERS CFI_PERMISSIVE \
+                   LTO_NONE RANDSTRUCT_NONE RANDSTRUCT_FULL \
+                   ANDROID_VENDOR_HOOKS ANDROID_KABI_RESERVE ANDROID_VENDOR_OEM_DATA \
+                   ARM64_MTE ARM64_PTR_AUTH ARM64_PAN SHADOW_CALL_STACK \
+                   TASKS_RCU VMAP_STACK THREAD_INFO_IN_TASK SCHED_INFO PSI \
+                   KASAN KASAN_HW_TAGS UBSAN UBSAN_TRAP KPROBES PERF_EVENTS \
+                   MODVERSIONS EXTENDED_MODVERSIONS SMP PREEMPT THREAD_SIZE_ORDER \
+                   ARM64_64K_PAGES; do
+            a=$(grep -E "^CONFIG_${k}=" .config | head -1 | cut -d= -f2-)
+            b=$(grep -E "^CONFIG_${k}=" "$DEV" | head -1 | cut -d= -f2-)
+            [ -n "$a" ] || a="n"; [ -n "$b" ] || b="n"
+            if [ "$a" = "$b" ]; then
+              echo "  $k = $a"
+            else
+              echo "::error::$k 不一致: 本树=$a 真机=$b"
+              bad=1
+            fi
+          done
+          echo "== LOCALVERSION =="
+          grep -E '^CONFIG_LOCALVERSION' .config
+          exit $bad
+
+      - name: Verify kernel source set
+        run: |
+          # 上一次是 memory.c 更新了、memory.h 没跟上 -> 编译期 no member named 'tr_hits'。
+          # 这里在编译前把「同一版」直接验一遍: 缺文件硬失败, 版本不一致给出告警。
+          missing=0
+          for f in memory.c memory.h comm.h entry.c nlcomm.c sym.c; do
+            if [ ! -f "kernel/$f" ]; then
+              echo "::error::缺少 kernel/$f, 仓库 source 不完整"
+              missing=1
+            fi
+          done
+          if grep -q 'tr_hits' kernel/memory.c && ! grep -q 'WIND_HAVE_TR_STATS' kernel/memory.h; then
+            echo "::warning::memory.h 落后于 memory.c: 翻译统计会缺两项 (功能不受影响, 但 windbench 看不到 tr_hits)"
+          fi
+          exit $missing
+
       - name: Build wind module
         run: |
           mkdir -p kernel-src/drivers/wind
@@ -327,9 +427,20 @@ jobs:
 
       - name: Show module info
         run: |
-          file kernel-src/drivers/wind/wind.ko
-          modinfo kernel-src/drivers/wind/wind.ko || true
-          ls -lh kernel-src/drivers/wind/wind.ko
+          KM=kernel-src/drivers/wind/wind.ko
+          file "$KM"
+          modinfo "$KM" || true
+          ls -lh "$KM"
+          WANT="${{ matrix.device_vermagic_prefix }}"
+          if [ -n "$WANT" ]; then
+            GOT=$(modinfo -F vermagic "$KM" | awk '{print $1}')
+            echo "vermagic 版本段: $GOT  (真机 $WANT)"
+            if [ "$GOT" != "$WANT" ]; then
+              echo "::error::vermagic 与真机不一致, 装上去会被拒或崩"
+              exit 1
+            fi
+          fi
+          echo "== 真机 CRC 表: $(wc -l < ../tools/device/symvers/${{ matrix.name }}.symvers 2>/dev/null || echo 缺失) 条 =="
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
