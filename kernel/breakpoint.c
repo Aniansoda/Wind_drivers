@@ -2235,6 +2235,37 @@ static void udpbp_free_all(void)
 /* ===================================================================
  * 三族诊断快照
  * =================================================================== */
+/* 换追踪方式的原子动作: 顺序固定, 先拆事件再关改写, 最后清记录。
+ * 任何一步失败都继续往下走 —— 半关状态比全关危险得多。 */
+int bp_all_off(void)
+{
+	int i, ret = 0, r;
+
+	r = hwbp_remove();
+	if (r < 0 && !ret)
+		ret = r;
+	r = ptebp_remove();
+	if (r < 0 && !ret)
+		ret = r;
+	r = wrpbp_remove();
+	if (r < 0 && !ret)
+		ret = r;
+
+	hwbp_set_reg_modify(-1, 0, 0, 0, 0, 0);
+	ptebp_set_regs(-1, 0, 0, 0, 0, 0);
+	wrpbp_set_vec(-1, 0, 0, 0, 0, 0);
+
+	for (i = 0; i < BP_SLOT_MAX; i++)
+	{
+		hwbp_clear_records(i);
+		ptebp_clear_records(i);
+		wrpbp_clear_records(i);
+	}
+
+	printk(KERN_INFO "bp: all off (三族断点已全部拆除并关闭改写)\n");
+	return ret;
+}
+
 int bp_diag_get(WIND_BP_DIAG *out)
 {
 	int i;

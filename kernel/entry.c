@@ -583,6 +583,10 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return wrpbp_clear_records(req.point_index);
 	}
 
+	/* ---- 三族一次性全关: 不带用户指针 ---- */
+	case OP_BP_ALL_OFF:
+		return bp_all_off();
+
 	/* ---- 三族诊断 ---- */
 	case OP_BP_DIAG:
 	{
@@ -1014,6 +1018,10 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		return wrpbp_clear_records(req.point_index);
 	}
+
+	/* ---- 三族一次性全关: 不带用户指针 ---- */
+	case OP_BP_ALL_OFF:
+		return bp_all_off();
 
 	/* ---- 三族诊断 ---- */
 	case OP_BP_DIAG:

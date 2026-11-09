@@ -94,7 +94,7 @@ static void wind_nl_input(struct sk_buff *skb)
 
 	/* op 白名单: 只接受本驱动定义的操作码区间, 其它一律丢弃不回包,
 	 * 避免任何意外输入被 dispatch 当成合法 cmd 深解引用。 */
-	if (req->op < WIND_OP_BASE + 0x01 || req->op > WIND_OP_BASE + 0x3E)
+	if (req->op < WIND_OP_BASE + 0x01 || req->op > WIND_OP_BASE + 0x3F)
 		return;
 
 	/* 在发送进程上下文里跑, arg 是用户指针, dispatch 里自己 copy_from/to_user */
