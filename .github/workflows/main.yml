@@ -19,7 +19,7 @@ jobs:
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android12-5.10.198_r00
             # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
-            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
+            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 
             zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=1"
