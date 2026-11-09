@@ -9,7 +9,9 @@
  * 引入版本, 见每段注释。
  */
 
-#include <linux/version.h>
+/* 6.10 起 include/linux/version.h 被删, LINUX_VERSION_CODE / KERNEL_VERSION 只剩
+ * 生成头里这一份。kbuild 的 -I$(objtree)/include 能找到, 5.4~6.18 通用。 */
+#include <generated/uapi/linux/version.h>
 #include <linux/mm.h>
 #include <linux/rwsem.h>
 #include <linux/io.h>
@@ -161,11 +163,15 @@ static inline void kh_dcache_clean_inval_poc(void *addr, size_t size)
 
 /* ---- 物理地址 → PTE 存放形式 ----
  * 52 位 PA 的机器上 arm64 把物理地址 [51:50] 挪到 PTE 的 [9:8] (4K 页),
- * 直接 `| page_to_phys(p)` 会写错位。用内核自己的 __phys_to_pte_val: 它只在
- * CONFIG_ARM64_PA_BITS_52 下存在, 守卫与内核同一条, 不会悬空。
+ * 直接 `| page_to_phys(p)` 会写错位。这里自己按位形拼 (与内核 __phys_to_pte_val
+ * 等价), 只用 PTE_ADDR_HIGH / PTE_ADDR_HIGH_SHIFT 两个宏, 不依赖内核内联函数
+ * 叫什么名字, 6.x 各版改名也不受影响。
  */
-#ifdef CONFIG_ARM64_PA_BITS_52
-#define KH_PHYS_TO_PTE(phys)	((pteval_t)__phys_to_pte_val((phys_addr_t)(phys)))
+#if defined(CONFIG_ARM64_PA_BITS_52) && defined(PTE_ADDR_HIGH_SHIFT) && \
+	defined(PTE_ADDR_HIGH)
+#define KH_PHYS_TO_PTE(phys)						\
+	((pteval_t)(((phys) | ((u64)(phys) >> PTE_ADDR_HIGH_SHIFT)) &	\
+		    KH_PTE_PA_MASK))
 #else
 #define KH_PHYS_TO_PTE(phys)	((pteval_t)(phys))
 #endif

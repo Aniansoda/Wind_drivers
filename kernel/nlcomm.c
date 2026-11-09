@@ -13,7 +13,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/version.h>
+#include <generated/uapi/linux/version.h>
 #include <linux/netlink.h>
 #include <net/netlink.h>
 #include <linux/skbuff.h>

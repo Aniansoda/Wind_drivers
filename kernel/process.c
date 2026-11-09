@@ -5,7 +5,7 @@
 #include <linux/module.h>
 #include <linux/tty.h>
 #include <linux/mm.h>
-#include <linux/version.h>
+#include <generated/uapi/linux/version.h>
 #include <linux/sched/mm.h>
 #include <linux/mman.h>
 #include <linux/fs.h>

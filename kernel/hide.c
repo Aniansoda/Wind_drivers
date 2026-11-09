@@ -22,7 +22,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
-#include <linux/version.h>
+#include <generated/uapi/linux/version.h>
 #include <linux/namei.h>
 #include <linux/fs.h>
 #include <linux/string.h>

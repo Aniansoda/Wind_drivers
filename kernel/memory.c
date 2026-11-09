@@ -9,7 +9,7 @@
 #include <linux/gfp.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
-#include <linux/version.h>
+#include <generated/uapi/linux/version.h>
 #include <linux/sched/mm.h>
 #include <linux/highmem.h>
 #include <linux/mm_types.h>
@@ -921,7 +921,7 @@ int wind_shadow_attach(struct mm_struct *mm, unsigned long va, struct wind_shado
 	flush_dcache_page(sp);
 
 	/* 只换输出地址: UXN/AP/AF 等属性位全部沿用原 PTE, 执行权限不变 */
-	new = (old & ~PTE_ADDR_MASK) | (pteval_t)page_to_phys(sp);
+	new = (old & ~KH_PTE_PA_MASK) | KH_PHYS_TO_PTE(page_to_phys(sp));
 	new |= PTE_AF;
 	wind_pte_pin_write(&sh->pin, va, ~(pteval_t)0, new);
 
@@ -1470,9 +1470,9 @@ int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
 		return -EOPNOTSUPP;
 	}
 
-	for (va = target_va & PAGE_MASK, off = vma->vm_start;
-	     va < target_va + length;
-	     va += PAGE_SIZE, off += PAGE_SIZE) {
+	va = target_va & PAGE_MASK;
+	off = vma->vm_start;
+	while (va < target_va + length) {
 
 		pa = translate_linear_address(mm, va);
 		if (!pa)
@@ -1482,6 +1482,8 @@ int mmap_process_memory(struct driver_session *sess, struct vm_area_struct *vma,
 			ret = -EAGAIN;
 			break;
 		}
+		va += PAGE_SIZE;
+		off += PAGE_SIZE;
 	}
 
 	wind_mmput(mm);
