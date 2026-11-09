@@ -205,29 +205,51 @@ static int reg_min_ms;
 module_param(reg_min_ms, int, 0644);
 MODULE_PARM_DESC(reg_min_ms, "命中改写最小间隔毫秒, 0=每次命中都写(默认)");
 
-/* 符号解析不到 fpsimd_preserve_current_state 时的直写通道:
- * 断点异常上下文里向量寄存器就是用户态当前值, 直接改硬件 q3/q4/q5 的低
- * 32 位 (s3/s4/s5) 等价于 HookPTE 的 v3/v4/v5 改写, 不依赖任何内核符号。 */
+/* 符号解析不到 fpsimd_preserve_current_state 时的直写通道 */
 #if defined(CONFIG_ARM64)
+/* 断点溢出上下文里 q3/q4/q5 就是用户态当前值: 直接改它们的低 32 位
+ * (s3/s4/s5) 等价于 HookPTE 的 v3/v4/v5 改写, 不依赖任何内核符号。
+ * 内核按 -mgeneral-regs-only 编译, 汇编器拒收 fp 助记符 (clang 报
+ * "instruction requires: fp-armv8"), 所以这里用 .inst 写死编码。
+ * 编码由 GNU as 实测得到:
+ *   stp q3, q4, [x9] = 0xad001123    str q5, [x9] = 0x3d800125
+ *   ldp q3, q4, [x9] = 0xad401123    ldr q5, [x9] = 0x3dc00125 */
 static bool hwbp_fp_reg_direct(const struct hwbp_regmod *cfg)
 {
 	u64 q34[4] __attribute__((aligned(16)));
 	u64 q5[2] __attribute__((aligned(16)));
-
+	volatile u64 *v34 = q34;
+	volatile u64 *v5 = q5;
 	u32 mask = cfg->mask ? cfg->mask : HWBP_MASK_ALL;
 
-	asm volatile("stp q3, q4, [%0]" :: "r"(q34) : "memory");
-	asm volatile("str q5, [%0]" :: "r"(q5) : "memory");
+	{
+		register u64 *p asm("x9") = q34;
+
+		asm volatile(".inst 0xad001123" : "+r"(p) :: "memory"); /* stp q3, q4, [x9] */
+	}
+	{
+		register u64 *p asm("x9") = q5;
+
+		asm volatile(".inst 0x3d800125" : "+r"(p) :: "memory"); /* str q5, [x9] */
+	}
 
 	if (mask & 0x1)
-		q34[0] = (q34[0] & ~0xffffffffULL) | (u64)cfg->rx;
+		v34[0] = (v34[0] & ~0xffffffffULL) | (u64)cfg->rx;
 	if (mask & 0x2)
-		q34[2] = (q34[2] & ~0xffffffffULL) | (u64)cfg->ry;
+		v34[2] = (v34[2] & ~0xffffffffULL) | (u64)cfg->ry;
 	if (mask & 0x4)
-		q5[0] = (q5[0] & ~0xffffffffULL) | (u64)cfg->rz;
+		v5[0] = (v5[0] & ~0xffffffffULL) | (u64)cfg->rz;
 
-	asm volatile("ldp q3, q4, [%0]" :: "r"(q34) : "memory");
-	asm volatile("ldr q5, [%0]" :: "r"(q5) : "memory");
+	{
+		register u64 *p asm("x9") = q34;
+
+		asm volatile(".inst 0xad401123" : "+r"(p) :: "memory"); /* ldp q3, q4, [x9] */
+	}
+	{
+		register u64 *p asm("x9") = q5;
+
+		asm volatile(".inst 0x3dc00125" : "+r"(p) :: "memory"); /* ldr q5, [x9] */
+	}
 	return true;
 }
 #else
@@ -1867,7 +1889,7 @@ static void udpbp_rec_push(struct udpbp_slot *s, const UDPBP_RECORD *rec)
 		return;
 
 	idx = s->head % UDPBP_REC_PER_SLOT;
-	memcpy(&s->recs[idx], rec, sizeof(*rec));
+	s->recs[idx] = *rec;
 	s->head = (s->head + 1) % UDPBP_REC_PER_SLOT;
 	if (s->count < UDPBP_REC_PER_SLOT)
 		s->count++;
@@ -1887,7 +1909,7 @@ static u32 udpbp_rec_read(struct udpbp_slot *s, u32 start_index,
 	{
 		u32 idx = (oldest + i) % UDPBP_REC_PER_SLOT;
 
-		memcpy(&out[n], &s->recs[idx], sizeof(UDPBP_RECORD));
+		out[n] = s->recs[idx];
 		n++;
 	}
 	return n;
@@ -2160,7 +2182,7 @@ int udpbp_set(int32_t slot_index, const UDPBP_POINT_CONFIG *point, int32_t *slot
 		s->hits = 0;
 	}
 
-	memcpy(&s->cfg, point, sizeof(s->cfg));
+	s->cfg = *point;
 	WRITE_ONCE(s->used, true);
 	WRITE_ONCE(g_udpbp_armed, true);
 
