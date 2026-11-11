@@ -63,7 +63,7 @@ int  clonebp_clear_records(struct mm_struct *mm, int32_t point_index);
 int  clonebp_refresh(struct mm_struct *mm);
 int  clonebp_get_config(void *uout);
 int  clonebp_get_records(uint32_t point_index, uint32_t start,
-			 void *recs, uint32_t cap, uint32_t *count_out);
+			 CLONEBP_RECORD *recs, uint32_t cap, uint32_t *count_out);
 
 /* fork 保护: 复制页表前暂停影子映射, 复制后只恢复父进程 */
 void clonebp_fork_pause(struct mm_struct *mm);

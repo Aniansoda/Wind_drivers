@@ -431,7 +431,6 @@ static struct clonebp_page *cb_page_get(struct mm_struct *mm, uint64_t addr,
 
 int clonebp_set(struct task_struct *task, const void __user *uconf, uint32_t count)
 {
-	uint64_t page_base;
 	struct mm_struct *mm;
 	int i, ok = 0;
 
