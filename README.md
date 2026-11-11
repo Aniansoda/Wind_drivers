@@ -1,4 +1,4 @@
-# Wind Driver — Android ARM64 内核驱动 (wind.ko)
+# Wind Driver — Android ARM64 内核驱动
 
 **中文** | [English](README.en.md) | [日本語](README.ja.md) | [Русский](README.ru.md) | [한국어](README.ko.md)
 
