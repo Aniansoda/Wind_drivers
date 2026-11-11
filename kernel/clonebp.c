@@ -125,6 +125,19 @@ static struct page *cb_clone_page(struct page *orig, u32 offset, u32 imm, const 
  *   to_shadow=0: 装回原始页(用户可读, 不可执行), 供用户读取
  * 只改 PTE, 不动 VMA, /proc/self/maps 保持原样。
  */
+#define CLONEBP_STATE_ORIG    0
+#define CLONEBP_STATE_SHADOW  1
+#define CLONEBP_STATE_BAILOUT 2
+#define CLONEBP_BAILOUT_MAX   16
+
+/* 同页自读会让「切原页->重试读->取指 UXN 切影子->重试读」形成无限异常环,
+ * 参考态实测会拖垮内核。这里按页计数, 超阈值就放宽成可读可执行的原始页,
+ * hook 失效但系统存活。 */
+static atomic_t cb_bailout_cnt[CLONEBP_MAX_PAGES];
+static void flush_tlb_page_range_local(struct mm_struct *mm, unsigned long va);
+static int cb_page_index(struct clonebp_page *cp);
+static int cb_try_bailout(struct clonebp_page *cp);
+
 static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_shadow)
 {
 	pte_t *ptep;
@@ -143,9 +156,12 @@ static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_
 		return -EFAULT;
 	}
 	local_irq_save(flags);
-	if (to_shadow) {
+	if (to_shadow == CLONEBP_STATE_SHADOW) {
 		/* 影子页: 用户不可读(无 PTE_USER), 可执行 */
 		pte = mk_pte(cp->shadow_page, __pgprot(PTE_PXN));
+	} else if (to_shadow == CLONEBP_STATE_BAILOUT) {
+		/* 兜底: 原始页放宽为可读可执行(去 UXN), 打破异常环 */
+		pte = mk_pte(cp->orig_page[0], __pgprot(PTE_USER | PTE_RDONLY | PTE_PXN));
 	} else {
 		/* 原始页: 用户可读, 不可执行 */
 		pte = mk_pte(cp->orig_page[0],
@@ -155,8 +171,14 @@ static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_
 	local_irq_restore(flags);
 	mmap_read_unlock(mm);
 
-	atomic_set(&cp->state, to_shadow ? 1 : 0);
-	flush_tlb_mm(mm);
+	atomic_set(&cp->state, to_shadow);
+	if (to_shadow != CLONEBP_STATE_BAILOUT) {
+		int _i = cb_page_index(cp);
+
+		if (_i >= 0)
+			atomic_set(&cb_bailout_cnt[_i], 0);
+	}
+	flush_tlb_page_range_local(mm, cp->user_va);
 	cb_stat_inc(CLONEBP_ST_TLB_FLUSH);
 	return 0;
 }
@@ -164,6 +186,46 @@ static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_
 /* ============================================================
  * 二、异常接管: 执行/读取双向切页 + BRK 命中改写
  * ============================================================ */
+
+/* per-CPU 局部刷: 只冲刷本 CPU 上该 VA 的 TLB, 避免全局 shootdown 带来的
+ * 「读执行交替耗时」膨胀(参考态 §读执行耗时 检测点)。 */
+static void flush_tlb_page_range_local(struct mm_struct *mm, unsigned long va)
+{
+	int cpu;
+
+	if (!mm)
+		return;
+	preempt_disable();
+	cpu = smp_processor_id();
+	if (mm_cpumask(mm) && cpumask_test_cpu(cpu, mm_cpumask(mm)))
+		local_flush_tlb_page(va);
+	preempt_enable();
+}
+
+static int cb_page_index(struct clonebp_page *cp)
+{
+	if (!cp || !g_cb_pages)
+		return -1;
+	if (cp < g_cb_pages || cp >= g_cb_pages + CLONEBP_MAX_PAGES)
+		return -1;
+	return (int)(cp - g_cb_pages);
+}
+
+/* 返回 1 表示已进入兜底态, 调用方直接放行异常返回 */
+static int cb_try_bailout(struct clonebp_page *cp)
+{
+	int idx = cb_page_index(cp);
+
+	if (idx < 0)
+		return 0;
+	if (atomic_inc_return(&cb_bailout_cnt[idx]) < CLONEBP_BAILOUT_MAX)
+		return 0;
+	cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_BAILOUT);
+	cb_stat_inc(CLONEBP_ST_BRK_HIT);
+	pr_warn("[clonebp] va=%lx 自读异常环, 已放宽为可读可执行\n",
+		(unsigned long)cp->user_va);
+	return 1;
+}
 
 /* 按 VA 查点 */
 static struct clonebp_point *cb_find_point(uint64_t pc)
@@ -223,7 +285,11 @@ static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
 	if (cb_esr_is_iabt(esr)) {
 		/* CPU 取指命中原始页(UXN) -> 换影子页 -> 重试取指 */
 		if (cp) {
-			cb_switch_page(g_cb_mm, cp, 1);
+			if (atomic_read(&cp->state) == CLONEBP_STATE_BAILOUT)
+				return 0;
+			if (cb_try_bailout(cp))
+				return 1;
+			cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_SHADOW);
 			cb_stat_inc(CLONEBP_ST_IFAULT_IN);
 			return 1;
 		}
@@ -231,8 +297,10 @@ static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
 	}
 	if (cb_esr_is_dabt(esr)) {
 		/* 用户读取命中影子页(无 USER 位) -> 换回原始页 -> 重试访问 */
-		if (cp && atomic_read(&cp->state) == 1) {
-			cb_switch_page(g_cb_mm, cp, 0);
+		if (cp && atomic_read(&cp->state) == CLONEBP_STATE_SHADOW) {
+			if (cb_try_bailout(cp))
+				return 1;
+			cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_ORIG);
 			cb_stat_inc(CLONEBP_ST_DFAULT_IN);
 			return 1;
 		}
@@ -294,6 +362,30 @@ static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
 	return 0;
 }
 
+
+/* mprotect 会按 VMA 重建 PTE。若此刻挂的是影子页, 新 PTE 会保留影子 PFN
+ * 并把权限改成用户可读 -> 影子页里的补丁字节被直接读出来。
+ * 在权限重建前把落在范围内的点先切回原始页。 */
+static int cb_mprotect_pre(struct kprobe *kpr, struct pt_regs *regs)
+{
+	unsigned long start = regs->regs[0];
+	unsigned long len   = regs->regs[1];
+	unsigned long va;
+	struct clonebp_page *cp;
+
+	(void)kpr;
+	if (!g_cb_mm || !g_cb_point_cnt || !start || !len)
+		return 0;
+	for (va = start & PAGE_MASK; va < start + len; va += PAGE_SIZE) {
+		cp = cb_find_page(va);
+		if (!cp || !cp->inited)
+			continue;
+		if (atomic_read(&cp->state) == CLONEBP_STATE_SHADOW)
+			cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_ORIG);
+	}
+	return 0;
+}
+
 static struct kprobe cb_mem_abort_kp = {
 	.symbol_name = "do_mem_abort",
 	.pre_handler = cb_mem_abort_pre,
@@ -302,8 +394,13 @@ static struct kprobe cb_brk_kp = {
 	.symbol_name = "brk_handler",
 	.pre_handler = cb_brk_pre,
 };
+static struct kprobe cb_mprotect_kp = {
+	.symbol_name = "do_mprotect_pkey",
+	.pre_handler = cb_mprotect_pre,
+};
 static int cb_kp_mem_reg;
 static int cb_kp_brk_reg;
+static int cb_kp_mprot_reg;
 
 static int cb_install_hooks(void)
 {
@@ -327,11 +424,23 @@ static int cb_install_hooks(void)
 		}
 		cb_kp_brk_reg = 1;
 	}
+	if (!cb_kp_mprot_reg) {
+		ret = register_kprobe(&cb_mprotect_kp);
+		if (ret < 0)
+			pr_warn("[clonebp] do_mprotect_pkey unavailable %d, "
+				"mprotect 会暴露影子页\n", ret);
+		else
+			cb_kp_mprot_reg = 1;
+	}
 	return 0;
 }
 
 static void cb_remove_hooks(void)
 {
+	if (cb_kp_mprot_reg) {
+		unregister_kprobe(&cb_mprotect_kp);
+		cb_kp_mprot_reg = 0;
+	}
 	if (cb_kp_brk_reg) {
 		unregister_kprobe(&cb_brk_kp);
 		cb_kp_brk_reg = 0;
