@@ -27,7 +27,6 @@
 #include <asm/ptrace.h>
 #include <asm/insn.h>
 #include <linux/ktime.h>
-#include <linux/prandom.h>
 
 #include "clonebp.h"
 
@@ -163,6 +162,16 @@ static struct cb_timing g_cb_tm = {
 	.evt_cnt = ATOMIC64_INIT(0),
 };
 
+static u32 cb_tm_seed = 0x9E3779B9U;
+
+static inline u32 cb_tm_rand(void)
+{
+	cb_tm_seed ^= cb_tm_seed << 13;
+	cb_tm_seed ^= cb_tm_seed >> 17;
+	cb_tm_seed ^= cb_tm_seed << 5;
+	return cb_tm_seed;
+}
+
 static inline u64 cb_tm_begin(void)
 {
 	if (!READ_ONCE(g_cb_tm.mode))
@@ -190,7 +199,7 @@ static inline void cb_tm_end(u64 t0)
 		u32 span = READ_ONCE(g_cb_tm.jitter_ns);
 
 		if (span)
-			pad += prandom_u32() % span;
+			pad += cb_tm_rand() % span;
 	}
 	if (pad) {
 		if (pad > CB_TM_PAD_MAX)
