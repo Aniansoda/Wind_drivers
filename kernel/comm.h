@@ -113,6 +113,7 @@ enum OPERATIONS
 	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47, /* 时序对抗: 耗时归一化/抖动/兜底阈值 */
 	OP_ACE_SET              = WIND_OP_BASE + 0x50, /* 设 ACE 目标 tgid */
 	OP_ACE_GET_STAT         = WIND_OP_BASE + 0x51, /* 读 ACE 伪装命中计数 */
+	OP_ACE_VERBOSE          = WIND_OP_BASE + 0x52, /* 开关驱动自身日志(默认关) */
 };
 
 /* ---- 读取模式 ---- */
@@ -666,6 +667,8 @@ typedef struct _ACE_STAT
 	uint64_t ksym_drop;      /* kallsyms 被清空的符号数 */
 	uint64_t tracerp_hide;   /* TracerPid 被清零的次数 */
 	uint64_t fs_drop;        /* 路径类 syscall 被置空的次数 */
+	uint64_t comm_drop;      /* 线程名被滤掉的行数 */
+	uint64_t port_drop;      /* 调试端口连接被阻断的次数 */
 } ACE_STAT, *PACE_STAT;
 
 #endif /* _COMM_H_ */

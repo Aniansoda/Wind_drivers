@@ -7,8 +7,8 @@
 | ID | 检测点 | ACE 实现证据 | 观测手段 | 驱动对策 | 状态 |
 |---|---|---|---|---|---|
 | A1 | 外挂进程可见性 | `mvm_bk_proc`/`mvm_bk_task`、ckguard `/proc/%u/cmdline`+`getPackageName` | 遍历 `/proc/*/cmdline` 比对黑名单/包名 | `hide_process()` 走 `filldir64` | **强/已有** |
-| A2 | 启动链 | `/proc/<pid>/stat` ppid | 父进程非 zygote 则可疑 | 需伪造 stat 输出 | 中/待 |
-| A3 | 线程名 | `/proc/<pid>/task/*/comm` | 找 `gum-js-loop`、`gmain` 等 | 需过滤 comm | 中/待 |
+| A2 | 启动链 | `/proc/<pid>/stat` ppid | 父进程非 zygote 则可疑 | 需伪造 stat 输出 | 中/**已实现** |
+| A3 | 线程名 | `/proc/<pid>/task/*/comm` | 找 `gum-js-loop`、`gmain` 等 | 需过滤 comm | 中/**已实现** |
 | A4 | 进程数量异常 | 遍历 /proc 计数 | 统计频次 | 同 A1 | 弱/已有 |
 
 ## B 内存面
@@ -36,7 +36,7 @@
 |---|---|---|---|---|---|
 | D1 | 模块列表 | 常规 | `/proc/modules`、`/sys/module/wind` | `m_show` 过滤 + 链表摘除 | 强/新写 |
 | D2 | 内核符号 | 常规 | `/proc/kallsyms` | `kallsyms_expand_symbol` kretprobe 清空 | 强/新写 |
-| D3 | 内核日志 | 驱动自身 `pr_info` | `dmesg`、`/dev/kmsg` | 去日志或 hook syslog | 中/待 |
+| D3 | 内核日志 | 驱动自身 `pr_info` | `dmesg`、`/dev/kmsg` | 去日志或 hook syslog | 中/**已实现** |
 | D4 | 内核代码完整性 | — | 比对函数首字节 | kprobe 走 BRK 不打补丁 | 强/已有 |
 | D5 | ACE 自有内核通道 | `tss_sdk_ioctl` | `/dev/` 节点读写 | 需先确认节点名 | 中/待 |
 
@@ -86,8 +86,8 @@
 | 状态 | 数量 | ID |
 |---|---|---|
 | 已有对策 | 9 | A1 A4 B4 B5 C3 C4 D4 H1 H2 I3 |
-| 新写（本次实现） | 4 | B1(含B2/B3) C1 D1 D2 |
-| 待实现 | 12 | A2 A3 D3 D5 E1 E2 E3 E5 F1 F2 F3 F4 G1 |
+| 已实现 | 11 | B1 B2 B3 C1 D1 D2 D3 E1 E2 E3 A3 G1 |
+| 待实现 | 6 | A2 D5 E5 F1 F2 F3 F4 |
 | 无需/服务端 | 5 | B5 E4 G2 I1 I2 |
 
 ## 优先级

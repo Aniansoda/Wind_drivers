@@ -20,11 +20,20 @@
 #define ACE_PFX "[wind-ace] "
 
 static uint32_t g_ace_tgid;
+static int ace_verbose;
+
+#define ACE_LOG(fmt, ...)						\
+	do {								\
+		if (READ_ONCE(ace_verbose))				\
+			pr_info(ACE_PFX fmt, ##__VA_ARGS__);		\
+	} while (0)
 static atomic64_t g_ace_maps_drop;
 static atomic64_t g_ace_mod_drop;
 static atomic64_t g_ace_ksym_drop;
 static atomic64_t g_ace_tp_hide;
 static atomic64_t g_ace_fs_drop;
+static atomic64_t g_ace_comm_drop;
+static atomic64_t g_ace_port_drop;
 
 static const char *const ace_deny[] = {
 	"libwind", "wind.ko", "keep.sh", "libkeep",
@@ -302,7 +311,89 @@ static struct kprobe ace_statx_kp = {
 	.pre_handler = ace_statx_pre,
 };
 
+
+/* ---- A3: 线程名过滤 ----
+ * /proc/<pid>/task/<tid>/comm 由 proc_task_name 输出, 命中则跳过整行。
+ */
+
+static const char *const ace_comm_deny[] = {
+	"gum-js-loop", "gmain", "gdbus", "pool-frida", "frida",
+	"gadget", "xposed", "substrate", "riru", "zygisk",
+};
+
+static bool ace_comm_hit(const char *comm)
+{
+	int i;
+
+	if (!comm || !*comm)
+		return false;
+	for (i = 0; i < (int)ARRAY_SIZE(ace_comm_deny); ++i)
+		if (strstr(comm, ace_comm_deny[i]))
+			return true;
+	return false;
+}
+
+static noinline int ace_comm_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)regs->regs[3];
+
+	(void)kp;
+	if (!task || !ace_cur_is_target())
+		return 0;
+	if (!ace_comm_hit(task->comm))
+		return 0;
+	atomic64_inc(&g_ace_comm_drop);
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static struct kprobe ace_comm_kp = {
+	.symbol_name = "proc_task_name",
+	.pre_handler = ace_comm_pre,
+};
+
+/* ---- G1: 调试端口阻断 ----
+ * __sys_connect(fd, sockaddr __user *, addrlen) 第 2 参是用户态 sockaddr。
+ * 只读前 8 字节 (family + port + 部分 addr), 命中黑名单端口就把指针置 NULL
+ * 让 getname 等价的 copy_from_user 失败返回 -EFAULT, 不改栈不改返回值寄存器。
+ */
+
+static const unsigned short ace_deny_port[] = {
+	27042, 27043, 23946, 5037, 8000, 8080, 31337,
+};
+
+static noinline int ace_connect_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	unsigned char buf[8];
+	const void __user *sa = (const void __user *)regs->regs[1];
+	unsigned short port;
+	int i;
+
+	(void)kp;
+	if (!sa || !ace_cur_is_target())
+		return 0;
+	if (copy_from_user(buf, sa, sizeof(buf)))
+		return 0;
+	if ((buf[0] | (buf[1] << 8)) != 2)
+		return 0;
+	port = (unsigned short)((buf[2] << 8) | buf[3]);
+	for (i = 0; i < (int)ARRAY_SIZE(ace_deny_port); ++i) {
+		if (port != ace_deny_port[i])
+			continue;
+		regs->regs[1] = 0;
+		atomic64_inc(&g_ace_port_drop);
+		return 0;
+	}
+	return 0;
+}
+
+static struct kprobe ace_connect_kp = {
+	.symbol_name = "__sys_connect",
+	.pre_handler = ace_connect_pre,
+};
+
 /* ---- 对外接口 ---- */
+
 
 
 int ace_set_pid(uint32_t tgid)
@@ -310,7 +401,13 @@ int ace_set_pid(uint32_t tgid)
 	if (!tgid)
 		return -EINVAL;
 	WRITE_ONCE(g_ace_tgid, tgid);
-	pr_info(ACE_PFX "target tgid=%u\n", tgid);
+	ACE_LOG("target tgid=%u\n", tgid);
+	return 0;
+}
+
+int ace_set_verbose(int on)
+{
+	WRITE_ONCE(ace_verbose, on ? 1 : 0);
 	return 0;
 }
 
@@ -333,6 +430,8 @@ int ace_get_stat(void *uout)
 	st.ksym_drop = (uint64_t)atomic64_read(&g_ace_ksym_drop);
 	st.tracerp_hide = (uint64_t)atomic64_read(&g_ace_tp_hide);
 	st.fs_drop = (uint64_t)atomic64_read(&g_ace_fs_drop);
+	st.comm_drop = (uint64_t)atomic64_read(&g_ace_comm_drop);
+	st.port_drop = (uint64_t)atomic64_read(&g_ace_port_drop);
 	memcpy(uout, &st, sizeof(st));
 	return 0;
 }
@@ -350,6 +449,12 @@ int ace_init(void)
 	r = register_kretprobe(&ace_ksym_krp);
 	if (r)
 		pr_warn(ACE_PFX "kallsyms_expand_symbol probe failed: %d\n", r);
+	r = register_kprobe(&ace_comm_kp);
+	if (r)
+		pr_warn(ACE_PFX "proc_task_name probe failed: %d\n", r);
+	r = register_kprobe(&ace_connect_kp);
+	if (r)
+		pr_warn(ACE_PFX "__sys_connect probe failed: %d\n", r);
 	r = register_kprobe(&ace_open_kp);
 	if (r)
 		pr_warn(ACE_PFX "do_sys_openat2 probe failed: %d\n", r);
@@ -365,13 +470,15 @@ int ace_init(void)
 	r = register_kretprobe(&ace_status_krp);
 	if (r)
 		pr_warn(ACE_PFX "proc_pid_status retprobe failed: %d\n", r);
-	pr_info(ACE_PFX "ready\n");
+	ACE_LOG("ready\n");
 	return 0;
 }
 
 void ace_exit(void)
 {
 	unregister_kretprobe(&ace_status_krp);
+	unregister_kprobe(&ace_connect_kp);
+	unregister_kprobe(&ace_comm_kp);
 	unregister_kprobe(&ace_statx_kp);
 	unregister_kprobe(&ace_faccess_kp);
 	unregister_kprobe(&ace_open_kp);
@@ -380,5 +487,5 @@ void ace_exit(void)
 	unregister_kprobe(&ace_mods_kp);
 	unregister_kprobe(&ace_maps_kp);
 	WRITE_ONCE(g_ace_tgid, 0);
-	pr_info(ACE_PFX "gone\n");
+	ACE_LOG("gone\n");
 }
