@@ -18,8 +18,6 @@ jobs:
               https://android.googlesource.com/kernel/common
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android12-5.10.198_r00
-            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
-            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
             zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=1"
@@ -34,8 +32,6 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             ref: android13-5.15.149_r00
-            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
-            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
             zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=1"
@@ -49,8 +45,6 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://android.googlesource.com/kernel/common
             ref: android14-6.1
-            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
-            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
             zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=-17"
@@ -62,18 +56,11 @@ jobs:
               https://github.com/aosp-mirror/kernel_common.git
               https://android.googlesource.com/kernel/common
             ref: android15-6.6.66_r00
-            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
-            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
             zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=-18"
             llvmver: "18"
             mode: modpost
-          # 真机 OP6547L1 (6.12.58-android16-6-g7704a1ae279b-ab15213644-4k)
-          #   config    : 设备 /proc/config.gz 原样, 放在 tools/device/config/
-          #   vermagic  : 用 CONFIG_LOCALVERSION 强制成设备同一串
-          #   CRC       : 不需要真机 CRC 表, 走零 CRC 路线(编译后清版本段), 不做任何 CRC 替换
-          #               同构性只由 config 逐项比对把关(Verify config matches device)
           - name: android16-6.12.58-device
             kernel_version: "6.12.58"
             device_sha: "7704a1ae279b"
@@ -86,11 +73,6 @@ jobs:
             config: ""
             config_file: tools/device/config/android16-6.12.58-device.config
             localversion: "-android16-6-g7704a1ae279b-ab15213644-4k"
-            # 零 CRC 路线(6.12.sh 内置 ko 的双胞胎做法):
-            # 编译后把 __versions / __version_ext_* 段长度清零 -> 内核 check_version()
-            # 走 "Broken toolchain. Warn once, then let it go.." 分支整段放行;
-            # 同时 __versions 段存在 => same_magic(has_crcs=1) 只比 vermagic 尾巴。
-            # 前提: config 必须仍与真机同构(否则 CFI/结构体不符照样崩), 这一步由 Verify config matches device 把关。
             zero_versions: "1"
             cc: "LLVM=-19"
             llvmver: "19"
@@ -101,8 +83,6 @@ jobs:
               https://android.googlesource.com/kernel/common
               https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
             sha: f957accaf5634f841071adb4f35286ef2779d5b1
-            # 无 CRC 路线: 编译后把版本段长度清零, 内核 check_version() 整段放行
-            # 目的: 尾巴相同的机型都能装, 不依赖逐台采集 CRC 表
             zero_versions: "1"
             config: gki_defconfig
             cc: "LLVM=-21"
@@ -126,6 +106,7 @@ jobs:
           fi
           echo "设备 config: $CFG  $(wc -l < "$CFG") 行"
           grep -E '^CONFIG_(MODVERSIONS|EXTENDED_MODVERSIONS|ASM_MODVERSIONS|CFI_CLANG|SMP|PREEMPT)=' "$CFG" || true
+
       - name: Add swap (LTO 兜底)
         run: |
           if [ ! -f /swapfile ]; then
@@ -138,18 +119,75 @@ jobs:
           swapon --show || true
           df -h / | tail -1
 
+      # ============================================================
+      # 修复 1: runner 的 apt mirrorlist 指向已下线的 azure.archive.ubuntu.com
+      #         并顺带修 DNS（整体解析失效时连 security.ubuntu.com 都会 Err）
+      # ============================================================
+      - name: Fix apt (server mirrorlist + DNS)
+        run: |
+          set -x
+          echo "== 现状 =="
+          cat /etc/resolv.conf || true
+          ls -l /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || echo "(无 apt-mirrors.txt)"
+          getent hosts archive.ubuntu.com || echo "DNS FAIL (before)"
+
+          # 1) 干掉 runner 自定义的 mirrorlist 机制 —— azure.archive 的唯一来源
+          sudo rm -f /etc/apt/apt-mirrors.txt
+          sudo rm -f /etc/apt/apt.conf.d/*mirror* 2>/dev/null || true
+          sudo rm -f /etc/apt/apt.conf.d/*proxy*  2>/dev/null || true
+
+          # 2) 清空全部源定义, 写死官方源
+          sudo rm -rf /etc/apt/sources.list.d/*
+          sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
+          deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+          deb http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+          EOF
+
+          # 3) DNS
+          echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 168.63.129.16" \
+            | sudo tee /etc/resolv.conf
+          getent hosts archive.ubuntu.com || echo "DNS FAIL (after)"
+
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 clean
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
+
+      # ============================================================
+      # 修复 2: 主源失败自动退清华 / 阿里云，llvm.sh 也带重试
+      # ============================================================
       - name: Install cross toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            bc flex bison \
-            libssl-dev libelf-dev \
-            dwarves libdwarf-dev kmod \
-            wget gnupg
-            
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          APT_OPTS="-o Acquire::Retries=8 -o Acquire::http::Timeout=60 -o Acquire::ForceIPv4=true"
+          PKGS="gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu bc flex bison libssl-dev libelf-dev dwarves libdwarf-dev kmod wget curl gnupg ca-certificates"
+
+          if sudo apt-get $APT_OPTS install -y --no-install-recommends $PKGS; then
+            echo "[OK] 官方源安装成功"
+          else
+            echo "!! 官方源失败, 切清华镜像"
+            sudo sed -i \
+              -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
+              -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
+              /etc/apt/sources.list
+            sudo apt-get $APT_OPTS clean
+            sudo apt-get $APT_OPTS update || true
+            if sudo apt-get $APT_OPTS install -y --no-install-recommends $PKGS; then
+              echo "[OK] 清华源安装成功"
+            else
+              echo "!! 清华源失败, 切阿里云镜像"
+              sudo sed -i \
+                -e 's|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+                /etc/apt/sources.list
+              sudo apt-get $APT_OPTS clean
+              sudo apt-get $APT_OPTS update || true
+              sudo apt-get $APT_OPTS install -y --no-install-recommends $PKGS
+              echo "[OK] 阿里云源安装成功"
+            fi
+          fi
+
+          wget -qO /tmp/llvm.sh --tries=8 --timeout=60 --waitretry=5 \
+            https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
           if [ -n "${{ matrix.llvmver }}" ]; then
             sudo /tmp/llvm.sh "${{ matrix.llvmver }}" all
@@ -256,17 +294,8 @@ jobs:
             --disable CONFIG_MODULE_SIG_PROTECT \
             --set-str CONFIG_MODULE_SIG_PROTECT_LIST "" \
             || true
-          # 真机 config = CONFIG_TRIM_UNUSED_KSYMS=y + WHITELIST="abi_symbollist.raw",
-          # 那个文件只有 Android build/abi 工具产出, 裸 ACK 树里没有; scripts/Makefile.modpost
-          # 把它塞进 modpost-deps -> "No rule to make target 'abi_symbollist.raw', needed by 'Module.symvers'"。
-          # 关掉 TRIM 后 Module.symvers 收全量导出符号; 我们既不依赖裁剪, 也不依赖它的 CRC(零 CRC 路线)。
-          # 真机 config 里还有 MODULE_SIG_PROTECT_LIST="protected_module_names_list" + MODULE_SIG_PROTECT=y,
-          # 那个名单文件只有 OPPO 的 build/abi 工具会生成; 裸 ACK 树里没有, 于是
-          # scripts/Makefile.modpost: modpost-deps += $(mod-protect-list) -> "No rule to make target
-          # 'protected_module_names_list', needed by 'vmlinux.symvers'"。清空名单, PROTECT 自动变 n。
+
           if [ -n "${{ matrix.config_file }}" ]; then
-            # 真机 config 带 oplus 的 MODULE_SIG_PROTECT / MODULE_SIG_ALL,
-            # ACK 里没有这些符号, olddefconfig 会丢; 这里显式关掉签名, 免得 CI 卡在生成密钥。
             ./scripts/config \
               --disable CONFIG_MODULE_SIG_ALL \
               --disable CONFIG_MODULE_SIG_FORCE \
@@ -323,7 +352,6 @@ jobs:
       - name: Get Module.symvers
         run: |
           cd kernel-src
-
           if [ "${{ matrix.mode }}" = "full" ]; then
             make ARCH=arm64 ${{ matrix.cc }} CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" modules \
               || echo "!! 完整构建非零退出，先看有没有 symvers"
@@ -340,7 +368,6 @@ jobs:
             test -s vmlinux.symvers
             cp vmlinux.symvers Module.symvers
           fi
-          
           test -s Module.symvers
           wc -l Module.symvers
 
@@ -366,7 +393,6 @@ jobs:
           cd kernel-src
           DEV="$GITHUB_WORKSPACE/${{ matrix.config_file }}"
           bad=0
-          # 这几个直接决定结构体布局 / 非法间接调用会不会 trap: 任何一项与真机不同都不许发包
           for k in CFI_CLANG CFI_ICALL_NORMALIZE_INTEGERS CFI_PERMISSIVE \
                    LTO_NONE RANDSTRUCT_NONE RANDSTRUCT_FULL \
                    ANDROID_VENDOR_HOOKS ANDROID_KABI_RESERVE ANDROID_VENDOR_OEM_DATA \
@@ -391,17 +417,15 @@ jobs:
 
       - name: Verify kernel source set
         run: |
-          # 上一次是 memory.c 更新了、memory.h 没跟上 -> 编译期 no member named 'tr_hits'。
-          # 这里在编译前把「同一版」直接验一遍: 缺文件硬失败, 版本不一致给出告警。
           missing=0
-          for f in memory.c memory.h comm.h entry.c nlcomm.c sym.c; do
+          for f in memory.c memory.h comm.h entry.c nlcomm.c sym.c clonebp.c clonebp.h; do
             if [ ! -f "kernel/$f" ]; then
               echo "::error::缺少 kernel/$f, 仓库 source 不完整"
               missing=1
             fi
           done
           if grep -q 'tr_hits' kernel/memory.c && ! grep -q 'WIND_HAVE_TR_STATS' kernel/memory.h; then
-            echo "::warning::memory.h 落后于 memory.c: 翻译统计会缺两项 (功能不受影响, 但 windbench 看不到 tr_hits)"
+            echo "::warning::memory.h 落后于 memory.c: 翻译统计会缺两项"
           fi
           exit $missing
 
