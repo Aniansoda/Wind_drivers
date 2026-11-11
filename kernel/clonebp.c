@@ -86,8 +86,12 @@ static pte_t *cb_pte_get(struct mm_struct *mm, unsigned long addr, pmd_t **pmdp_
 	if (pmdp_out)
 		*pmdp_out = pmd;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))
-	/* __pte_offset_map 在 6.5+ 需要 pmd 且返回前要 pte_unmap */
-	return pte_offset_map(pmd, addr);
+	/* 6.5+ 的 pte_offset_map 展开成 out-of-line 的 __pte_offset_map,
+	 * 该符号不 EXPORT_SYMBOL 给模块 (6.6 / 6.18 modpost 直接报 undefined),
+	 * 这里做等价手算: pte 页基址走 arm64 的 pmd_page_vaddr, 再叠页内下标,
+	 * 不产生任何外部符号引用, 也就不需要配对的 pte_unmap
+	 */
+	return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(addr);
 #else
 	return pte_offset_kernel(pmd, addr);
 #endif
