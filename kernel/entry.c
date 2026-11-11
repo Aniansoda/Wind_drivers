@@ -637,6 +637,16 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return clonebp_refresh(NULL);
 	case OP_ACE_SET:
 		return ace_set_pid((uint32_t)arg);
+	case OP_ACE_SET_FEATURES:
+		return ace_set_features((uint32_t)arg);
+	case OP_ACE_GET_FEATURES:
+	{
+		uint32_t f = ace_get_features();
+
+		if (copy_to_user((void __user *)arg, &f, sizeof(f)) != 0)
+			return -EFAULT;
+		return 0;
+	}
 	case OP_ACE_INTE:
 		return ace_inte_takeover((int)arg) > 0 ? 0 : -ENODEV;
 	case OP_ACE_VERBOSE:

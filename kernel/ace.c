@@ -21,7 +21,23 @@
 #define ACE_PFX "[wind-ace] "
 
 static uint32_t g_ace_tgid;
+/* 单项开关位掩码, 默认全开。高 3 位留给后续功能。 */
+#define ACE_F_MAPS     (1u << 0)
+#define ACE_F_MODS     (1u << 1)
+#define ACE_F_KSYM     (1u << 2)
+#define ACE_F_TRACERP  (1u << 3)
+#define ACE_F_FS       (1u << 4)
+#define ACE_F_COMM     (1u << 5)
+#define ACE_F_PORT     (1u << 6)
+#define ACE_F_MASK     0x7Fu
+
+static u32 g_ace_feat = ACE_F_MASK;
 static int ace_verbose;
+
+static inline bool ace_feat(u32 bit)
+{
+	return READ_ONCE(g_ace_feat) & bit;
+}
 
 #define ACE_LOG(fmt, ...)						\
 	do {								\
@@ -104,6 +120,8 @@ static noinline int ace_maps_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	if (!vma->vm_file)
 		return 0;
+	if (!ace_feat(ACE_F_MAPS))
+		return 0;
 	if (!ace_cur_is_target())
 		return 0;
 	buf = kmalloc(PATH_MAX, GFP_ATOMIC);
@@ -133,6 +151,8 @@ static noinline int ace_mods_pre(struct kprobe *kp, struct pt_regs *regs)
 	(void)kp;
 	if (!mod || !mod->name)
 		return 0;
+	if (!ace_feat(ACE_F_MODS))
+		return 0;
 	if (!ace_cur_is_target())
 		return 0;
 	if (!ace_deny_name(mod->name))
@@ -159,6 +179,8 @@ static noinline int ace_ksym_ret(struct kretprobe_instance *ri, struct pt_regs *
 
 	(void)ri;
 	if (!READ_ONCE(g_ace_tgid))
+		return 0;
+	if (!ace_feat(ACE_F_KSYM))
 		return 0;
 	r = (char *)regs->regs[1];
 	if (!r || !*r)
@@ -196,6 +218,8 @@ static noinline int ace_status_pre(struct kprobe *kp, struct pt_regs *regs)
 	(void)kp;
 	s->task = NULL;
 	if (!task)
+		return 0;
+	if (!ace_feat(ACE_F_TRACERP))
 		return 0;
 	if (!ace_is_target(task->tgid))
 		return 0;
@@ -246,6 +270,8 @@ static noinline bool ace_fs_hit(const struct pt_regs *regs)
 	char *p;
 	bool hit;
 
+	if (!ace_feat(ACE_F_FS))
+		return false;
 	if (!ace_cur_is_target())
 		return false;
 	p = (char *)regs->regs[1];
@@ -341,6 +367,8 @@ static noinline int ace_comm_pre(struct kprobe *kp, struct pt_regs *regs)
 	(void)kp;
 	if (!task || !ace_cur_is_target())
 		return 0;
+	if (!ace_feat(ACE_F_COMM))
+		return 0;
 	if (!ace_comm_hit(task->comm))
 		return 0;
 	atomic64_inc(&g_ace_comm_drop);
@@ -372,6 +400,8 @@ static noinline int ace_connect_pre(struct kprobe *kp, struct pt_regs *regs)
 
 	(void)kp;
 	if (!sa || !ace_cur_is_target())
+		return 0;
+	if (!ace_feat(ACE_F_PORT))
 		return 0;
 	if (copy_from_user(buf, sa, sizeof(buf)))
 		return 0;
@@ -476,6 +506,18 @@ int ace_set_pid(uint32_t tgid)
 	return 0;
 }
 
+int ace_set_features(u32 mask)
+{
+	WRITE_ONCE(g_ace_feat, mask & ACE_F_MASK);
+	pr_info(ACE_PFX "features=0x%x\n", READ_ONCE(g_ace_feat));
+	return 0;
+}
+
+u32 ace_get_features(void)
+{
+	return READ_ONCE(g_ace_feat);
+}
+
 int ace_set_verbose(int on)
 {
 	WRITE_ONCE(ace_verbose, on ? 1 : 0);
@@ -496,6 +538,7 @@ int ace_get_stat(void *uout)
 		return -EINVAL;
 	memset(&st, 0, sizeof(st));
 	st.tgid = READ_ONCE(g_ace_tgid);
+	st.features = READ_ONCE(g_ace_feat);
 	st.maps_drop = (uint64_t)atomic64_read(&g_ace_maps_drop);
 	st.mod_drop = (uint64_t)atomic64_read(&g_ace_mod_drop);
 	st.ksym_drop = (uint64_t)atomic64_read(&g_ace_ksym_drop);
