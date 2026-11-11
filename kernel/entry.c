@@ -21,6 +21,7 @@
 #include "gyro.h"
 #include "sym.h"
 #include "nlcomm.h"
+#include "clonebp.h"
 
 /*
  * entry.c — 通讯通道与 ioctl 分发 (作者: 川上富江Tomie)
@@ -586,6 +587,54 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 	}
 
 	/* ---- 三族一次性全关: 不带用户指针 ---- */
+
+	/* ---- 克隆页断点 (同 VA 双物理页, 不占 BRP/WRP) ---- */
+	case OP_CLONEBP_SET:
+		return clonebp_set_pid((uint32_t)0, (const void __user *)arg);
+	case OP_CLONEBP_REMOVE:
+		return clonebp_remove_all(NULL);
+	case OP_CLONEBP_GET_CONFIG:
+	{
+		CLONEBP_CONFIG cfg;
+
+		if (clonebp_get_config(&cfg) != 0)
+			return -EINVAL;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_CLONEBP_GET_RECORDS:
+	{
+		CLONEBP_RECORDS_REQUEST req;
+		CLONEBP_RECORD *recs;
+		uint32_t cnt = 0;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (!req.records || req.capacity == 0 || req.capacity > CLONEBP_RECORD_MAX)
+			return -EINVAL;
+		recs = kcalloc(req.capacity, sizeof(*recs), GFP_KERNEL);
+		if (!recs)
+			return -ENOMEM;
+		if (clonebp_get_records(req.point_index, req.start_index,
+					recs, req.capacity, &cnt) != 0) {
+			kfree(recs);
+			return -EINVAL;
+		}
+		if (cnt && copy_to_user(req.records, recs, cnt * sizeof(*recs))) {
+			kfree(recs);
+			return -EFAULT;
+		}
+		kfree(recs);
+		if (req.count_out && copy_to_user(req.count_out, &cnt, sizeof(cnt)))
+			return -EFAULT;
+		return 0;
+	}
+	case OP_CLONEBP_CLEAR_RECORDS:
+		return clonebp_clear_records(NULL, (int32_t)arg);
+	case OP_CLONEBP_REFRESH:
+		return clonebp_refresh(NULL);
+
 	case OP_BP_ALL_OFF:
 		return bp_all_off();
 
@@ -969,7 +1018,9 @@ static int __init driver_entry(void)
 	 * 连 netlink 通道一起没了, 用户态永远连不上。 */
 	if (transport == 0) {
 		printk(KERN_INFO "wind: transport=0, 只做符号解析, 不建通道\n");
-		return 0;
+		if (clonebp_module_init() != 0)
+		pr_err("[wind] clonebp init failed\n");
+	return 0;
 	}
 	if (!install_hook || hook_level <= 0)
 		printk(KERN_INFO "wind: install_hook=%d hook_level=%d → 只跳过 hook, 通道照建\n",
@@ -1013,6 +1064,8 @@ static int __init driver_entry(void)
 
 static void __exit driver_unload(void)
 {
+	clonebp_module_exit();
+
 	printk("[+] wind driver_unload");
 	gyro_remove();
 	kgsl_hook_remove();

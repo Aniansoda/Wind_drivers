@@ -100,6 +100,16 @@ enum OPERATIONS
 
 	/* ---- 三族一次性全关: 不带任何用户指针, 换追踪方式的原子动作 ---- */
 	OP_BP_ALL_OFF         = WIND_OP_BASE + 0x3F,
+
+	/* ---- 克隆页断点 (Clone-Page): 同 VA 双物理页, 不占 BRP/WRP 寄存器 ----
+	 * 原始页只读不可执行(用户 CRC 干净), 影子页用户不可读可执行(内含 BRK)。 */
+	OP_CLONEBP_SET          = WIND_OP_BASE + 0x40, /* 安装克隆页断点组 */
+	OP_CLONEBP_REMOVE       = WIND_OP_BASE + 0x41, /* 拆除全部并还原页表 */
+	OP_CLONEBP_GET_CONFIG   = WIND_OP_BASE + 0x42, /* 读启用点数 + 影子页数 + 故障计数 */
+	OP_CLONEBP_GET_RECORDS  = WIND_OP_BASE + 0x43, /* 分段读命中记录 */
+	OP_CLONEBP_SET_RECORD   = WIND_OP_BASE + 0x44, /* 改单点改写配置 */
+	OP_CLONEBP_CLEAR_RECORDS= WIND_OP_BASE + 0x45, /* 清记录 (-1 全部) */
+	OP_CLONEBP_REFRESH      = WIND_OP_BASE + 0x46, /* 重新克隆影子页(页被重映射后自愈) */
 };
 
 /* ---- 读取模式 ---- */
@@ -550,5 +560,83 @@ typedef struct _WIND_NL_MSG
 	uint64_t arg;    /* 用户态指针, 同 ioctl 第三参数 */
 	int64_t  result; /* 内核回填的返回值 */
 } WIND_NL_MSG, *PWIND_NL_MSG;
+
+
+/* ---- 克隆页断点协议 ---- */
+#define CLONEBP_MAX_POINTS   32
+#define CLONEBP_RECORD_MAX   256
+#define CLONEBP_MAX_PAGES    64
+#define CLONEBP_PATCH_MAX    16
+#define CLONEBP_REG_MAX      8
+#define CLONEBP_BRK_IMM_BASE 0x1000
+
+#define CLONEBP_MODE_LOG     0
+#define CLONEBP_MODE_REWRITE 1
+
+#define CLONEBP_F_ONESHOT    0x1
+#define CLONEBP_F_KEEP_ORIG  0x2
+#define CLONEBP_F_NO_FLUSH   0x4
+
+enum CLONEBP_STAT_IDX
+{
+	CLONEBP_ST_IFAULT_IN = 0,  /* 执行命中原始页 -> 切影子 */
+	CLONEBP_ST_DFAULT_IN = 1,  /* 读取命中影子页 -> 切原始 */
+	CLONEBP_ST_BRK_HIT   = 2,  /* 影子页 BRK 命中 */
+	CLONEBP_ST_TLB_FLUSH = 3,
+	CLONEBP_ST_CLONE_OK  = 4,
+	CLONEBP_ST_CLONE_FAIL= 5,
+	CLONEBP_ST_MAX       = 6,
+};
+
+typedef struct _CLONEBP_POINT_CONFIG
+{
+	uint64_t addr;                    /* 目标函数入口 VA */
+	uint32_t mode;                    /* CLONEBP_MODE_* */
+	uint32_t reg_base;                /* 写回起始 X 寄存器号 0..30 */
+	uint32_t reg_mask;                /* bit0..bit7 对应 reg_base+0..7 */
+	uint32_t flags;                   /* CLONEBP_F_* */
+	uint64_t reg_val[CLONEBP_REG_MAX];/* 写回值 */
+	uint32_t imm;                     /* BRK 立即数, 0=自动分配 */
+	uint32_t patch_len;               /* 影子页补丁长度, 0=写 BRK */
+	uint8_t  patch[CLONEBP_PATCH_MAX];/* 影子页替换字节 */
+} CLONEBP_POINT_CONFIG, *PCLONEBP_POINT_CONFIG;
+
+typedef struct _CLONEBP_SET_REQUEST
+{
+	uint32_t pid;          /* 目标进程 */
+	uint32_t point_count;
+	CLONEBP_POINT_CONFIG points[];
+} CLONEBP_SET_REQUEST, *PCLONEBP_SET_REQUEST;
+
+typedef struct _CLONEBP_RECORD
+{
+	uint64_t trigger_pc;
+	uint64_t hit_addr;
+	uint32_t hits;
+	uint32_t reserved;
+} CLONEBP_RECORD, *PCLONEBP_RECORD;
+
+typedef struct _CLONEBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t shadow_pages;
+	uint64_t faults_in_i;   /* 执行故障次数 */
+	uint64_t faults_in_d;   /* 读取故障次数 */
+	uint64_t brk_hits;
+	uint64_t tlb_flushes;
+	uint64_t clone_ok;
+	uint64_t clone_fail;
+	uint32_t reserved[2];
+} CLONEBP_CONFIG, *PCLONEBP_CONFIG;
+
+typedef struct _CLONEBP_RECORDS_REQUEST
+{
+	uint32_t point_index;
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	CLONEBP_RECORD *records;
+	uint32_t *count_out;
+} CLONEBP_RECORDS_REQUEST, *PCLONEBP_RECORDS_REQUEST;
 
 #endif /* _COMM_H_ */
