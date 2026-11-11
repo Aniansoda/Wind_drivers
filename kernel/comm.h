@@ -665,6 +665,7 @@ typedef struct _ACE_STAT
 	uint64_t mod_drop;       /* /proc/modules 被滤掉的行数 */
 	uint64_t ksym_drop;      /* kallsyms 被清空的符号数 */
 	uint64_t tracerp_hide;   /* TracerPid 被清零的次数 */
+	uint64_t fs_drop;        /* 路径类 syscall 被置空的次数 */
 } ACE_STAT, *PACE_STAT;
 
 #endif /* _COMM_H_ */

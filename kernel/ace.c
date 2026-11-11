@@ -24,6 +24,7 @@ static atomic64_t g_ace_maps_drop;
 static atomic64_t g_ace_mod_drop;
 static atomic64_t g_ace_ksym_drop;
 static atomic64_t g_ace_tp_hide;
+static atomic64_t g_ace_fs_drop;
 
 static const char *const ace_deny[] = {
 	"libwind", "wind.ko", "keep.sh", "libkeep",
@@ -32,6 +33,29 @@ static const char *const ace_deny[] = {
 	"dobby", "shadowhook", "whale", "sandhook",
 	"libmem", "gameguardian",
 };
+
+/* fs 层用全路径前缀匹配: "su" 这类短词做 strstr 会误伤 status/issue 等 */
+static const char *const ace_path_deny[] = {
+	"/system/bin/su", "/system/xbin/su", "/sbin/su",
+	"/su/bin/su", "/debug_ramdisk/su", "/data/local/tmp/su",
+	"/data/adb/magisk", "/data/adb/ksu", "/data/adb/ap",
+	"/data/adb/modules", "/sbin/magisk", "/cache/magisk",
+	"/system/app/Superuser.apk", "/system/bin/frida-server",
+	"/data/local/tmp/frida-server",
+};
+
+static bool ace_fs_deny(const char *p)
+{
+	int i;
+
+	for (i = 0; i < (int)ARRAY_SIZE(ace_path_deny); ++i) {
+		size_t n = strlen(ace_path_deny[i]);
+
+		if (strncmp(p, ace_path_deny[i], n) == 0)
+			return true;
+	}
+	return false;
+}
 
 static bool ace_deny_name(const char *p)
 {
@@ -198,7 +222,88 @@ static struct kretprobe ace_status_krp = {
 	.maxactive = 32,
 };
 
+
+/* ---- E1/E2/E3: 路径类 syscall 过滤 ----
+ * 三个入口都只做一件事: 把原来的用户态路径指针置 NULL,
+ * 让 getname_flags 直接返回 -EFAULT。不改内核栈, 不改返回值寄存器,
+ * 不依赖 prologue 是否已压栈, 所以不会崩。
+ * 覆盖: open/openat -> do_sys_openat2; access/faccessat -> do_faccessat;
+ *       stat/lstat/newfstatat -> vfs_statx
+ */
+
+static noinline bool ace_fs_hit(const struct pt_regs *regs)
+{
+	char *p;
+	bool hit;
+
+	if (!ace_cur_is_target())
+		return false;
+	p = (char *)regs->regs[1];
+	if (!p)
+		return false;
+	/* 只读前 128 字节, 避免用户给超长路径时白跑 */
+	{
+		char buf[128];
+		long n = strncpy_from_user(buf, p, sizeof(buf) - 1);
+
+		if (n <= 0)
+			return false;
+		buf[n] = '\0';
+		hit = ace_fs_deny(buf);
+	}
+	return hit;
+}
+
+static noinline int ace_open_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	(void)kp;
+	if (!ace_fs_hit(regs))
+		return 0;
+
+	regs->regs[1] = 0;
+	atomic64_inc(&g_ace_fs_drop);
+	return 0;
+}
+
+static noinline int ace_faccess_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	(void)kp;
+	if (!ace_fs_hit(regs))
+		return 0;
+
+	regs->regs[1] = 0;
+	atomic64_inc(&g_ace_fs_drop);
+	return 0;
+}
+
+static noinline int ace_statx_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	(void)kp;
+	if (!ace_fs_hit(regs))
+		return 0;
+
+	regs->regs[1] = 0;
+	atomic64_inc(&g_ace_fs_drop);
+	return 0;
+}
+
+static struct kprobe ace_open_kp = {
+	.symbol_name = "do_sys_openat2",
+	.pre_handler = ace_open_pre,
+};
+
+static struct kprobe ace_faccess_kp = {
+	.symbol_name = "do_faccessat",
+	.pre_handler = ace_faccess_pre,
+};
+
+static struct kprobe ace_statx_kp = {
+	.symbol_name = "vfs_statx",
+	.pre_handler = ace_statx_pre,
+};
+
 /* ---- 对外接口 ---- */
+
 
 int ace_set_pid(uint32_t tgid)
 {
@@ -227,6 +332,7 @@ int ace_get_stat(void *uout)
 	st.mod_drop = (uint64_t)atomic64_read(&g_ace_mod_drop);
 	st.ksym_drop = (uint64_t)atomic64_read(&g_ace_ksym_drop);
 	st.tracerp_hide = (uint64_t)atomic64_read(&g_ace_tp_hide);
+	st.fs_drop = (uint64_t)atomic64_read(&g_ace_fs_drop);
 	memcpy(uout, &st, sizeof(st));
 	return 0;
 }
@@ -244,6 +350,15 @@ int ace_init(void)
 	r = register_kretprobe(&ace_ksym_krp);
 	if (r)
 		pr_warn(ACE_PFX "kallsyms_expand_symbol probe failed: %d\n", r);
+	r = register_kprobe(&ace_open_kp);
+	if (r)
+		pr_warn(ACE_PFX "do_sys_openat2 probe failed: %d\n", r);
+	r = register_kprobe(&ace_faccess_kp);
+	if (r)
+		pr_warn(ACE_PFX "do_faccessat probe failed: %d\n", r);
+	r = register_kprobe(&ace_statx_kp);
+	if (r)
+		pr_warn(ACE_PFX "vfs_statx probe failed: %d\n", r);
 	r = register_kprobe(&ace_status_kp);
 	if (r)
 		pr_warn(ACE_PFX "proc_pid_status probe failed: %d\n", r);
@@ -257,6 +372,9 @@ int ace_init(void)
 void ace_exit(void)
 {
 	unregister_kretprobe(&ace_status_krp);
+	unregister_kprobe(&ace_statx_kp);
+	unregister_kprobe(&ace_faccess_kp);
+	unregister_kprobe(&ace_open_kp);
 	unregister_kprobe(&ace_status_kp);
 	unregister_kretprobe(&ace_ksym_krp);
 	unregister_kprobe(&ace_mods_kp);
