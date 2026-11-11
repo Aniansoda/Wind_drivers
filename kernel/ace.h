@@ -9,5 +9,6 @@ int  ace_set_pid(uint32_t tgid);
 int  ace_clear_pid(void);
 int  ace_get_stat(void *uout);
 int  ace_set_verbose(int on);
+int  ace_inte_takeover(int remove_only);
 
 #endif

