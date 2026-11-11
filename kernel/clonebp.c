@@ -26,6 +26,8 @@
 #include <asm/tlbflush.h>
 #include <asm/ptrace.h>
 #include <asm/insn.h>
+#include <linux/random.h>
+#include <linux/ktime.h>
 
 #include "clonebp.h"
 
@@ -130,10 +132,86 @@ static struct page *cb_clone_page(struct page *orig, u32 offset, u32 imm, const 
 #define CLONEBP_STATE_BAILOUT 2
 #define CLONEBP_BAILOUT_MAX   16
 
+/* ---- 时序对抗: 异常路径耗时归一化, 消除「读执行交替」可测量方差 ----
+ * 反作弊常对同页做 N 次读/执行交替并统计耗时与方差:
+ *   原始页访问 ~ns 级, 每次切页 ~us 级, 均值与方差都显著偏离。
+ * BALANCE 把单次异常路径补到固定 target_ns, 方差压平;
+ * JITTER 叠加均匀抖动, 让分布伪装成 cache miss 而非恒定异常。
+ * bailout_max 同时下调可让检测方连打几十次就读到静默页(放弃 hook 保命)。
+ */
+#define CB_TM_BALANCE   1
+#define CB_TM_JITTER    2
+#define CB_TM_PAD_MAX   200000U
+
+struct cb_timing {
+	u32 mode;
+	u32 target_ns;
+	u32 jitter_ns;
+	u32 bailout_max;
+	atomic64_t cost_ns;
+	atomic64_t pad_ns;
+	atomic64_t evt_cnt;
+};
+
+static struct cb_timing g_cb_tm = {
+	.mode = 0,
+	.target_ns = 0,
+	.jitter_ns = 0,
+	.bailout_max = CLONEBP_BAILOUT_MAX,
+	.cost_ns = ATOMIC64_INIT(0),
+	.pad_ns = ATOMIC64_INIT(0),
+	.evt_cnt = ATOMIC64_INIT(0),
+};
+
+static inline u64 cb_tm_begin(void)
+{
+	if (!READ_ONCE(g_cb_tm.mode))
+		return 0;
+	return ktime_get_mono_fast_ns();
+}
+
+static inline void cb_tm_end(u64 t0)
+{
+	u32 mode = READ_ONCE(g_cb_tm.mode);
+	u64 cost, pad = 0;
+
+	if (!mode || !t0)
+		return;
+	cost = ktime_get_mono_fast_ns() - t0;
+	atomic64_add(cost, &g_cb_tm.cost_ns);
+	atomic64_inc(&g_cb_tm.evt_cnt);
+	if (mode & CB_TM_BALANCE) {
+		u64 target = READ_ONCE(g_cb_tm.target_ns);
+
+		if (target > cost)
+			pad = target - cost;
+	}
+	if (mode & CB_TM_JITTER) {
+		u32 span = READ_ONCE(g_cb_tm.jitter_ns);
+
+		if (span)
+			pad += prandom_u32() % span;
+	}
+	if (pad) {
+		if (pad > CB_TM_PAD_MAX)
+			pad = CB_TM_PAD_MAX;
+		ndelay((unsigned long)pad);
+		atomic64_add(pad, &g_cb_tm.pad_ns);
+	}
+}
+
+
 /* 同页自读会让「切原页->重试读->取指 UXN 切影子->重试读」形成无限异常环,
  * 参考态实测会拖垮内核。这里按页计数, 超阈值就放宽成可读可执行的原始页,
  * hook 失效但系统存活。 */
 static atomic_t cb_bailout_cnt[CLONEBP_MAX_PAGES];
+static void cb_flush_va_local(unsigned long va)
+{
+	dsb(ishst);
+	__tlbi(vae1is, va >> PAGE_SHIFT);
+	dsb(ish);
+	isb();
+}
 static void flush_tlb_page_range_local(struct mm_struct *mm, unsigned long va);
 static int cb_page_index(struct clonebp_page *cp);
 static int cb_try_bailout(struct clonebp_page *cp);
@@ -198,13 +276,13 @@ static void flush_tlb_page_range_local(struct mm_struct *mm, unsigned long va)
 	preempt_disable();
 	cpu = smp_processor_id();
 	if (mm_cpumask(mm) && cpumask_test_cpu(cpu, mm_cpumask(mm)))
-		local_flush_tlb_page(va);
+		cb_flush_va_local(va);
 	preempt_enable();
 }
 
 static int cb_page_index(struct clonebp_page *cp)
 {
-	if (!cp || !g_cb_pages)
+	if (!cp)
 		return -1;
 	if (cp < g_cb_pages || cp >= g_cb_pages + CLONEBP_MAX_PAGES)
 		return -1;
@@ -218,7 +296,7 @@ static int cb_try_bailout(struct clonebp_page *cp)
 
 	if (idx < 0)
 		return 0;
-	if (atomic_inc_return(&cb_bailout_cnt[idx]) < CLONEBP_BAILOUT_MAX)
+	if (atomic_inc_return(&cb_bailout_cnt[idx]) < (int)g_cb_tm.bailout_max)
 		return 0;
 	cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_BAILOUT);
 	cb_stat_inc(CLONEBP_ST_BRK_HIT);
@@ -268,13 +346,12 @@ static inline int cb_esr_is_dabt(unsigned int esr)
 }
 
 /* do_mem_abort pre_handler: 双向切页后放行异常返回, 由 CPU 重试 */
-static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
+static int cb_mem_abort_do(struct pt_regs *regs)
 {
 	unsigned long addr = regs->regs[0];       /* x0 = far */
 	unsigned int esr = (unsigned int)regs->regs[1];
 	struct clonebp_page *cp;
 
-	(void)kpr;
 	if (!g_cb_mm || g_cb_point_cnt == 0)
 		return 0;
 
@@ -309,8 +386,20 @@ static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
 	return 0;
 }
 
+static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
+{
+	int ret;
+	u64 t0 = cb_tm_begin();
+
+	(void)kpr;
+	ret = cb_mem_abort_do(regs);
+	cb_tm_end(t0);
+	return ret;
+}
+
+
 /* brk_handler pre_handler: 影子页 BRK 命中 -> 记录/改写 -> 跳过 SIGTRAP */
-static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
+static int cb_brk_do(struct pt_regs *regs)
 {
 	struct clonebp_point *pt;
 	uint64_t pc = regs->pc;
@@ -318,7 +407,6 @@ static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
 	u32 imm;
 	int i;
 
-	(void)kpr;
 	if (!g_cb_point_cnt)
 		return 0;
 
@@ -361,6 +449,18 @@ static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
 	}
 	return 0;
 }
+
+static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
+{
+	int ret;
+	u64 t0 = cb_tm_begin();
+
+	(void)kpr;
+	ret = cb_brk_do(regs);
+	cb_tm_end(t0);
+	return ret;
+}
+
 
 
 /* mprotect 会按 VMA 重建 PTE。若此刻挂的是影子页, 新 PTE 会保留影子 PFN
@@ -832,6 +932,40 @@ int clonebp_get_config(void *uout)
 	cfg.clone_ok = (uint64_t)atomic64_read(&g_cb_stat[CLONEBP_ST_CLONE_OK]);
 	cfg.clone_fail = (uint64_t)atomic64_read(&g_cb_stat[CLONEBP_ST_CLONE_FAIL]);
 	memcpy(uout, &cfg, sizeof(cfg));
+	return 0;
+}
+
+int clonebp_set_timing(CLONEBP_TIMING_CONFIG *cfg)
+{
+	if (!cfg)
+		return -EINVAL;
+	if (cfg->mode == 0xFFFFFFFFU)   /* 只读哨兵: 不改配置 */
+		return 0;
+	if (cfg->mode & ~(CB_TM_BALANCE | CB_TM_JITTER))
+		return -EINVAL;
+	if (cfg->target_ns > CB_TM_PAD_MAX || cfg->jitter_ns > CB_TM_PAD_MAX)
+		return -EINVAL;
+	if (cfg->bailout_max == 0 || cfg->bailout_max > 4096)
+		return -EINVAL;
+	WRITE_ONCE(g_cb_tm.target_ns, cfg->target_ns);
+	WRITE_ONCE(g_cb_tm.jitter_ns, cfg->jitter_ns);
+	WRITE_ONCE(g_cb_tm.bailout_max, cfg->bailout_max);
+	WRITE_ONCE(g_cb_tm.mode, cfg->mode);
+	return 0;
+}
+
+int clonebp_get_timing(CLONEBP_TIMING_CONFIG *cfg)
+{
+	if (!cfg)
+		return -EINVAL;
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->mode = READ_ONCE(g_cb_tm.mode);
+	cfg->target_ns = READ_ONCE(g_cb_tm.target_ns);
+	cfg->jitter_ns = READ_ONCE(g_cb_tm.jitter_ns);
+	cfg->bailout_max = READ_ONCE(g_cb_tm.bailout_max);
+	cfg->cost_ns = (uint64_t)atomic64_read(&g_cb_tm.cost_ns);
+	cfg->pad_ns = (uint64_t)atomic64_read(&g_cb_tm.pad_ns);
+	cfg->evt_cnt = (uint64_t)atomic64_read(&g_cb_tm.evt_cnt);
 	return 0;
 }
 

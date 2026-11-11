@@ -110,6 +110,7 @@ enum OPERATIONS
 	OP_CLONEBP_SET_RECORD   = WIND_OP_BASE + 0x44, /* 改单点改写配置 */
 	OP_CLONEBP_CLEAR_RECORDS= WIND_OP_BASE + 0x45, /* 清记录 (-1 全部) */
 	OP_CLONEBP_REFRESH      = WIND_OP_BASE + 0x46, /* 重新克隆影子页(页被重映射后自愈) */
+	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47, /* 时序对抗: 耗时归一化/抖动/兜底阈值 */
 };
 
 /* ---- 读取模式 ---- */
@@ -565,6 +566,20 @@ typedef struct _WIND_NL_MSG
 /* ---- 克隆页断点协议 ---- */
 #define CLONEBP_MAX_POINTS   32
 #define CLONEBP_RECORD_MAX   256
+
+/* ---- 克隆页时序对抗配置 (读写同一结构: 写入 mode/target/jitter/bailout, 回读统计) ---- */
+typedef struct _CLONEBP_TIMING_CONFIG
+{
+	uint32_t mode;          /* bit0=BALANCE bit1=JITTER; 0xFFFFFFFF 表示只读 */
+	uint32_t target_ns;     /* BALANCE 目标单次异常耗时 (ns), 上限 200000 */
+	uint32_t jitter_ns;     /* JITTER 均匀抖动上限 (ns) */
+	uint32_t bailout_max;   /* 同页连续异常达到该次数就放宽为静默页 (1~4096) */
+	uint64_t cost_ns;       /* 出参: 累计异常处理耗时 */
+	uint64_t pad_ns;        /* 出参: 累计补齐耗时 */
+	uint64_t evt_cnt;       /* 出参: 累计异常事件数 */
+	uint32_t reserved[2];
+} CLONEBP_TIMING_CONFIG, *PCLONEBP_TIMING_CONFIG;
+
 #define CLONEBP_MAX_PAGES    64
 #define CLONEBP_PATCH_MAX    16
 #define CLONEBP_REG_MAX      8

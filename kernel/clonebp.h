@@ -62,6 +62,8 @@ int  clonebp_remove_all(struct mm_struct *mm);
 int  clonebp_clear_records(struct mm_struct *mm, int32_t point_index);
 int  clonebp_refresh(struct mm_struct *mm);
 int  clonebp_get_config(void *uout);
+int  clonebp_set_timing(CLONEBP_TIMING_CONFIG *cfg);
+int  clonebp_get_timing(CLONEBP_TIMING_CONFIG *cfg);
 int  clonebp_get_records(uint32_t point_index, uint32_t start,
 			 CLONEBP_RECORD *recs, uint32_t cap, uint32_t *count_out);
 

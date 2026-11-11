@@ -634,6 +634,20 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return clonebp_clear_records(NULL, (int32_t)arg);
 	case OP_CLONEBP_REFRESH:
 		return clonebp_refresh(NULL);
+	case OP_CLONEBP_TIMING:
+	{
+		CLONEBP_TIMING_CONFIG in, out;
+
+		if (copy_from_user(&in, (void __user *)arg, sizeof(in)))
+			return -EFAULT;
+		if (clonebp_set_timing(&in) != 0)
+			return -EINVAL;
+		if (clonebp_get_timing(&out) != 0)
+			return -EINVAL;
+		if (copy_to_user((void __user *)arg, &out, sizeof(out)))
+			return -EFAULT;
+		return 0;
+	}
 
 	case OP_BP_ALL_OFF:
 		return bp_all_off();
