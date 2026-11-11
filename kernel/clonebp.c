@@ -26,8 +26,8 @@
 #include <asm/tlbflush.h>
 #include <asm/ptrace.h>
 #include <asm/insn.h>
-#include <linux/random.h>
 #include <linux/ktime.h>
+#include <linux/prandom.h>
 
 #include "clonebp.h"
 
