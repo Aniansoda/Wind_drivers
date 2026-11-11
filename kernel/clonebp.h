@@ -2,44 +2,22 @@
 #define _CLONEBP_H_
 
 #include <linux/types.h>
+#include "comm.h"   /* 协议常量 / 结构 / 统计索引统一来自 comm.h */
 
 /*
  * 克隆页断点 (Clone-Page Breakpoint)
- * 同一虚拟地址挂两张物理页:
- *   原始页: PTE_USER | PTE_RDONLY | PTE_UXN  -> 用户读取看到干净指令, 但不可执行
- *   影子页: 用户态不可读, 可执行           -> CPU 取指走这里, 内含 BRK 补丁
- * 读内存 -> Data Abort -> 切原始页; 执行 -> Instruction Abort -> 切影子页。
- * 不占 BRP/WRP 硬件断点寄存器, 不改原始页内容, 不限点数。
+ * 同 VA 双物理页:
+ *   原始页 PTE_USER|PTE_RDONLY|PTE_UXN -> 用户读看到干净指令, 不可执行
+ *   影子页 无 PTE_USER, 可执行        -> CPU 取指走这里, 内含 BRK
+ * 读 -> Data Abort -> 切原始页; 执行 -> Instruction Abort -> 切影子页。
+ * 不占 BRP/WRP 寄存器, 不改原始页字节。
  */
 
-#define CLONEBP_MAX_POINTS      32
-#define CLONEBP_RECORD_MAX      256
-#define CLONEBP_MAX_PAGES       64
-#define CLONEBP_PATCH_MAX       16
-#define CLONEBP_REG_MAX         8
-#define CLONEBP_BRK_IMM_BASE    0x1000
-
-/* 命中后动作 */
-#define CLONEBP_MODE_LOG        0
-#define CLONEBP_MODE_REWRITE    1
-
-/* flags */
-#define CLONEBP_F_ONESHOT       0x1
-#define CLONEBP_F_KEEP_ORIG     0x2
-#define CLONEBP_F_NO_FLUSH      0x4
-
-/* 故障统计索引 */
-enum CLONEBP_STAT {
-	CLONEBP_ST_IFAULT_IN  = 0,  /* 执行命中原始页 -> 切影子 */
-	CLONEBP_ST_DFAULT_IN  = 1,  /* 读命中影子页 -> 切原始 */
-	CLONEBP_ST_BRK_HIT    = 2,  /* 影子页 BRK 命中 */
-	CLONEBP_ST_TLB_FLUSH  = 3,
-	CLONEBP_ST_CLONE_OK   = 4,
-	CLONEBP_ST_CLONE_FAIL = 5,
-	CLONEBP_ST_MAX        = 6,
-};
-
 #ifdef __KERNEL__
+
+#include <linux/mm.h>        /* pte_t / struct page / struct mm_struct 前置声明 */
+#include <linux/spinlock.h>  /* spinlock_t */
+#include <linux/sched.h>     /* struct task_struct */
 
 struct task_struct;
 struct mm_struct;

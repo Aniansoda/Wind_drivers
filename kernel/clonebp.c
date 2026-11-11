@@ -18,6 +18,8 @@
 #include <linux/delay.h>
 #include <linux/kprobes.h>
 #include <linux/kallsyms.h>
+#include <linux/pid.h>
+#include <linux/pgtable.h>
 #include <linux/version.h>
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -26,6 +28,14 @@
 #include <asm/insn.h>
 
 #include "clonebp.h"
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0))
+#define cb_kmap(pg)      kmap_atomic(pg)
+#define cb_kunmap(pg)    kunmap_atomic(pg)
+#else
+#define cb_kmap(pg)      kmap_local_page(pg)
+#define cb_kunmap(pg)    kunmap_local(pg)
+#endif
 
 #define CB_MAX_PAGES_TOTAL  CLONEBP_MAX_PAGES
 
@@ -92,8 +102,8 @@ static struct page *cb_clone_page(struct page *orig, u32 offset, u32 imm, const 
 	if (!shadow)
 		return NULL;
 
-	dst = kmap_local_page(shadow);
-	src = kmap_local_page(orig);
+	dst = cb_kmap(shadow);
+	src = cb_kmap(orig);
 	memcpy(dst, src, PAGE_SIZE);
 
 	/* 在 shadow 页的目标偏移处写入 BRK #imm (ARM64: 0xD4200000 | imm<<5) */
@@ -103,8 +113,8 @@ static struct page *cb_clone_page(struct page *orig, u32 offset, u32 imm, const 
 		u32 insn = 0xD4200000u | ((imm & 0xFFFF) << 5);
 		memcpy((u8 *)dst + offset, &insn, 4);
 	}
-	kunmap_local(src);
-	kunmap_local(dst);
+	cb_kunmap(src);
+	cb_kunmap(dst);
 	cb_stat_inc(CLONEBP_ST_CLONE_OK);
 	return shadow;
 }
