@@ -14,6 +14,7 @@
 #include <asm/page.h>
 #include <asm/sysreg.h>
 #include "comm.h"
+#include "ace.h"
 #include "memory.h"
 #include "process.h"
 #include "breakpoint.h"
@@ -634,6 +635,18 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return clonebp_clear_records(NULL, (int32_t)arg);
 	case OP_CLONEBP_REFRESH:
 		return clonebp_refresh(NULL);
+	case OP_ACE_SET:
+		return ace_set_pid((uint32_t)arg);
+	case OP_ACE_GET_STAT:
+	{
+		ACE_STAT st;
+
+		if (ace_get_stat(&st) != 0)
+			return -EINVAL;
+		if (copy_to_user((void __user *)arg, &st, sizeof(st)) != 0)
+			return -EFAULT;
+		return 0;
+	}
 	case OP_CLONEBP_TIMING:
 	{
 		CLONEBP_TIMING_CONFIG in, out;
@@ -1032,6 +1045,8 @@ static int __init driver_entry(void)
 	 * 连 netlink 通道一起没了, 用户态永远连不上。 */
 	if (transport == 0) {
 		printk(KERN_INFO "wind: transport=0, 只做符号解析, 不建通道\n");
+		if (ace_init() != 0)
+			pr_warn("[wind] ace init failed\n");
 		if (clonebp_module_init() != 0)
 		pr_err("[wind] clonebp init failed\n");
 	return 0;
@@ -1078,6 +1093,7 @@ static int __init driver_entry(void)
 
 static void __exit driver_unload(void)
 {
+	ace_exit();
 	clonebp_module_exit();
 
 	printk("[+] wind driver_unload");

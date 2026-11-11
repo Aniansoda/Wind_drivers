@@ -111,6 +111,8 @@ enum OPERATIONS
 	OP_CLONEBP_CLEAR_RECORDS= WIND_OP_BASE + 0x45, /* 清记录 (-1 全部) */
 	OP_CLONEBP_REFRESH      = WIND_OP_BASE + 0x46, /* 重新克隆影子页(页被重映射后自愈) */
 	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47, /* 时序对抗: 耗时归一化/抖动/兜底阈值 */
+	OP_ACE_SET              = WIND_OP_BASE + 0x50, /* 设 ACE 目标 tgid */
+	OP_ACE_GET_STAT         = WIND_OP_BASE + 0x51, /* 读 ACE 伪装命中计数 */
 };
 
 /* ---- 读取模式 ---- */
@@ -653,5 +655,16 @@ typedef struct _CLONEBP_RECORDS_REQUEST
 	CLONEBP_RECORD *records;
 	uint32_t *count_out;
 } CLONEBP_RECORDS_REQUEST, *PCLONEBP_RECORDS_REQUEST;
+
+/* ---- 反 ACE 检测: 伪装命中统计 ---- */
+typedef struct _ACE_STAT
+{
+	uint32_t tgid;
+	uint32_t reserved;
+	uint64_t maps_drop;      /* maps 被滤掉的行数 */
+	uint64_t mod_drop;       /* /proc/modules 被滤掉的行数 */
+	uint64_t ksym_drop;      /* kallsyms 被清空的符号数 */
+	uint64_t tracerp_hide;   /* TracerPid 被清零的次数 */
+} ACE_STAT, *PACE_STAT;
 
 #endif /* _COMM_H_ */

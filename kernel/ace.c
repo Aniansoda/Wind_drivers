@@ -1,0 +1,266 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/kprobes.h>
+#include <linux/sched.h>
+#include <linux/percpu.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/seq_file.h>
+#include <linux/pid.h>
+#include <linux/list.h>
+#include <linux/ptrace.h>
+#include <linux/uaccess.h>
+#include <linux/version.h>
+
+#include "ace.h"
+#include "comm.h"
+
+#define ACE_PFX "[wind-ace] "
+
+static uint32_t g_ace_tgid;
+static atomic64_t g_ace_maps_drop;
+static atomic64_t g_ace_mod_drop;
+static atomic64_t g_ace_ksym_drop;
+static atomic64_t g_ace_tp_hide;
+
+static const char *const ace_deny[] = {
+	"libwind", "wind.ko", "keep.sh", "libkeep",
+	"gadget", "libfrida", "frida-agent", "substrate",
+	"xposed", "lsposed", "riru", "zygisk",
+	"dobby", "shadowhook", "whale", "sandhook",
+	"libmem", "gameguardian",
+};
+
+static bool ace_deny_name(const char *p)
+{
+	int i;
+
+	if (!p || !*p)
+		return false;
+	for (i = 0; i < (int)ARRAY_SIZE(ace_deny); ++i)
+		if (strstr(p, ace_deny[i]))
+			return true;
+	return false;
+}
+
+static inline bool ace_is_target(pid_t tgid)
+{
+	uint32_t t = READ_ONCE(g_ace_tgid);
+
+	return t && tgid > 0 && (uint32_t)tgid == t;
+}
+
+static inline bool ace_cur_is_target(void)
+{
+	return ace_is_target(current->tgid);
+}
+
+/* ---- B1/B2/B3: /proc/<pid>/maps 行级过滤 ---- */
+
+static noinline int ace_maps_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
+	char *buf, *p;
+	bool deny;
+
+	(void)kp;
+	if (!vma)
+		return 0;
+	if (!vma->vm_file)
+		return 0;
+	if (!ace_cur_is_target())
+		return 0;
+	buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+	if (!buf)
+		return 0;
+	p = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
+	deny = !IS_ERR(p) && ace_deny_name(p);
+	kfree(buf);
+	if (!deny)
+		return 0;
+	atomic64_inc(&g_ace_maps_drop);
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static struct kprobe ace_maps_kp = {
+	.symbol_name = "show_map_vma",
+	.pre_handler = ace_maps_pre,
+};
+
+/* ---- D1: /proc/modules 行级过滤 ---- */
+
+static noinline int ace_mods_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct module *mod = (struct module *)regs->regs[1];
+
+	(void)kp;
+	if (!mod || !mod->name)
+		return 0;
+	if (!ace_cur_is_target())
+		return 0;
+	if (!ace_deny_name(mod->name))
+		return 0;
+	atomic64_inc(&g_ace_mod_drop);
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static struct kprobe ace_mods_kp = {
+	.symbol_name = "m_show",
+	.pre_handler = ace_mods_pre,
+};
+
+/* ---- D2: /proc/kallsyms 符号名清除 ----
+ * kallsyms_expand_symbol(off, result[, maxlen]) 的 result 是输出缓冲,
+ * 在 kretprobe 里清空即可让该行显示为空名。
+ * 权衡: 空名行比留 wind_* 安全, 逐行解析 kallsyms 的代价 ACE 通常不付。
+ */
+
+static noinline int ace_ksym_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	char *r;
+
+	(void)ri;
+	if (!READ_ONCE(g_ace_tgid))
+		return 0;
+	r = (char *)regs->regs[1];
+	if (!r || !*r)
+		return 0;
+	if (!ace_deny_name(r))
+		return 0;
+	r[0] = '\0';
+	atomic64_inc(&g_ace_ksym_drop);
+	return 0;
+}
+
+static struct kretprobe ace_ksym_krp = {
+	.kp.symbol_name = "kallsyms_expand_symbol",
+	.handler = ace_ksym_ret,
+	.maxactive = 32,
+};
+
+/* ---- C1: TracerPid 清零 ----
+ * proc_pid_status 的 task 参数在 5.10~6.18 都是第 4 个 (regs[3])。
+ * pre 清 task->ptrace, kretprobe 恢复; 保存到 per-CPU 避免并发串台。
+ */
+
+struct ace_tp_slot {
+	struct task_struct *task;
+	unsigned int ptrace;
+};
+
+static DEFINE_PER_CPU(struct ace_tp_slot, ace_tp_slot);
+
+static noinline int ace_status_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct task_struct *task = (struct task_struct *)regs->regs[3];
+	struct ace_tp_slot *s = this_cpu_ptr(&ace_tp_slot);
+
+	(void)kp;
+	s->task = NULL;
+	if (!task)
+		return 0;
+	if (!ace_is_target(task->tgid))
+		return 0;
+	if (!task->ptrace)
+		return 0;
+	s->task = task;
+	s->ptrace = task->ptrace;
+	task->ptrace = 0;
+	atomic64_inc(&g_ace_tp_hide);
+	return 0;
+}
+
+static noinline int ace_status_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct ace_tp_slot *s = this_cpu_ptr(&ace_tp_slot);
+
+	(void)ri;
+	(void)regs;
+	if (!s->task)
+		return 0;
+	s->task->ptrace = s->ptrace;
+	s->task = NULL;
+	return 0;
+}
+
+static struct kprobe ace_status_kp = {
+	.symbol_name = "proc_pid_status",
+	.pre_handler = ace_status_pre,
+};
+
+static struct kretprobe ace_status_krp = {
+	.kp.symbol_name = "proc_pid_status",
+	.handler = ace_status_ret,
+	.maxactive = 32,
+};
+
+/* ---- 对外接口 ---- */
+
+int ace_set_pid(uint32_t tgid)
+{
+	if (!tgid)
+		return -EINVAL;
+	WRITE_ONCE(g_ace_tgid, tgid);
+	pr_info(ACE_PFX "target tgid=%u\n", tgid);
+	return 0;
+}
+
+int ace_clear_pid(void)
+{
+	WRITE_ONCE(g_ace_tgid, 0);
+	return 0;
+}
+
+int ace_get_stat(void *uout)
+{
+	ACE_STAT st;
+
+	if (!uout)
+		return -EINVAL;
+	memset(&st, 0, sizeof(st));
+	st.tgid = READ_ONCE(g_ace_tgid);
+	st.maps_drop = (uint64_t)atomic64_read(&g_ace_maps_drop);
+	st.mod_drop = (uint64_t)atomic64_read(&g_ace_mod_drop);
+	st.ksym_drop = (uint64_t)atomic64_read(&g_ace_ksym_drop);
+	st.tracerp_hide = (uint64_t)atomic64_read(&g_ace_tp_hide);
+	memcpy(uout, &st, sizeof(st));
+	return 0;
+}
+
+int ace_init(void)
+{
+	int r;
+
+	r = register_kprobe(&ace_maps_kp);
+	if (r)
+		pr_warn(ACE_PFX "show_map_vma probe failed: %d\n", r);
+	r = register_kprobe(&ace_mods_kp);
+	if (r)
+		pr_warn(ACE_PFX "m_show probe failed: %d\n", r);
+	r = register_kretprobe(&ace_ksym_krp);
+	if (r)
+		pr_warn(ACE_PFX "kallsyms_expand_symbol probe failed: %d\n", r);
+	r = register_kprobe(&ace_status_kp);
+	if (r)
+		pr_warn(ACE_PFX "proc_pid_status probe failed: %d\n", r);
+	r = register_kretprobe(&ace_status_krp);
+	if (r)
+		pr_warn(ACE_PFX "proc_pid_status retprobe failed: %d\n", r);
+	pr_info(ACE_PFX "ready\n");
+	return 0;
+}
+
+void ace_exit(void)
+{
+	unregister_kretprobe(&ace_status_krp);
+	unregister_kprobe(&ace_status_kp);
+	unregister_kretprobe(&ace_ksym_krp);
+	unregister_kprobe(&ace_mods_kp);
+	unregister_kprobe(&ace_maps_kp);
+	WRITE_ONCE(g_ace_tgid, 0);
+	pr_info(ACE_PFX "gone\n");
+}
