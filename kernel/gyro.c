@@ -655,15 +655,17 @@ static int gyro_bind(struct task_struct *task)
 /* ===================================================================
  * 安装 hook: 解析符号 -> 找基址 -> 设执行断点。
  * =================================================================== */
-/* 陀螺仪通道总开关。默认关。
- * 它既要占 arm64 仅有的 4 个硬件断点寄存器, 又和 WRP 追踪点抢同一批,
- * 抢不到就让 wrpbp_set 返回 -EBUSY, 表现成"自瞄完全没反应";
- * 抢过头的另一边则整机每秒几万次异常, 卡死重启。
- * 自瞄现在统一走断点写回, 这条路默认不启用。
+/* 陀螺仪通道总开关。默认开。
+ * 主路走 Paradise 那套: 挂 system_server 的 __arm64_sys_recvmsg,
+ * 直接改 ASensorEvent 里陀螺仪记录的 data[0]/data[1], 下游客户端拿到的
+ * 就是改过的值。这条路不占 arm64 的 4 个硬件断点寄存器, 也不依赖
+ * sendObjects 命中, 所以和 WRP 追踪点不冲突。
+ * 只有主路挂不上、回落到执行断点时才占寄存器 —— 那时 wrpbp_set 会回
+ * -EBUSY, 日志里看得见。insmod wind.ko wind_gyro=0 可整体关掉。
  */
-bool g_wind_gyro_enable = false;
+bool g_wind_gyro_enable = true;
 module_param_named(wind_gyro, g_wind_gyro_enable, bool, 0444);
-MODULE_PARM_DESC(wind_gyro, "陀螺仪改写通道, 0=关闭(默认, 自瞄走断点写回)");
+MODULE_PARM_DESC(wind_gyro, "陀螺仪改写通道, 1=开(默认, Paradise 同路 socket 改写)");
 
 int gyro_install(pid_t pid)
 {
@@ -672,7 +674,7 @@ int gyro_install(pid_t pid)
 
 	if (!g_wind_gyro_enable)
 	{
-		printk(KERN_INFO "gyro: 通道已关闭 (wind_gyro=0), 自瞄走断点写回\n");
+		printk(KERN_INFO "gyro: 通道已关闭 (wind_gyro=0)\n");
 		return -EOPNOTSUPP;
 	}
 	if (gyro_active)

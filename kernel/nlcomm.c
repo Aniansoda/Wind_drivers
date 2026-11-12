@@ -94,7 +94,10 @@ static void wind_nl_input(struct sk_buff *skb)
 
 	/* op 白名单: 只接受本驱动定义的操作码区间, 其它一律丢弃不回包,
 	 * 避免任何意外输入被 dispatch 当成合法 cmd 深解引用。 */
-	if (req->op < WIND_OP_BASE + 0x01 || req->op > WIND_OP_BASE + 0x3F)
+	/* 上界原来是 0x3F, 但 OP_WRPBP_SET_FREGS 是 0x56 —— 落在区间外,
+	 * 请求被静默丢掉, 用户态只能等到 recv 超时, 看起来像 err=-1。
+	 * 按 comm.h 实际用到的最大 opcode 放宽。 */
+	if (req->op <= WIND_OP_BASE || req->op > WIND_OP_BASE + 0xFF)
 		return;
 
 	/* 在发送进程上下文里跑, arg 是用户指针, dispatch 里自己 copy_from/to_user */
