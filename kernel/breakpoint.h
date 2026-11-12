@@ -58,6 +58,11 @@ int brkbp_clear_records(int32_t point_index);
 int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 	      size_t point_count);
 int wrpbp_set_vec(int32_t point_index, u32 enable, u32 x, u32 y, u32 z, u32 mask);
+/* 浮点寄存器写回总开关 (clonebp / wrpbp 共用)。
+ * insmod wind.ko wind_fp_writeback=0 可整体关掉。
+ */
+extern bool g_wind_fp_writeback;
+
 int wrpbp_set_fregs(int32_t point_index, u32 freg_base, u32 freg_mask,
 		     const u32 *vals, u32 count);
 int wrpbp_get_config(WRPBP_CONFIG *out);

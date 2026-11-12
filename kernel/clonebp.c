@@ -30,6 +30,9 @@
 #include <asm/fpsimd.h>
 #include "sym.h"   /* wind_fpsimd_preserve_current_state */
 
+/* 定义在 breakpoint.c, 两边共用同一个开关 */
+extern bool g_wind_fp_writeback;
+
 #include "clonebp.h"
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0))
@@ -464,10 +467,20 @@ static int cb_brk_do(struct pt_regs *regs)
 			 * 再置 TIF_FOREIGN_FPSTATE 让返回用户态时按内存重载。
 			 * 只改内存不置标志 = 改了一份没人读的副本,
 			 * 表现就是"断点命中了但弹道没变"。 */
-			if (pt->freg_mask) {
+			if (pt->freg_mask && g_wind_fp_writeback) {
 				unsigned long fl;
+				bool ok = true;
 
-				if (wind_fpsimd_preserve_current_state()) {
+				/* 先关抢占: fpsimd_preserve_current_state 里有
+				 * WARN_ON(preemptible()), Android 默认 panic_on_warn,
+				 * 触发一次就是直接重启。
+				 */
+				preempt_disable();
+				/* 硬件里还是活值才需要落盘; 已经是 FOREIGN 说明内存就是准的 */
+				if (!test_thread_flag(TIF_FOREIGN_FPSTATE))
+					ok = wind_fpsimd_preserve_current_state();
+
+				if (ok) {
 					local_irq_save(fl);
 					for (k = 0; k < CLONEBP_FREG_MAX; ++k) {
 						int rn;
@@ -492,6 +505,7 @@ static int cb_brk_do(struct pt_regs *regs)
 					       "浮点写回不会生效 (freg_mask=0x%x)\n",
 					       pt->freg_mask);
 				}
+				preempt_enable();
 			}
 		}
 		if (pt->flags & CLONEBP_F_ONESHOT)

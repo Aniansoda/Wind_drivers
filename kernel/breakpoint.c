@@ -21,6 +21,7 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/err.h>
@@ -1336,6 +1337,14 @@ out:
  *   先 preserve 把硬件状态落到 thread.uw.fpsimd_state,
  *   再改 vregs[n] 低 32 位, 最后置 TIF_FOREIGN_FPSTATE 让返回用户态时重载。
  */
+/* 浮点写回总开关, 默认开。insmod wind.ko wind_fp_writeback=0 可整体关掉,
+ * 用来区分"崩在浮点写回"还是"崩在别处"。
+ */
+bool g_wind_fp_writeback = true;
+module_param_named(wind_fp_writeback, g_wind_fp_writeback, bool, 0644);
+MODULE_PARM_DESC(wind_fp_writeback,
+		 "浮点寄存器写回总开关, 0=只用内存改写 (默认 1)");
+
 static void wrpbp_apply_fregs(int slot)
 {
 	struct wrpbp_vecmod *v = &wrpbp_vec[slot];
@@ -1348,8 +1357,22 @@ static void wrpbp_apply_fregs(int slot)
 	 * 把 S3/S4/S5 一次性清零。 */
 	if (!v->freg_mask)
 		return;
-	if (!wind_fpsimd_preserve_current_state())
+	if (!g_wind_fp_writeback)
 		return;
+
+	/* 这一段是 perf 溢出回调里跑的。fpsimd_preserve_current_state() 内部
+	 * 有 WARN_ON(preemptible()), Android 默认 panic_on_warn, 一命中就重启。
+	 * 先把抢占关掉再进, 并把整个写回序列包在同一段里。
+	 */
+	preempt_disable();
+	if (!test_thread_flag(TIF_FOREIGN_FPSTATE)) {
+		/* 硬件里的活值还没落盘, 先存一次, 否则下面置 FOREIGN 后
+		 * 返回用户态会用一份旧内存覆盖全部寄存器。 */
+		if (!wind_fpsimd_preserve_current_state()) {
+			preempt_enable();
+			return;
+		}
+	}
 
 	local_irq_save(fl);
 	for (k = 0; k < CLONEBP_FREG_MAX; ++k) {
@@ -1366,6 +1389,7 @@ static void wrpbp_apply_fregs(int slot)
 	}
 	set_thread_flag(TIF_FOREIGN_FPSTATE);
 	local_irq_restore(fl);
+	preempt_enable();
 }
 
 static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
