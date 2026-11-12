@@ -15,6 +15,7 @@
 #include <asm/sysreg.h>
 #include "comm.h"
 #include "ace.h"
+#include "windcfg.h"
 #include "memory.h"
 #include "process.h"
 #include "breakpoint.h"
@@ -280,6 +281,9 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 	case OP_KGSL_HOOK:
 		return kgsl_hook_install();
 	case OP_GYRO_INSTALL:
+		/* 刷入器装了 gyro=0: 陀螺仪控制整体关闭, 用户态再调也不放行 */
+		if (!windcfg_gyro_on())
+			return -EOPNOTSUPP;
 		return gyro_install((pid_t)arg);
 	case OP_GYRO_REMOVE:
 		gyro_remove();
@@ -1072,6 +1076,10 @@ static int __init driver_entry(void)
 	if (ret)
 		return ret;
 
+	/* 刷入器配置: 反 ACE 各项默认全开, 目标进程由内核自己扫 task 绑定。
+	 * 放在 sym_init 之后 —— 它要用 kallsyms 和 ace/kgsl 的入口。 */
+	windcfg_init();
+
 	/* 通道建立只由 transport 决定, 与 install_hook / hook_level 无关。
 	 * 以前这里把 install_hook=0 也当成"什么都不建", 结果用户按建议关 hook 做对照,
 	 * 连 netlink 通道一起没了, 用户态永远连不上。 */
@@ -1125,6 +1133,7 @@ static int __init driver_entry(void)
 
 static void __exit driver_unload(void)
 {
+	windcfg_exit();
 	ace_exit();
 	clonebp_module_exit();
 
