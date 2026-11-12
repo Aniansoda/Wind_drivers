@@ -971,7 +971,7 @@ int clonebp_set_pid(uint32_t pid_arg, const void __user *ureq)
 }
 
 /* ---- OP_CLONEBP_SET_RECORD: 就地改单个点的写回配置 ----
- * 已经装好的点不用先拆再装, 直接改 reg_*/freg_*/mode/flags。
+ * 已经装好的点不用先拆再装, 直接改 reg 族 / freg 族 / mode / flags。
  * addr / patch / imm 属于装载期的东西, 这里不动。
  */
 int clonebp_set_record(uint32_t pid, uint32_t point_index,

@@ -64,7 +64,8 @@ int  clonebp_set_pid(uint32_t pid, const void __user *ureq);
 int  clonebp_remove_all(struct mm_struct *mm);
 int  clonebp_clear_records(struct mm_struct *mm, int32_t point_index);
 int  clonebp_refresh(struct mm_struct *mm);
-/* 就地改单点改写配置 (OP_CLONEBP_SET_RECORD): 只采纳 reg_*/freg_*/mode/flags */
+/* 就地改单点改写配置 (OP_CLONEBP_SET_RECORD):
+ * 只采纳 reg 族、freg 族、mode、flags 这几项 */
 int  clonebp_set_record(uint32_t pid, uint32_t point_index,
 			const CLONEBP_POINT_CONFIG *cfg);
 int  clonebp_get_config(void *uout);
