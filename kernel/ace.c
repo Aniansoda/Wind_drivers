@@ -51,6 +51,9 @@ static atomic64_t g_ace_tp_hide;
 static atomic64_t g_ace_fs_drop;
 static atomic64_t g_ace_comm_drop;
 static atomic64_t g_ace_port_drop;
+static atomic64_t g_ace_smaps_drop;
+static atomic64_t g_ace_fd_drop;
+static atomic64_t g_ace_prop_hit;
 
 static const char *const ace_deny[] = {
 	"libwind", "wind.ko", "keep.sh", "libkeep",
@@ -339,6 +342,123 @@ static struct kprobe ace_statx_kp = {
 };
 
 
+/* ---- 新增: /proc/<pid>/smaps 行级过滤 ----
+ * 与 maps 同一套判据, 但走 show_smap。smaps 比 maps 多 Rss/Pss/Shared_Dirty,
+ * 能识别共享内存注入和 mprotect 改过的匿名可执行段, 必须单独拦。
+ */
+
+static noinline int ace_smaps_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
+	char *buf, *p;
+	bool deny;
+
+	(void)kp;
+	if (!vma)
+		return 0;
+	if (!vma->vm_file)
+		return 0;
+	if (!ace_feat(ACE_F_SMAPS))
+		return 0;
+	if (!ace_cur_is_target())
+		return 0;
+	buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+	if (!buf)
+		return 0;
+	p = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
+	deny = !IS_ERR(p) && ace_deny_name(p);
+	kfree(buf);
+	if (!deny)
+		return 0;
+	atomic64_inc(&g_ace_smaps_drop);
+	regs->pc = regs->regs[30];
+	return 1;
+}
+
+static struct kprobe ace_smaps_kp = {
+	.symbol_name = "show_smap",
+	.pre_handler = ace_smaps_pre,
+};
+
+/* ---- 新增: /proc/<pid>/fd 目录枚举阻断 ----
+ * 6.6 没有可挂的 proc_fd_readdir, 改在 open 入口拦目标进程对 "*/fd" 目录的
+ * 打开请求: 路径指针置 NULL 让 getname_flags 返回 -EFAULT。
+ * 只匹配以 /fd 结尾的目录本身, 不误伤 fdinfo 和具体 fd 节点。
+ */
+
+static noinline bool ace_fd_dir_hit(const struct pt_regs *regs)
+{
+	char buf[128];
+	long n;
+	char *s;
+
+	if (!ace_feat(ACE_F_FD))
+		return false;
+	if (!ace_cur_is_target())
+		return false;
+	n = strncpy_from_user(buf, (char *)regs->regs[1], sizeof(buf) - 1);
+	if (n <= 0)
+		return false;
+	buf[n] = '\0';
+	if (strncmp(buf, "/proc/", 6) != 0)
+		return false;
+	s = strstr(buf, "/fd");
+	if (!s || s[3] != '\0')
+		return false;
+	return true;
+}
+
+static noinline int ace_fd_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	(void)kp;
+	if (!ace_fd_dir_hit(regs))
+		return 0;
+	regs->regs[1] = 0;
+	atomic64_inc(&g_ace_fd_drop);
+	return 0;
+}
+
+static struct kprobe ace_fd_kp = {
+	.symbol_name = "do_sys_openat2",
+	.pre_handler = ace_fd_pre,
+};
+
+/* ---- 新增: /dev/__properties__ 共享映射识别 ----
+ * 属性区是 rw-s 共享映射, 不走 vfs_read, 只能挂 mmap_region。
+ * 本版只识别计数, 不改映射内容: 改页内容要页级 patch, 先量化 ACE 映射几块。
+ */
+
+static noinline int ace_prop_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	struct file *file = (struct file *)regs->regs[0];
+	char *buf, *p;
+	bool hit;
+
+	(void)kp;
+	if (!file)
+		return 0;
+	if (!ace_feat(ACE_F_PROP))
+		return 0;
+	if (!ace_cur_is_target())
+		return 0;
+	buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+	if (!buf)
+		return 0;
+	p = d_path(&file->f_path, buf, PATH_MAX);
+	hit = !IS_ERR(p) && strstr(p, "/dev/__properties__/") != NULL;
+	kfree(buf);
+	if (!hit)
+		return 0;
+	atomic64_inc(&g_ace_prop_hit);
+	return 0;
+}
+
+static struct kprobe ace_prop_kp = {
+	.symbol_name = "mmap_region",
+	.pre_handler = ace_prop_pre,
+};
+
+
 /* ---- A3: 线程名过滤 ----
  * /proc/<pid>/task/<tid>/comm 由 proc_task_name 输出, 命中则跳过整行。
  */
@@ -546,6 +666,9 @@ int ace_get_stat(void *uout)
 	st.fs_drop = (uint64_t)atomic64_read(&g_ace_fs_drop);
 	st.comm_drop = (uint64_t)atomic64_read(&g_ace_comm_drop);
 	st.port_drop = (uint64_t)atomic64_read(&g_ace_port_drop);
+	st.smaps_drop = (uint64_t)atomic64_read(&g_ace_smaps_drop);
+	st.fd_drop = (uint64_t)atomic64_read(&g_ace_fd_drop);
+	st.prop_hit = (uint64_t)atomic64_read(&g_ace_prop_hit);
 	memcpy(uout, &st, sizeof(st));
 	return 0;
 }
@@ -584,12 +707,24 @@ int ace_init(void)
 	r = register_kretprobe(&ace_status_krp);
 	if (r)
 		pr_warn(ACE_PFX "proc_pid_status retprobe failed: %d\n", r);
+	r = register_kprobe(&ace_smaps_kp);
+	if (r)
+		pr_warn(ACE_PFX "show_smap probe failed: %d\n", r);
+	r = register_kprobe(&ace_fd_kp);
+	if (r)
+		pr_warn(ACE_PFX "do_sys_openat2(fd) probe failed: %d\n", r);
+	r = register_kprobe(&ace_prop_kp);
+	if (r)
+		pr_warn(ACE_PFX "mmap_region probe failed: %d\n", r);
 	ACE_LOG("ready\n");
 	return 0;
 }
 
 void ace_exit(void)
 {
+	unregister_kprobe(&ace_prop_kp);
+	unregister_kprobe(&ace_fd_kp);
+	unregister_kprobe(&ace_smaps_kp);
 	unregister_kretprobe(&ace_status_krp);
 	unregister_kprobe(&ace_connect_kp);
 	unregister_kprobe(&ace_comm_kp);

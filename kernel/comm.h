@@ -668,7 +668,10 @@ typedef struct _CLONEBP_RECORDS_REQUEST
 #define ACE_F_FS       (1u << 4)
 #define ACE_F_COMM     (1u << 5)
 #define ACE_F_PORT     (1u << 6)
-#define ACE_F_MASK     0x7Fu
+#define ACE_F_PROP     (1u << 7)   /* /dev/__properties__ 共享映射识别 */
+#define ACE_F_FD       (1u << 8)   /* /proc/<pid>/fd 目录枚举阻断 */
+#define ACE_F_SMAPS    (1u << 9)   /* /proc/<pid>/smaps 行级过滤 */
+#define ACE_F_MASK     0x3FFu
 
 typedef struct _ACE_STAT
 {
@@ -681,6 +684,9 @@ typedef struct _ACE_STAT
 	uint64_t fs_drop;        /* 路径类 syscall 被置空的次数 */
 	uint64_t comm_drop;      /* 线程名被滤掉的行数 */
 	uint64_t port_drop;      /* 调试端口连接被阻断的次数 */
+	uint64_t smaps_drop;     /* smaps 被滤掉的 vma 段数 */
+	uint64_t fd_drop;        /* /proc/<pid>/fd 枚举被阻断的次数 */
+	uint64_t prop_hit;       /* 属性区共享映射被识别的次数 */
 } ACE_STAT, *PACE_STAT;
 
 #endif /* _COMM_H_ */
