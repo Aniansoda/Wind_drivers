@@ -12,6 +12,7 @@
 #include <linux/types.h>
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
 
 #include "windcfg.h"
 #include "ace.h"
@@ -59,6 +60,17 @@ void windcfg_bind_pid(pid_t tgid)
 
 	if (tgid <= 1)
 		return;
+
+	/* 用户态有可能把刷入器自己传进来。藏自己 = 把悬浮窗从 kgsl 里
+	 * 一起抹掉, vendor EGL 加载不到 GPU 驱动, 之后 eglChooseConfig
+	 * 全是 EGL_NOT_INITIALIZED。self 只记录, 一个隐藏都不做。 */
+	if (tgid == task_tgid_vnr(current)) {
+		if (tgid != g_bound_tgid)
+			pr_info("[wind-cfg] tgid=%d 是刷入器自己, 跳过隐藏\n", tgid);
+		g_bound_tgid = tgid;
+		return;
+	}
+
 	if (tgid == g_bound_tgid)
 		return;
 	g_bound_tgid = tgid;
