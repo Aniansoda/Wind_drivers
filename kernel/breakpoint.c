@@ -1585,15 +1585,16 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 			attr.bp_len = bp_len_to_hw(cur_len);
 			attr.bp_type = hwtype;
 
-			ev = wind_register_wide_hw_breakpoint(&attr,
-							      wrpbp_triggered, NULL);
-			if (IS_ERR(ev) && PTR_ERR(ev) == -EOPNOTSUPP)
-			{
-				wide = false;
-				ev = wind_register_user_hw_breakpoint(&attr,
-								      wrpbp_triggered,
-								      NULL, sess->task);
-			}
+			/* 必须按任务注册。
+			 * wide 版是"全 CPU 全任务"的断点: 每个核每次上下文切换都要进
+			 * 一次异常, 再靠 wrpbp_tgid 过滤掉。用户地址用 wide 的代价是
+			 * 整机每秒多出几万次异常 -> 表现为"用 wind 读取非常卡",
+			 * 断点打得多的时候直接把机器拖死重启。
+			 * register_user_hw_breakpoint 只在该 task 调度上 CPU 时生效。 */
+			(void)wide;
+			ev = wind_register_user_hw_breakpoint(&attr,
+							      wrpbp_triggered,
+							      NULL, sess->task);
 			if (IS_ERR(ev))
 			{
 				ret = PTR_ERR(ev);
