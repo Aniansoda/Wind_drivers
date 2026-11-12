@@ -1,4 +1,7 @@
 #include <linux/module.h>
+
+/* 由 entry.c 定义: 卸载中标志 */
+extern bool g_wind_unloading;
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/kprobes.h>
@@ -114,6 +117,9 @@ static inline bool ace_cur_is_target(void)
 
 static noinline int ace_maps_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
 	char *buf, *p;
 	bool deny;
@@ -149,6 +155,9 @@ static struct kprobe ace_maps_kp = {
 
 static noinline int ace_mods_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct module *mod = (struct module *)regs->regs[1];
 
 	(void)kp;
@@ -215,6 +224,9 @@ static DEFINE_PER_CPU(struct ace_tp_slot, ace_tp_slot);
 
 static noinline int ace_status_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct task_struct *task = (struct task_struct *)regs->regs[3];
 	struct ace_tp_slot *s = this_cpu_ptr(&ace_tp_slot);
 
@@ -295,6 +307,9 @@ static noinline bool ace_fs_hit(const struct pt_regs *regs)
 
 static noinline int ace_open_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	(void)kp;
 	if (!ace_fs_hit(regs))
 		return 0;
@@ -306,6 +321,9 @@ static noinline int ace_open_pre(struct kprobe *kp, struct pt_regs *regs)
 
 static noinline int ace_faccess_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	(void)kp;
 	if (!ace_fs_hit(regs))
 		return 0;
@@ -317,6 +335,9 @@ static noinline int ace_faccess_pre(struct kprobe *kp, struct pt_regs *regs)
 
 static noinline int ace_statx_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	(void)kp;
 	if (!ace_fs_hit(regs))
 		return 0;
@@ -349,6 +370,9 @@ static struct kprobe ace_statx_kp = {
 
 static noinline int ace_smaps_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
 	char *buf, *p;
 	bool deny;
@@ -410,6 +434,9 @@ static noinline bool ace_fd_dir_hit(const struct pt_regs *regs)
 
 static noinline int ace_fd_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	(void)kp;
 	if (!ace_fd_dir_hit(regs))
 		return 0;
@@ -430,6 +457,9 @@ static struct kprobe ace_fd_kp = {
 
 static noinline int ace_prop_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct file *file = (struct file *)regs->regs[0];
 	char *buf, *p;
 	bool hit;
@@ -482,6 +512,9 @@ static bool ace_comm_hit(const char *comm)
 
 static noinline int ace_comm_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct task_struct *task = (struct task_struct *)regs->regs[3];
 
 	(void)kp;
@@ -513,6 +546,9 @@ static const unsigned short ace_deny_port[] = {
 
 static noinline int ace_connect_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	unsigned char buf[8];
 	const void __user *sa = (const void __user *)regs->regs[1];
 	unsigned short port;

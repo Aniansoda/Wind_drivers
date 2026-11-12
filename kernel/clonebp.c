@@ -5,6 +5,9 @@
  * 不占用 BRP/WRP 硬件断点寄存器, 不改原始页字节。
  */
 #include <linux/module.h>
+
+/* 由 entry.c 定义: 卸载中标志 */
+extern bool g_wind_unloading;
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
@@ -500,6 +503,9 @@ static int cb_mem_abort_do(struct pt_regs *regs)
 
 static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	int ret;
 	u64 t0 = cb_tm_begin();
 
@@ -619,6 +625,9 @@ static int cb_brk_do(struct pt_regs *regs)
 
 static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	int ret;
 	u64 t0 = cb_tm_begin();
 
@@ -635,6 +644,9 @@ static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
  * 在权限重建前把落在范围内的点先切回原始页。 */
 static int cb_mprotect_pre(struct kprobe *kpr, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	unsigned long start = regs->regs[0];
 	unsigned long len   = regs->regs[1];
 	unsigned long va;

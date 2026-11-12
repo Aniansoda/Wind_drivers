@@ -24,6 +24,11 @@
 #include "sym.h"
 #include "nlcomm.h"
 #include "clonebp.h"
+#include <linux/rcupdate.h>
+
+/* 卸载中标志: 所有 kprobe / perf 回调看到它立刻返回。
+ * 定义必须放在 include 之后: 前面用到 bool 会缺类型。 */
+bool g_wind_unloading;
 
 /*
  * entry.c — 通讯通道与 ioctl 分发 (作者: 川上富江Tomie)
@@ -1136,23 +1141,43 @@ static int __init driver_entry(void)
 
 static void __exit driver_unload(void)
 {
+	/* 卸载一开始就把所有探针关掉: 探针只要还在跑, 就会在别的 CPU 上
+	 * 进到本模块的函数里, 而这些函数马上要被 unregister/free 掉。
+	 * 这是 rmmod 卡死 (等 RCU 等到看门狗) 和重启 (探针跳到已释放
+	 * 的 text) 的直接来源。 */
+	WRITE_ONCE(g_wind_unloading, true);
+	synchronize_rcu();
+	printk("[+] wind: unload start\n");
 	windcfg_exit();
+	printk("[+] wind: -cfg\n");
 	ace_exit();
+	printk("[+] wind: -ace\n");
 	clonebp_module_exit();
+	printk("[+] wind: -clonebp\n");
 
 	printk("[+] wind driver_unload");
 	gyro_remove();
+	printk("[+] wind: -gyro\n");
 	kgsl_hook_remove();
+	printk("[+] wind: -kgsl\n");
 	wind_bp_exit();
+	printk("[+] wind: -bp\n");
+	printk("[+] wind: wait rcu\n");
+	synchronize_rcu();
 	wind_nl_remove();
+	printk("[+] wind: -nl\n");
 	wind_map_cache_purge();
+	printk("[+] wind: -maps\n");
 	wind_misc_remove();
+	printk("[+] wind: -misc\n");
 	hook_remove();
+	printk("[+] wind: -hook\n");
 	if (g_sess) {
 		session_destroy(g_sess);
 		g_sess = NULL;
 	}
 	wind_sym_exit();
+	printk("[+] wind: unload done\n");
 }
 
 module_init(driver_entry);

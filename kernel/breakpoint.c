@@ -20,6 +20,9 @@
  */
 
 #include <linux/kernel.h>
+
+/* 由 entry.c 定义: 卸载中标志 */
+extern bool g_wind_unloading;
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
@@ -351,6 +354,9 @@ MODULE_PARM_DESC(bp_dbg, "1=每个断点槽位头 3 次命中打 dmesg(默认) 0
 static void hwbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 			   struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return;
 	int i;
 	HWBP_RECORD rec;
 
@@ -1403,6 +1409,9 @@ static bool wrpbp_rate_warned[BP_SLOT_MAX];
 static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 			    struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return;
 	int i, j;
 	HWBP_RECORD rec;
 
@@ -1789,6 +1798,9 @@ static const char *g_brkbp_syms[] = {
 
 static int brkbp_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	unsigned long pc = instruction_pointer(regs);
 	int i;
 
@@ -2259,6 +2271,9 @@ static int g_udpbp_tx_arg = 2;
 
 static int udpbp_tx_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	/* udp_send_skb(skb, sk) / ip_send_skb(net, skb) /
 	 * ip_local_out(net, sk, skb) —— 按 g_udpbp_tx_arg 取参数 */
 	(void)p;
@@ -2268,6 +2283,9 @@ static int udpbp_tx_pre(struct kprobe *p, struct pt_regs *regs)
 
 static int udpbp_rx_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	/* __udp4_lib_rcv(struct sk_buff *, struct udp_table *, int) */
 	(void)p;
 	udpbp_handle((struct sk_buff *)regs->regs[0], UDPBP_DIR_RX);

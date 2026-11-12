@@ -124,6 +124,20 @@ static int ask01(const char *title, int def)
 	return (v == 0 || v == 1) ? v : def;
 }
 
+/* 1-是 / 2-否, 回车取默认。ask01 的 0-关/1-开 文案套在"要不要卸载"上会误导 */
+static int ask_yn(const char *title, int def)
+{
+	char line[32];
+
+	printf(TAG " " K_YEL "%s" K_RST " " K_DIM "[1-是/2-否] 默认:%d" K_RST "\n",
+	       title, def);
+	printf(TAG " 请选择: ");
+	fflush(stdout);
+	if (read_line(line, sizeof(line)) != 0 || !line[0])
+		return def;
+	return line[0] == '1';
+}
+
 /* 常见系统进程名, 让用户有得选 */
 static const char *kProcNames[] = {
 	"",                 /* 1  不伪装 */
@@ -373,12 +387,39 @@ int main(int argc, char **argv)
 	save_cfg(&c);
 
 do_load:
-	/* 卸载旧的 */
+	/* 检测到已刷入: 先问, 不替用户做主 */
 	if (module_loaded()) {
-		char *rm[] = { "rmmod", MOD_NAME, NULL };
-		k_info("卸载已加载的 %s", MOD_NAME);
-		if (run(rm) != 0)
-			k_warn("rmmod 失败, 可能仍在使用, 继续加载");
+		k_warn("检测到 %s 已经在内核里", MOD_NAME);
+		if (!ask_yn("要卸载后重装吗", 1)) {
+			k_info("保留现有模块, 本次不卸载也不重复加载");
+			return 0;
+		}
+
+		{
+			char *rm[] = { "rmmod", MOD_NAME, NULL };
+			int i;
+
+			k_info("卸载已加载的 %s", MOD_NAME);
+			if (run(rm) != 0) {
+				k_err("rmmod 失败 (模块还在被调用 / 设备忙)");
+				if (!ask_yn("仍然继续加载新模块", 0)) {
+					k_dim("已中止");
+					return 0;
+				}
+			} else {
+				/* 等 /proc/modules 里真消失。
+				 * rmmod 返回后条目不是立刻没的, 紧接着 insmod 会 EEXIST。 */
+				for (i = 0; i < 30 && module_loaded(); i++)
+					usleep(100000);
+				if (module_loaded()) {
+					k_err("%s 仍在内核里, 旧模块可能没卸干净", MOD_NAME);
+					if (!ask_yn("仍然继续加载新模块", 0)) {
+						k_dim("已中止");
+						return 0;
+					}
+				}
+			}
+		}
 	}
 
 	write_proc_name(c.proc_name);

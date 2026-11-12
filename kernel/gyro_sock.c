@@ -18,6 +18,9 @@
  * 这比判 socket 类型更准 —— 同一条流里的加速度计/磁力计记录原样放过。
  */
 #include <linux/kernel.h>
+
+/* 由 entry.c 定义: 卸载中标志 */
+extern bool g_wind_unloading;
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
@@ -164,6 +167,9 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
  * 注意内核 pt_regs 里的 regs[0..2] 就是 syscall 的 x0..x2, 直接取。 */
 static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 {
+	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
 	struct gyro_recv_ctx *ctx = this_cpu_ptr(&gyro_ctx);
 	struct user_msghdr umh;
 
