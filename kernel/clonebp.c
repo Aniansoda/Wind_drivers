@@ -982,6 +982,24 @@ int clonebp_get_timing(CLONEBP_TIMING_CONFIG *cfg)
 	return 0;
 }
 
+void clonebp_get_diag(uint32_t *active, uint32_t *pages,
+		      uint32_t *brk_hits, uint32_t *tlb_flush)
+{
+	/* g_cb_point_cnt / g_cb_page_cnt 由 g_cb_lock 保护;
+	 * 统计数组是 atomic64, 直接读即可。 */
+	mutex_lock(&g_cb_lock);
+	if (active)
+		*active = (uint32_t)g_cb_point_cnt;
+	if (pages)
+		*pages = (uint32_t)g_cb_page_cnt;
+	mutex_unlock(&g_cb_lock);
+
+	if (brk_hits)
+		*brk_hits = (uint32_t)atomic64_read(&g_cb_stat[CLONEBP_ST_BRK_HIT]);
+	if (tlb_flush)
+		*tlb_flush = (uint32_t)atomic64_read(&g_cb_stat[CLONEBP_ST_TLB_FLUSH]);
+}
+
 int clonebp_get_records(uint32_t point_index, uint32_t start,
 			CLONEBP_RECORD *recs, uint32_t cap, uint32_t *count_out)
 {

@@ -51,6 +51,7 @@
 #include "sym.h"
 #include "memory.h"
 #include "compat.h"
+#include "clonebp.h"   /* clonebp_get_diag: 填 clonebp_* 诊断字段 */
 
 #define BP_SLOT_MAX       16
 #define BP_REC_PER_SLOT   64
@@ -2381,6 +2382,11 @@ int bp_diag_get(WIND_BP_DIAG *out)
 	out->last_rx = g_bpc.last_rx;
 	out->last_ry = g_bpc.last_ry;
 	out->last_rz = g_bpc.last_rz;
+
+	/* 克隆页断点自己维护统计, 这里只是转手。
+	 * 之前漏了转手, 客户端读 clonebp_active 拿到的是 0, 误判成"装载被回滚"。 */
+	clonebp_get_diag(&out->clonebp_active, &out->clonebp_pages,
+			 &out->clonebp_brk_hits, &out->clonebp_tlb_flush);
 	return 0;
 }
 

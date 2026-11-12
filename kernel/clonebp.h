@@ -64,6 +64,12 @@ int  clonebp_refresh(struct mm_struct *mm);
 int  clonebp_get_config(void *uout);
 int  clonebp_set_timing(CLONEBP_TIMING_CONFIG *cfg);
 int  clonebp_get_timing(CLONEBP_TIMING_CONFIG *cfg);
+/* 诊断快照: 给 WIND_BP_DIAG 填 clonebp_* 四个字段。
+ * 不传指针的项会被跳过, 可以只关心其中一两个。
+ */
+void clonebp_get_diag(uint32_t *active, uint32_t *pages,
+		      uint32_t *brk_hits, uint32_t *tlb_flush);
+
 int  clonebp_get_records(uint32_t point_index, uint32_t start,
 			 CLONEBP_RECORD *recs, uint32_t cap, uint32_t *count_out);
 

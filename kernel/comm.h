@@ -442,6 +442,12 @@ typedef struct _WIND_BP_DIAG
 	uint32_t ptebp_reloads;
 	uint32_t ptebp_heal_ok;
 	uint32_t ptebp_heal_fail;
+	/* 克隆页断点: 与 PTE 断点是两套独立机制, 之前没进诊断结构,
+	 * 客户端读到的是相邻字段的残留值, 于是永远显示 armed=0。 */
+	uint32_t clonebp_active;    /* 已装载点数 */
+	uint32_t clonebp_pages;     /* 已克隆的页数 */
+	uint32_t clonebp_brk_hits;  /* 影子页 BRK 命中次数 */
+	uint32_t clonebp_tlb_flush; /* 页切换导致 TLB 刷新的次数 */
 	uint32_t wrpbp_armed;
 	uint32_t wrpbp_hits;
 	uint32_t wrpbp_writes;

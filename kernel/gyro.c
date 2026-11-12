@@ -86,7 +86,14 @@ static struct perf_event * __percpu *gyro_bp; /* per-CPU 执行断点 (wide) */
 static bool gyro_bp_wide = true;              /* false = 退回单任务断点 */
 static struct perf_event *gyro_single_bp;     /* 退回路径的单任务断点 */
 static atomic64_t gyro_hits = ATOMIC64_INIT(0); /* 命中计数, 诊断用 */
-static pid_t gyro_pid;                  /* 目标进程 */
+static pid_t gyro_pid;                  /* 目标进程: 只用来定位 hook 地址 */
+/* 命中过滤开关。true = 全局生效, 不检查 current->tgid;
+ * false = 只对 gyro_pid 那个进程生效。
+ * 设为全局是因为 sendObjects 的篡改结果落在共享内存里,
+ * 任何读这块 buffer 的进程都该看到同一个值,
+ * 只认 system_server 会让游戏侧读到未改写的旧数据。
+ */
+static bool gyro_global = true;
 static unsigned long gyro_addr;         /* sendObjects 运行时地址 */
 static bool gyro_active;
 static bool gyro_enabled;
@@ -319,7 +326,7 @@ static void gyro_wrp_handler(struct perf_event *bp, struct perf_sample_data *dat
 
 	if (!READ_ONCE(gyro_active) || !READ_ONCE(gyro_enabled))
 		return;
-	if (gyro_pid && current->tgid != gyro_pid)
+	if (!gyro_global && gyro_pid && current->tgid != gyro_pid)
 		return;
 	/* 我们自己写回也会命中这个观察点: 内核上下文 + per-CPU busy 双闸 */
 	if (!user_mode(regs))
@@ -468,9 +475,10 @@ static void gyro_breakpoint_handler(struct perf_event *bp,
 	if (!READ_ONCE(gyro_active) || !READ_ONCE(gyro_enabled))
 		return;
 
-	/* wide 断点挂在 per-CPU 上: 同一个 VA 在别的进程里也可能被映射到同址,
-	 * 只处理目标 tgid, 否则会改到无关进程的 sensor 数据。 */
-	if (gyro_pid && current->tgid != gyro_pid)
+	/* wide 断点挂在 per-CPU 上, 同一个 VA 在别的进程里也可能被映射到同址。
+	 * gyro_global 为真时不筛 tgid: 篡改结果写进共享内存,
+	 * 所有读取方都应拿到同一个值, 这是全局语义。 */
+	if (!gyro_global && gyro_pid && current->tgid != gyro_pid)
 		return;
 	atomic64_inc(&gyro_hits);
 
@@ -655,6 +663,7 @@ int gyro_install(pid_t pid)
 	}
 
 	gyro_pid = pid;
+	gyro_global = true;   /* 默认全局, 不绑单一进程 */
 	task = gyro_get_task();
 	if (!task)
 	{
