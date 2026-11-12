@@ -670,6 +670,18 @@ int gyro_install(pid_t pid)
 
 	gyro_pid = pid;
 	gyro_global = true;   /* 默认全局, 不绑单一进程 */
+
+	/* 主路: SEQPACKET socket 改写。
+	 * 不占调试寄存器, 不依赖 sendObjects 命中, 也不受帧率影响。
+	 * 挂上了就不必再装执行断点。 */
+	ret = gyro_sock_install(pid);
+	if (ret == 0) {
+		gyro_active = true;
+		printk(KERN_INFO "gyro: socket 路线已启用 tgid=%d\n", pid);
+		return 0;
+	}
+	printk(KERN_INFO "gyro: socket 路线失败 %d, 回落到执行断点\n", ret);
+
 	task = gyro_get_task();
 	if (!task)
 	{
@@ -695,6 +707,7 @@ int gyro_install(pid_t pid)
 
 void gyro_remove(void)
 {
+	gyro_sock_remove();
 	if (gyro_bp)
 	{
 		wind_unregister_wide_hw_breakpoint(gyro_bp);
@@ -729,6 +742,10 @@ EXPORT_SYMBOL(gyro_holds_breakpoints);
 
 void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 {
+	/* socket 路线只认 x/y; z 从不使用, 保持原样 */
+	if (gyro_sock_active())
+		gyro_sock_set(rx, ry);
+
 	struct task_struct *task;
 
 	gyro_rx = rx;

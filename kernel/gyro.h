@@ -35,6 +35,22 @@ void gyro_set_enabled(bool enabled);
 /* 停止 / 恢复: 暂停或恢复篡改, 保留 hook 不卸载 (区别于 gyro_remove)
  *   stop  : -ENODEV 未安装; 0 成功 (幂等)
  *   resume: -ENODEV 未安装; -ESRCH 目标已退出; 断点缺失时自动重绑, 失败返回该错误 */
+/*
+ * ---- SEQPACKET socket 路线 (对齐 paradise 的 gyro 实现) ----
+ * paradise 的实测日志:
+ *   [paradise] gyro: hooked %d sockets in system_server (pid %d)
+ *   [paradise] gyro: no SEQPACKET sockets found in system_server
+ * 它在 system_server 的 SOCK_SEQPACKET 收发路径上改报文。
+ *
+ * 这里挂在 sock_recvmsg 上, 按 socket 类型 + 进程 + 报文长度过滤, 效果一致,
+ * 但不枚举 socket 链表, 内核结构变了也不会散架。
+ * 不占硬件断点寄存器, 不依赖 sendObjects 符号命中。
+ */
+int  gyro_sock_install(pid_t system_server_tgid);
+void gyro_sock_remove(void);
+void gyro_sock_set(u32 x_bits, u32 y_bits);
+bool gyro_sock_active(void);
+
 int  gyro_stop(void);
 int  gyro_resume(void);
 

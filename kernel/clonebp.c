@@ -236,6 +236,70 @@ static void flush_tlb_page_range_local(struct mm_struct *mm, unsigned long va);
 static int cb_page_index(struct clonebp_page *cp);
 static int cb_try_bailout(struct clonebp_page *cp);
 
+/* ============================================================
+ * 页可切换性检查 (对齐 paradise 的 [ptebp] 前置条件)
+ *
+ * paradise 的降级分支把约束讲得很清楚:
+ *   [ptebp] contiguous PTE unfolding unavailable; such pages will be rejected
+ *   [ptebp] mte_sync_tags unavailable; using direct-map cache sync
+ *
+ * arm64 会把 16 个相邻 PTE 折叠成一项存 (contiguous PTE)。折叠状态下改其中
+ * 一个, 实际写的是整组共用的那一项, 相邻 15 个页跟着一起变 —— 直接写坏别人的
+ * 内存。所以我们只接受「能唯一定位到单页」的情形, 定位不了就拒绝这个页,
+ * 不做半残处理。
+ *
+ * 同样拒绝大页: 一个大 folio 映射到多条 PTE 时, mk_pte(single_page) 只能
+ * 表示其中一页, 换页后原 folio 的其余部分语义就变了。
+ * ============================================================ */
+static bool cb_page_switchable(struct mm_struct *mm, struct clonebp_page *cp,
+			       const char **why)
+{
+	struct page *page;
+
+	if (!mm || !cp || !cp->orig_page[0]) {
+		*why = "no-orig-page";
+		return false;
+	}
+	page = cp->orig_page[0];
+
+	/* 大页 / 复合页: 单条 PTE 表示不了 */
+	if (PageCompound(page)) {
+		*why = "compound-page";
+		return false;
+	}
+
+#ifdef CONFIG_ARM64_CONT_PTE
+	{
+		pte_t *ptep = cb_pte_get(mm, cp->user_va, NULL);
+		pte_t pte;
+
+		if (!ptep) {
+			*why = "no-pte";
+			return false;
+		}
+		pte = READ_ONCE(*ptep);
+		if (pte_cont(pte)) {
+			unsigned long idx;
+
+			/* 折叠组必须按 CONT_PTES 对齐; 不在组首就无法安全展开 */
+			idx = (cp->user_va >> PAGE_SHIFT) & (CONT_PTES - 1);
+			if (idx != 0) {
+				*why = "cont-pte-mid";
+				return false;
+			}
+			/* 组首可以做展开: 把整组 PTE 拆成独立项。
+			 * 内核没导出 contpte 相关接口, 这里不去拆内核的,
+			 * 只拒绝 —— 保守但不会写坏相邻页。 */
+			*why = "cont-pte-unfold-unsupported";
+			return false;
+		}
+	}
+#endif
+
+	*why = NULL;
+	return true;
+}
+
 static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_shadow)
 {
 	pte_t *ptep;
@@ -246,6 +310,18 @@ static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_
 		return -EINVAL;
 	if (atomic_read(&cp->state) == to_shadow)
 		return 0;
+	{
+		/* 只在真正要换页时查: 同一状态直接返回, 不付这个代价 */
+		const char *why = NULL;
+
+		if (!cb_page_switchable(mm, cp, &why)) {
+			cb_stat_inc(CLONEBP_ST_CLONE_FAIL);
+			if (why && printk_ratelimit())
+				pr_warn("clonebp: 页 %llx 不可切换 (%s), 已拒绝\n",
+					(unsigned long long)cp->user_va, why);
+			return -EOPNOTSUPP;
+		}
+	}
 
 	mmap_read_lock(mm);
 	ptep = cb_pte_get(mm, cp->user_va, NULL);
@@ -572,6 +648,68 @@ static int cb_mprotect_pre(struct kprobe *kpr, struct pt_regs *regs)
 	return 0;
 }
 
+/* ============================================================
+ * 外部读一致性: access_remote_vm
+ *
+ * paradise 的对应能力:
+ *   [paradise] shadow: access_remote_vm hook failed: %d (GUP reads will see shadow)
+ *   [paradise] shadow: pin_user_pages_remote parked %d page(s) addr=%lx
+ *   [paradise] shadow: follow_page_pte hook failed: %d
+ *
+ * 只换 PTE 是不够的。process_vm_readv、/proc/pid/mem、任何走 access_remote_vm
+ * 的读取拿到的都是内核那边的页, 不是当前 PTE 指向的页。影子页生效期间它们看到
+ * 原始页, 一比对就露馅。
+ *
+ * 做法: 在 access_remote_vm 返回后, 把结果缓冲里落在影子页区间的部分用影子页
+ * 内容覆盖。PTE 无论处在哪个状态, 外部读都统一看到影子页 (即"已生效"的代码)。
+ * ============================================================ */
+static void cb_fixup_remote_read(unsigned long addr, void *buf, int len)
+{
+	unsigned long off = 0;
+
+	if (!buf || len <= 0)
+		return;
+
+	while (off < (unsigned long)len) {
+		unsigned long va = addr + off;
+		unsigned long page_base = va & PAGE_MASK;
+		unsigned long in_page = va - page_base;
+		unsigned long n = PAGE_SIZE - in_page;
+		struct clonebp_page *cp;
+
+		if (n > (unsigned long)len - off)
+			n = (unsigned long)len - off;
+
+		cp = cb_find_page(page_base);
+		if (cp && cp->inited && cp->shadow_page) {
+			char *src = kmap_local_page(cp->shadow_page);
+
+			if (src) {
+				memcpy((char *)buf + off, src + in_page, n);
+				kunmap_local(src);
+				cb_stat_inc(CLONEBP_ST_CLONE_OK);
+			}
+		}
+		off += n;
+	}
+}
+
+/* access_remote_vm(mm, addr, buf, len, gup_flags) */
+static void cb_remote_vm_post(struct kprobe *p, struct pt_regs *regs,
+			      unsigned long flags)
+{
+	void *buf = (void *)regs->regs[2];
+	int len = (int)regs->regs[3];
+
+	cb_fixup_remote_read(regs->regs[1], buf, len);
+}
+
+static struct kprobe cb_remote_kp = {
+	.symbol_name = "access_remote_vm",
+	.post_handler = cb_remote_vm_post,
+};
+static int cb_kp_remote_reg;
+
 static struct kprobe cb_mem_abort_kp = {
 	.symbol_name = "do_mem_abort",
 	.pre_handler = cb_mem_abort_pre,
@@ -618,11 +756,23 @@ static int cb_install_hooks(void)
 		else
 			cb_kp_mprot_reg = 1;
 	}
+	if (!cb_kp_remote_reg) {
+		ret = register_kprobe(&cb_remote_kp);
+		if (ret < 0)
+			pr_warn("[clonebp] access_remote_vm 挂不上 %d, "
+				"process_vm_readv 会看到原始页\n", ret);
+		else
+			cb_kp_remote_reg = 1;
+	}
 	return 0;
 }
 
 static void cb_remove_hooks(void)
 {
+	if (cb_kp_remote_reg) {
+		unregister_kprobe(&cb_remote_kp);
+		cb_kp_remote_reg = 0;
+	}
 	if (cb_kp_mprot_reg) {
 		unregister_kprobe(&cb_mprotect_kp);
 		cb_kp_mprot_reg = 0;
