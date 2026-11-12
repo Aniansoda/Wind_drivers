@@ -17,13 +17,9 @@ MOD=wind
 say()  { printf '%s\n' "$*"; }
 sep()  { say "-------------------"; }
 
-ask01() { # $1=提示 $2=变量名(回显) $3=默认
+ask01() { # $1=标题 $2=变量名(回显) $3=默认
     _d="$3"
-    say ""
-    say "  0  关闭"
-    say "  1  开启"
-    say ""
-    printf '请选择 (0 或 1) [%s]: ' "$_d"
+    printf '\n %s [0-关/1-开] [默认:%s]\n 请选择: ' "$1" "$_d"
     read _v
     [ -z "$_v" ] && _v="$_d"
     case "$_v" in 0|1) ;; *) _v="$_d";; esac
@@ -54,65 +50,35 @@ if [ -f "$CFG" ]; then
     say "  隐藏驱动=$hide_driver  pid隐藏=$hide_pid  GPU隐藏=$hide_gpu"
     say "  oppo后门=$oppo_backdoor  强制加载=$force_load  陀螺仪=$gyro"
     say "  进程名=${proc_name:-无}  目标=${target_comm}"
-    printf '[!] 是否使用 [1 使用 / 0 重新选择]: '
+    printf '\n 使用上次配置 [1-是/2-否]\n 请选择: '
     read _u
-    [ "$_u" = "1" ] && USE_OLD=1
+    [ "$_u" != "2" ] && USE_OLD=1
 fi
 
 if [ "$USE_OLD" != "1" ]; then
     # ---- 是否加载 ----
     say ""
-    say "是否加载："
-    say "(1 : 加载)"
-    say "(2 : 不加载)"
-    sep
-    printf '请输入选择 (1 或 2): '
+    printf '\n 是否加载 Wind 驱动 [1-是/2-否]\n 请选择: '
     read _load
     [ "$_load" = "2" ] && { say "已取消"; exit 0; }
 
-    hide_driver=1
-    say ""
-    say "是否隐藏驱动"
-    ask01 "" hide_driver 1
-
-    oppo_backdoor=1
-    say ""
-    say "删除一加/Oppo 的 proc 后门接口"
-    ask01 "" oppo_backdoor 1
-
-    force_load=1
-    say ""
-    say "强制加载"
-    ask01 "" force_load 1
+    ask01 "隐藏 Wind 驱动" hide_driver 1
+    ask01 "屏蔽一加/Oppo proc 后门" oppo_backdoor 1
+    ask01 "强制加载" force_load 1
 
     say ""
-    say "[!] 以下三项与游戏进程相关，可单独关闭。"
+    say " ---- 以下三项与游戏进程相关, 可单独关闭 ----"
 
-    gyro=1
-    say ""
-    say "陀螺仪控制"
-    ask01 "" gyro 1
-
-    hide_pid=1
-    say ""
-    say "pid 隐藏"
-    ask01 "" hide_pid 1
-
-    hide_gpu=1
-    say ""
-    say "GPU 隐藏"
-    ask01 "" hide_gpu 1
+    ask01 "陀螺仪控制" gyro 1
+    ask01 "pid 隐藏" hide_pid 1
+    ask01 "GPU 隐藏" hide_gpu 1
 
     # ---- 进程名伪装 ----
-    say ""
-    say "进程名伪装（直接回车 = 不伪装）"
-    printf '进程名: '
+    printf '\n 进程名伪装（回车跳过）\n 输入: '
     read proc_name
 
     # ---- 目标进程 ----
-    say ""
-    say "目标进程 comm（直接回车 = com.tencent.tmgp.pubgmhd）"
-    printf 'target_comm: '
+    printf '\n 目标进程 comm（回车用 com.tencent.tmgp.pubgmhd）\n 输入: '
     read target_comm
     [ -z "${target_comm:-}" ] && target_comm=com.tencent.tmgp.pubgmhd
 

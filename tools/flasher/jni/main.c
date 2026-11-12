@@ -59,13 +59,12 @@ static int read_line(char *buf, size_t cap)
 	return 0;
 }
 
-static int ask01(int def)
+static int ask01(const char *title, int def)
 {
 	char line[32];
 	int v;
 
-	printf("\n  0  关闭\n  1  开启\n\n");
-	printf("请选择 (0 或 1) [%d]: ", def);
+	printf("\n %s [0-关/1-开] [默认:%d]\n 请选择: ", title, def);
 	fflush(stdout);
 	if (read_line(line, sizeof(line)) < 0)
 		return def;
@@ -249,51 +248,40 @@ int main(int argc, char **argv)
 		       old.oppo_backdoor, old.force_load, old.gyro);
 		printf("  进程名=%s  目标=%s\n",
 		       old.proc_name[0] ? old.proc_name : "无", old.target_comm);
-		printf("[!] 是否使用上次配置 [1 使用 / 0 重新选择]: ");
+		printf("\n 使用上次配置 [1-是/2-否]\n 请选择: ");
 		fflush(stdout);
-		if (read_line(line, sizeof(line)) == 0 && line[0] == '1') {
+		if (read_line(line, sizeof(line)) == 0 && line[0] != '2') {
 			c = old;
 			goto do_load;
 		}
 	}
 
 	/* 是否加载 */
-	printf("\n是否加载：\n(1 : 加载)\n(2 : 不加载)\n-------------------\n");
-	printf("请输入选择 (1 或 2): ");
+	printf("\n 是否加载 Wind 驱动 [1-是/2-否]\n 请选择: ");
 	fflush(stdout);
 	if (read_line(line, sizeof(line)) == 0 && line[0] == '2') {
 		printf("已取消\n");
 		return 0;
 	}
 
-	printf("\n是否隐藏驱动");
-	c.hide_driver = ask01(1);
+	c.hide_driver   = ask01("隐藏 Wind 驱动", 1);
+	c.oppo_backdoor = ask01("屏蔽一加/Oppo proc 后门", 1);
+	c.force_load    = ask01("强制加载", 1);
 
-	printf("\n删除一加/Oppo 的 proc 后门接口");
-	c.oppo_backdoor = ask01(1);
+	printf("\n ---- 以下三项与游戏进程相关, 可单独关闭 ----\n");
 
-	printf("\n强制加载");
-	c.force_load = ask01(1);
-
-	printf("\n[!] 以下三项与游戏进程相关，可单独关闭。");
-
-	printf("\n陀螺仪控制");
-	c.gyro = ask01(1);
-
-	printf("\npid 隐藏");
-	c.hide_pid = ask01(1);
-
-	printf("\nGPU 隐藏");
-	c.hide_gpu = ask01(1);
+	c.gyro     = ask01("陀螺仪控制", 1);
+	c.hide_pid = ask01("pid 隐藏", 1);
+	c.hide_gpu = ask01("GPU 隐藏", 1);
 
 	/* 进程名伪装 */
-	printf("\n进程名伪装（直接回车 = 不伪装）\n进程名: ");
+	printf("\n 进程名伪装（回车跳过）\n 输入: ");
 	fflush(stdout);
 	if (read_line(c.proc_name, sizeof(c.proc_name)) < 0)
 		c.proc_name[0] = 0;
 
 	/* 目标进程 */
-	printf("\n目标进程 comm（直接回车 = com.tencent.tmgp.pubgmhd）\ntarget_comm: ");
+	printf("\n 目标进程 comm（回车用 com.tencent.tmgp.pubgmhd）\n 输入: ");
 	fflush(stdout);
 	{
 		char t[64];
