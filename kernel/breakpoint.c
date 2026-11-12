@@ -1343,7 +1343,10 @@ static void wrpbp_apply_fregs(int slot)
 	unsigned long fl;
 	int k;
 
-	if (!v->freg_mask || !sl->freg_mask)
+	/* 只认运行时的 v->freg_mask: 安装期的 sl->freg_mask 只是"允许有这个通道",
+	 * 真正写哪些槽位必须以每次 set_fregs 传的为准, 否则会在用户还没设值时
+	 * 把 S3/S4/S5 一次性清零。 */
+	if (!v->freg_mask)
 		return;
 	if (!wind_fpsimd_preserve_current_state())
 		return;
@@ -1353,7 +1356,7 @@ static void wrpbp_apply_fregs(int slot)
 		int rn;
 		u32 *p;
 
-		if (!((v->freg_mask | sl->freg_mask) & (1u << k)))
+		if (!(v->freg_mask & (1u << k)))
 			continue;
 		rn = (int)sl->freg_base + k;
 		if (rn < 0 || rn > 31)
