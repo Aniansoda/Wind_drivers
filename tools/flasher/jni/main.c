@@ -90,7 +90,7 @@ static void cfg_defaults(struct cfg *c)
 	c->hide_gpu      = 1;
 	c->oppo_backdoor = 1;
 	c->force_load    = 1;
-	c->gyro          = 1;
+	c->gyro          = 0;   /* 陀螺仪通道已撤, 自瞄走断点写回 */
 	strcpy(c->proc_name, "");
 }
 
@@ -363,7 +363,10 @@ int main(int argc, char **argv)
 
 	printf(TAG " " K_DIM "以下三项与游戏进程相关, 可单独关闭" K_RST "\n");
 
-	c.gyro     = ask01("陀螺仪控制", 1);
+	/* 陀螺仪通道撤了: 它占 arm64 仅有的 4 个硬件断点寄存器,
+	 * 和自瞄要用的 WRP 观察点互斥, 开着就自瞄无效或整机重启。
+	 * 这里不再问, 固定关。 */
+	c.gyro     = 0;
 	c.hide_pid = ask01("pid 隐藏", 1);
 	c.hide_gpu = ask01("GPU 隐藏", 1);
 

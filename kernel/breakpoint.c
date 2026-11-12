@@ -1581,7 +1581,7 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 			uint64_t addr;
 			u32 cur_len = 0;
 			void *ev;
-			bool wide = true;
+			bool wide = false;
 			u32 rest = WRPBP_VEC_BYTES - off;
 
 			addr = points[i].watch_addr + off;
@@ -1607,17 +1607,19 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 			ev = wind_register_user_hw_breakpoint(&attr,
 							      wrpbp_triggered,
 							      NULL, sess->task);
-			if (IS_ERR(ev) && PTR_ERR(ev) == -EOPNOTSUPP)
-			{
-				wide = true;
-				ev = wind_register_wide_hw_breakpoint(&attr,
-								      wrpbp_triggered, NULL);
-			}
 			if (IS_ERR(ev))
 			{
 				ret = PTR_ERR(ev);
-				printk(KERN_ERR "wrpbp: point %d ev%d 注册失败 %d\n",
-				       i, j, ret);
+				/* 这里以前会退回 wide 版, 是"一装 WRP 就卡死重启"的源头:
+				 * wide 是每核每任务都算数, 用户地址上整机每秒多出几万次
+				 * 异常, 再叠上浮点写回, 直接把机器拖死。
+				 * 拿不到按任务版本就老老实实报错, 不拿整机稳定性换功能。 */
+				if (ret == -EOPNOTSUPP)
+					printk(KERN_ERR "wrpbp: register_user_hw_breakpoint "
+					       "解析不到 (内核未导出该符号), 拒绝退回 wide 版\n");
+				else
+					printk(KERN_ERR "wrpbp: point %d ev%d 注册失败 %d\n",
+					       i, j, ret);
 				goto fail;
 			}
 

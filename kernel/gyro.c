@@ -655,11 +655,26 @@ static int gyro_bind(struct task_struct *task)
 /* ===================================================================
  * 安装 hook: 解析符号 -> 找基址 -> 设执行断点。
  * =================================================================== */
+/* 陀螺仪通道总开关。默认关。
+ * 它既要占 arm64 仅有的 4 个硬件断点寄存器, 又和 WRP 追踪点抢同一批,
+ * 抢不到就让 wrpbp_set 返回 -EBUSY, 表现成"自瞄完全没反应";
+ * 抢过头的另一边则整机每秒几万次异常, 卡死重启。
+ * 自瞄现在统一走断点写回, 这条路默认不启用。
+ */
+bool g_wind_gyro_enable = false;
+module_param_named(wind_gyro, g_wind_gyro_enable, bool, 0444);
+MODULE_PARM_DESC(wind_gyro, "陀螺仪改写通道, 0=关闭(默认, 自瞄走断点写回)");
+
 int gyro_install(pid_t pid)
 {
 	struct task_struct *task;
 	int ret;
 
+	if (!g_wind_gyro_enable)
+	{
+		printk(KERN_INFO "gyro: 通道已关闭 (wind_gyro=0), 自瞄走断点写回\n");
+		return -EOPNOTSUPP;
+	}
 	if (gyro_active)
 		return -EBUSY;
 	if (pid <= 0)
