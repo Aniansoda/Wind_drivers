@@ -435,6 +435,7 @@ int wind_payload_extract(const char *dest)
 		return WPE_IO;
 	}
 
-	printf("\033[36m[+]\033[0m 载荷 \033[32m%s\033[0m → %s\n", hit->kver, dest);
+	printf("\033[36m[+]\033[0m 载荷 \033[32m%s\033[0m → %s (%zu 字节)\n",
+	       hit->kver, dest, plainlen);
 	return rc;
 }
