@@ -270,14 +270,19 @@ static bool cb_page_switchable(struct mm_struct *mm, struct clonebp_page *cp,
 
 #ifdef CONFIG_ARM64_CONT_PTE
 	{
-		pte_t *ptep = cb_pte_get(mm, cp->user_va, NULL);
+		pte_t *ptep;
 		pte_t pte;
 
+		/* cb_pte_get 要求调用方持有 mmap_lock */
+		mmap_read_lock(mm);
+		ptep = cb_pte_get(mm, cp->user_va, NULL);
 		if (!ptep) {
+			mmap_read_unlock(mm);
 			*why = "no-pte";
 			return false;
 		}
 		pte = READ_ONCE(*ptep);
+		mmap_read_unlock(mm);
 		if (pte_cont(pte)) {
 			unsigned long idx;
 

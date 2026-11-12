@@ -1,46 +1,53 @@
-/* 陀螺仪: SEQPACKET 接收路径改写 (对齐 paradise 的 gyro 实现)
+/* 陀螺仪: 在 recvmsg 返回后按 iovec 改写传感器事件 (对齐 paradise 的 gyro 实现)
  *
  * paradise 的做法:
  *   [paradise] gyro: hooked %d sockets in system_server (pid %d)
  *   [paradise] gyro: no SEQPACKET sockets found in system_server
  *   [paradise] gyro: failed to resolve iterator symbols
+ * 它遍历 system_server 的 socket 链表挑 SOCK_SEQPACKET, 再去动 iov_iter。
  *
- * 它遍历 system_server 的 socket 链表挑 SOCK_SEQPACKET, 在收发路径上改报文。
- * 这里不枚举 socket: 在 sock_recvmsg 上判 socket 类型 + 进程 + 报文长度,
- * 效果一样但不依赖任何链表结构, 内核版本变了也不会散架。
+ * 这条路不这么做, 原因有两条:
+ *   1. struct msghdr 从 5.x 起就没有 msg_iov/msg_iovlen 了, 换成 msg_iter;
+ *      而 struct iov_iter 的内部布局在 6.1/6.6/6.12/6.18 之间并不一致。
+ *      直接摸它等于给自己钉死一个内核版本。
+ *   2. struct socket 链表同样不是稳定 ABI。
  *
- * 为什么改 system_server 而不是游戏:
- *   传感器 HAL 把 ASensorEvent 批量送给 system_server, 由它转发给各个 app。
- *   在 ingest 侧改一次, 下游所有客户端拿到的就是改过的值。
- *
- * 不做指令级改写, 不占硬件断点寄存器, 不依赖任何符号命中。
+ * 改挂 __arm64_sys_recvmsg, 参数用 UAPI 的 struct user_msghdr, 十年前的布局
+ * 和十年后一样。socket 类型不再判断, 改成看每条记录的 type 字段:
+ * 只有 type == SENSOR_TYPE_GYROSCOPE 或 GYRO_UNCAL 的记录才改。
+ * 这比判 socket 类型更准 —— 同一条流里的加速度计/磁力计记录原样放过。
  */
 #include <linux/kernel.h>
+#include <linux/types.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/sched.h>
+#include <linux/percpu.h>
 #include <linux/uaccess.h>
 #include <linux/socket.h>
-#include <linux/net.h>
 #include <linux/atomic.h>
-#include <net/sock.h>
-#include <linux/iovec.h>
 
 #include "gyro.h"
 
-#ifndef AF_UNIX
-#define AF_UNIX 1
-#endif
-
-#define ASENSOR_EVENT_SIZE   0x68u          /* sizeof(ASensorEvent) */
-#define ASENSOR_DATA_OFF     0x18u          /* data[0], data[1] 在 +0x18/+0x1c */
+/* ASensorEvent 布局 (sizeof == 0x68):
+ *   +0x00 int32 version
+ *   +0x04 int32 sensor
+ *   +0x08 int32 type
+ *   +0x0c int32 reserved0
+ *   +0x10 int64 timestamp
+ *   +0x18 float data[16]
+ */
+#define ASENSOR_EVENT_SIZE   0x68u
+#define ASENSOR_TYPE_OFF     0x08u          /* 实际有效的是 +0x08 起的 int32 */
+#define ASENSOR_DATA_OFF     0x18u
+#define SENSOR_TYPE_GYRO         4
+#define SENSOR_TYPE_GYRO_UNCAL  16
 #define GYRO_MSG_MAX         (2u * 1024u * 1024u)
 #define GYRO_IOV_MAX         64
 
 struct gyro_recv_ctx {
-	void __user *iov;      /* msg->msg_iov, 用户态指针 */
+	struct iovec __user *iov;
 	unsigned long iovlen;
-	unsigned long size;
 	bool valid;
 };
 
@@ -48,16 +55,15 @@ static DEFINE_PER_CPU(struct gyro_recv_ctx, gyro_ctx);
 
 static struct kprobe g_gyro_kp;
 static bool g_gyro_sock_on;
-static pid_t g_gyro_tgid;          /* system_server 的 tgid */
+static pid_t g_gyro_tgid;
 static atomic64_t g_gyro_msgs = ATOMIC64_INIT(0);
 static atomic64_t g_gyro_rewrites = ATOMIC64_INIT(0);
 
-/* 目标角速度 (float 位模式) */
 static u32 g_gyro_x_bits;
 static u32 g_gyro_y_bits;
 
 /* 保留 incoming 的尾数, 只换成 target 的指数。
- * 直接写固定值, 上报序列的方差会突变; 这样量级还是原读数的量级。 */
+ * 直接写固定值会让上报序列的方差突变; 这样量级还是原读数的量级。 */
 static u32 gyro_rescale(u32 incoming, u32 target)
 {
 	int e_in, e_tgt, d;
@@ -86,26 +92,7 @@ static u32 gyro_rescale(u32 incoming, u32 target)
 	       (incoming & 0x80000000u);
 }
 
-/* 在扁平化后的 iovec 里读写一个 u32。
- * flat_off 是相对整条报文起始的字节偏移。 */
-static int iov_put_u32(struct iovec *iov, unsigned int n,
-		       unsigned long flat_off, u32 val)
-{
-	unsigned int i;
-	unsigned long acc = 0;
-
-	for (i = 0; i < n; i++) {
-		if (flat_off < acc + iov[i].iov_len) {
-			unsigned long in = flat_off - acc;
-
-			return put_user(val,
-				(u32 __user *)((char __user *)iov[i].iov_base + in));
-		}
-		acc += iov[i].iov_len;
-	}
-	return -EFAULT;
-}
-
+/* 在扁平化后的 iovec 上读一个 u32, flat_off 相对整条报文起始 */
 static int iov_get_u32(struct iovec *iov, unsigned int n,
 		       unsigned long flat_off, u32 *out)
 {
@@ -124,12 +111,36 @@ static int iov_get_u32(struct iovec *iov, unsigned int n,
 	return -EFAULT;
 }
 
+static int iov_put_u32(struct iovec *iov, unsigned int n,
+		       unsigned long flat_off, u32 val)
+{
+	unsigned int i;
+	unsigned long acc = 0;
+
+	for (i = 0; i < n; i++) {
+		if (flat_off < acc + iov[i].iov_len) {
+			unsigned long in = flat_off - acc;
+
+			return put_user(val,
+				(u32 __user *)((char __user *)iov[i].iov_base + in));
+		}
+		acc += iov[i].iov_len;
+	}
+	return -EFAULT;
+}
+
 static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long total)
 {
 	unsigned long off;
 
 	for (off = 0; off + ASENSOR_EVENT_SIZE <= total; off += ASENSOR_EVENT_SIZE) {
-		u32 raw[2], x, y;
+		u32 type, raw[2], x, y;
+
+		if (iov_get_u32(iov, n, off + ASENSOR_TYPE_OFF, &type))
+			continue;
+		/* 只动陀螺仪记录; 加速度计/磁力计/压力原样放过 */
+		if (type != SENSOR_TYPE_GYRO && type != SENSOR_TYPE_GYRO_UNCAL)
+			continue;
 
 		if (iov_get_u32(iov, n, off + ASENSOR_DATA_OFF, &raw[0]))
 			continue;
@@ -148,41 +159,36 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
 	}
 }
 
-/* sock_recvmsg(struct socket *sock, struct msghdr *msg, size_t size, int flags) */
+/* __arm64_sys_recvmsg(const struct pt_regs *regs)
+ * 用户参数在 regs->regs[0..2]: fd, msg, flags
+ * 注意内核 pt_regs 里的 regs[0..2] 就是 syscall 的 x0..x2, 直接取。 */
 static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct gyro_recv_ctx *ctx = this_cpu_ptr(&gyro_ctx);
-	struct socket *sock = (struct socket *)regs->regs[0];
-	struct msghdr *msg = (struct msghdr *)regs->regs[1];
-	unsigned long size = regs->regs[2];
+	struct user_msghdr umh;
 
 	ctx->valid = false;
 
-	if (!READ_ONCE(g_gyro_sock_on) || !sock || !msg)
+	if (!READ_ONCE(g_gyro_sock_on))
 		return 0;
 	if (!g_gyro_tgid || current->tgid != g_gyro_tgid)
 		return 0;
 	if (!READ_ONCE(g_gyro_x_bits) && !READ_ONCE(g_gyro_y_bits))
 		return 0;
-	if (!size || (size % ASENSOR_EVENT_SIZE) != 0 || size > GYRO_MSG_MAX)
+
+	if (copy_from_user(&umh, (void __user *)regs->regs[1], sizeof(umh)))
 		return 0;
-	if (!sock->sk || sock->sk->sk_family != AF_UNIX)
-		return 0;
-	/* 传感器走 SOCK_SEQPACKET; SOCK_DGRAM 是别的用途, 不碰 */
-	if (sock->type != SOCK_SEQPACKET)
-		return 0;
-	if (!msg->msg_iov || !msg->msg_iovlen || msg->msg_iovlen > GYRO_IOV_MAX)
+	if (!umh.msg_iov || !umh.msg_iovlen || umh.msg_iovlen > GYRO_IOV_MAX)
 		return 0;
 
-	ctx->iov = msg->msg_iov;
-	ctx->iovlen = msg->msg_iovlen;
-	ctx->size = size;
+	ctx->iov = umh.msg_iov;
+	ctx->iovlen = umh.msg_iovlen;
 	ctx->valid = true;
 	atomic64_inc(&g_gyro_msgs);
 	return 0;
 }
 
-/* 返回之后数据已经在用户 iovec 里了, 这时候改 */
+/* 返回后数据已在用户 iovec 里 */
 static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
 	struct gyro_recv_ctx *ctx = this_cpu_ptr(&gyro_ctx);
@@ -195,7 +201,7 @@ static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long
 	ctx->valid = false;
 
 	n = (unsigned int)ctx->iovlen;
-	if (n > GYRO_IOV_MAX)
+	if (!n || n > GYRO_IOV_MAX)
 		return;
 	if (copy_from_user(kiov, ctx->iov, n * sizeof(struct iovec)))
 		return;
@@ -205,7 +211,7 @@ static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long
 		if (total > GYRO_MSG_MAX)
 			return;
 	}
-	if (total < ASENSOR_EVENT_SIZE)
+	if (total < ASENSOR_EVENT_SIZE || (total % ASENSOR_EVENT_SIZE) != 0)
 		return;
 
 	gyro_rewrite_iov(kiov, n, total);
@@ -222,21 +228,21 @@ int gyro_sock_install(pid_t system_server_tgid)
 	}
 
 	memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
-	g_gyro_kp.symbol_name = "sock_recvmsg";
+	g_gyro_kp.symbol_name = "__arm64_sys_recvmsg";
 	g_gyro_kp.pre_handler = gyro_recv_pre;
 	g_gyro_kp.post_handler = gyro_recv_post;
 
 	ret = register_kprobe(&g_gyro_kp);
 	if (ret) {
-		pr_err("[wind] gyro-sock: sock_recvmsg 挂不上 (%d)\n", ret);
+		pr_err("[wind] gyro-sock: __arm64_sys_recvmsg 挂不上 (%d)\n", ret);
 		memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
-		g_gyro_kp.symbol_name = "unix_dgram_recvmsg";
+		g_gyro_kp.symbol_name = "__arm64_sys_recvfrom";
 		g_gyro_kp.pre_handler = gyro_recv_pre;
 		g_gyro_kp.post_handler = gyro_recv_post;
 		ret = register_kprobe(&g_gyro_kp);
 	}
 	if (ret) {
-		pr_err("[wind] gyro-sock: 回落 unix_dgram_recvmsg 也失败 (%d)\n", ret);
+		pr_err("[wind] gyro-sock: 回落 __arm64_sys_recvfrom 也失败 (%d)\n", ret);
 		memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
 		return ret;
 	}
