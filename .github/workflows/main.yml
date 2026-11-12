@@ -517,9 +517,91 @@ jobs:
           fi
           readelf -SW "$KM" | grep -E "__versions|version_ext" || echo "  (没有版本段)"
 
+      - name: Rename module by kernel version
+        run: |
+          set -eu
+          KM=kernel-src/drivers/wind/wind.ko
+          KV="${{ matrix.kernel_version }}"
+          if [ -z "$KV" ]; then
+            # 没在矩阵里写死的, 从 vermagic 第一段取
+            KV=$(modinfo -F vermagic "$KM" | awk '{print $1}' | cut -d- -f1)
+            echo "从 vermagic 取到 $KV"
+          fi
+          case "$KV" in
+            [0-9]*.[0-9]*) ;;
+            *) echo "::error::内核版本不合法: [$KV]"; exit 1 ;;
+          esac
+          mkdir -p dist
+          cp "$KM" "dist/wind-${KV}.ko"
+          echo "[OK] dist/wind-${KV}.ko"
+          ls -l dist
+
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
           name: wind-${{ matrix.name }}
-          path: kernel-src/drivers/wind/wind.ko
+          path: dist/wind-*.ko
+          if-no-files-found: error
+
+  # 把 6 个 ko 加密内嵌进刷入器, 编成单个 arm64 可执行文件
+  flasher:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all ko
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wind-*
+          path: dist
+          merge-multiple: true
+
+      - name: List payload sources
+        run: ls -l dist
+
+      - name: Setup NDK
+        run: |
+          curl -fsSL --retry 8 -o /tmp/ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-r27c" >> "$GITHUB_ENV"
+          "$ANDROID_NDK_HOME/ndk-build" --version
+
+      - name: Generate payload.c
+        run: |
+          python3 tools/mkpayload.py dist/*.ko -o tools/flasher/jni/payload.c
+          wc -c tools/flasher/jni/payload.c
+
+      - name: Build flasher
+        run: |
+          cd tools/flasher
+          "$ANDROID_NDK_HOME/ndk-build" \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=jni/Android.mk \
+            NDK_APPLICATION_MK=jni/Application.mk
+          ls -lh libs/arm64-v8a/
+
+      - name: Self test unpack path
+        run: |
+          set -eu
+          KV=$(grep -oP '\{ "\K[0-9.]+' tools/flasher/jni/payload.c | head -1)
+          echo "用 $KV 试解"
+          gcc -O2 -std=gnu11 -Itools/flasher/jni -o /tmp/wt \
+            tools/selftest_extract.c \
+            tools/flasher/jni/loader.c \
+            tools/flasher/jni/chacha20.c \
+            tools/flasher/jni/payload.c
+          WIND_KVER_FORCE="$KV" /tmp/wt /tmp/selftest.ko
+          ls -l /tmp/selftest.ko
+          # 解出来的必须是 ELF 且是 ko
+          head -c 4 /tmp/selftest.ko | od -An -tx1 | grep -q '7f 45 4c 46' \
+            || { echo "::error:: 解出来的不是 ELF"; exit 1; }
+
+      - name: Upload flasher
+        uses: actions/upload-artifact@v4
+        with:
+          name: wind-flash-arm64
+          path: tools/flasher/libs/arm64-v8a/wind_flash
           if-no-files-found: error

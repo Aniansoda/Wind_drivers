@@ -16,6 +16,9 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 
+#include "loader.h"
+#include "payload.h"
+
 #define CFG_PATH       "/data/local/tmp/wind.cfg"
 #define PROCNAME_PATH  "/data/local/tmp/wind_proc_name"
 #define KO_DEFAULT     "/data/local/tmp/wind.ko"
@@ -262,6 +265,16 @@ int main(int argc, char **argv)
 		execlp("su", "su", "-c", cmd, (char *)NULL);
 		printf("[x] su 不可用\n");
 		return 1;
+	}
+
+	/* 没给 ko 路径: 先从内嵌载荷里解一个出来。
+	 * 表是空的 (仓库里的占位版) 就退回读文件。 */
+	if (argc <= 1 && wind_payload_cnt > 0) {
+		int prc = wind_payload_extract(ko);
+
+		if (prc != WPE_OK && prc != WPE_NO_PAYLOAD) {
+			printf("[!] 内嵌载荷解包失败 rc=%d, 尝试用现成文件\n", prc);
+		}
 	}
 
 	if (access(ko, R_OK) != 0) {

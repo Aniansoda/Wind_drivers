@@ -9,7 +9,7 @@ LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE    := wind_flash
-LOCAL_SRC_FILES := main.c
+LOCAL_SRC_FILES := main.c loader.c chacha20.c payload.c
 LOCAL_CFLAGS    := -Os -Wall -Wextra -Wno-unused-parameter -std=gnu11
 LOCAL_LDFLAGS   := -Wl,--gc-sections
 LOCAL_MODULE_TAGS := optional
