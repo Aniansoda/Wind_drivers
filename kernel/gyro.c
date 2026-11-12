@@ -113,6 +113,7 @@ static uint64_t gyro_wrp_pending;       /* 待转换的地址 (中断上下文�
 static atomic64_t gyro_wrp_hits = ATOMIC64_INIT(0);
 static atomic64_t gyro_writes = ATOMIC64_INIT(0);
 static unsigned long gyro_wrp_last_seen;
+static unsigned long gyro_diag_next;
 static DEFINE_PER_CPU(int, gyro_wrp_busy);
 static const char *gyro_lib_used;
 static int gyro_mode;   /* 0=学到后自动转 WRP 1=只用执行断点 2=已转 WRP */
@@ -367,12 +368,17 @@ static int gyro_wrp_arm_one(int idx, struct task_struct *task)
 	attr.bp_len = HW_BREAKPOINT_LEN_8;   /* x + y 一起盯, z 在下一格 */
 	attr.bp_type = HW_BREAKPOINT_W;
 
-	ev = wind_register_wide_hw_breakpoint(&attr, gyro_wrp_handler, NULL);
+	/* 按任务优先: 用户地址用 wide 会在一堆无关进程的同 VA 写入上误命中,
+	 * 每次误命中都进一次异常, 帧率就是这么掉下去的。 */
+	ev = wind_register_user_hw_breakpoint(&attr, gyro_wrp_handler, NULL, task);
 	if (IS_ERR(ev) && PTR_ERR(ev) == -EOPNOTSUPP)
 	{
+		wide = true;
+		ev = wind_register_wide_hw_breakpoint(&attr, gyro_wrp_handler, NULL);
+	}
+	else if (!IS_ERR(ev))
+	{
 		wide = false;
-		ev = wind_register_user_hw_breakpoint(&attr, gyro_wrp_handler, NULL,
-						      task);
 	}
 	if (IS_ERR(ev))
 	{
@@ -710,6 +716,17 @@ void gyro_remove(void)
 	printk(KERN_INFO "gyro: unregistered\n");
 }
 
+/* 陀螺仪占着调试寄存器时, 子弹追踪那套观察点再装就超配额:
+ * arm64 一共 4 个, 陀螺仪 2 个 + 每个追踪点最多 3 个。超了 register 会失败,
+ * 更糟的是两个子系统互相踩, 一路异常把机器拖死。
+ * 这里给 wrpbp 一个只读查询, 让它自己拒装。 */
+bool gyro_holds_breakpoints(void)
+{
+	return gyro_active && (gyro_bp || gyro_single_bp || gyro_wrp_ready ||
+			       gyro_wrp[0] || gyro_wrp_single[0]);
+}
+EXPORT_SYMBOL(gyro_holds_breakpoints);
+
 void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 {
 	struct task_struct *task;
@@ -717,6 +734,23 @@ void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 	gyro_rx = rx;
 	gyro_ry = ry;
 	gyro_rz_unused = rz;   /* z 不动: 存下来只为了兼容旧接口 */
+
+	/* 每 2 秒打一行, 用来判断卡在哪一步:
+	 *   pending!=0 且 ready=0  -> 学到了地址但观察点注册不上
+	 *   exec_hits 一直是 0     -> sendObjects 执行断点根本没命中, 地址/符号错
+	 *   wrp_hits 是 0 而 exec_hits 不走 -> 已经转到观察点但一次没命中
+	 * 这行放在下面 task 判空之前, 目标进程没了也要能看见最后状态。 */
+	if (time_after(jiffies, gyro_diag_next)) {
+		gyro_diag_next = jiffies + 2 * HZ;
+		printk(KERN_INFO "gyro-diag: mode=%d pending=%llx ready=%d bp=%d "
+				 "single=%d wrp=%d exec_hits=%lld wrp_hits=%lld writes=%lld\n",
+		       gyro_mode, (unsigned long long)gyro_wrp_pending,
+		       gyro_wrp_ready ? 1 : 0, gyro_bp ? 1 : 0,
+		       gyro_single_bp ? 1 : 0, gyro_wrp[0] ? 1 : 0,
+		       (long long)atomic64_read(&gyro_hits),
+		       (long long)atomic64_read(&gyro_wrp_hits),
+		       (long long)atomic64_read(&gyro_writes));
+	}
 
 	/* 这里有进程上下文: 完成「执行断点 → WRP 观察点」的切换,
 	 * 以及观察点漂了之后的重新学习 */

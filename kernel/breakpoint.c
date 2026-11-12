@@ -1392,6 +1392,8 @@ static void wrpbp_apply_fregs(int slot)
 	preempt_enable();
 }
 
+extern bool gyro_holds_breakpoints(void);
+
 /* 每秒最多写回这么多次, 超了就暂停该槽位的写回 */
 #define WRPBP_RATE_MAX 4000
 static unsigned long wrpbp_rate_last[BP_SLOT_MAX];
@@ -1528,6 +1530,16 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 		return -ESRCH;
 	if (!points || point_count == 0 || point_count > BP_SLOT_MAX)
 		return -EINVAL;
+
+	/* 陀螺仪占着调试寄存器时就别再装追踪点了。
+	 * arm64 只有 4 个, 陀螺仪 2 个 + 每个追踪点最多 3 个, 一起装必然失败;
+	 * 更糟的是两边互相踩, 异常一路打下来把机器拖死 -> 卡死重启。 */
+	if (gyro_holds_breakpoints())
+	{
+		printk(KERN_ERR "wrpbp: 陀螺仪已占用硬件断点, 拒绝安装追踪点 "
+			       "(先关陀螺仪自瞄)\n");
+		return -EBUSY;
+	}
 
 	wrpbp_remove();
 	wrpbp_tgid = sess->task->tgid;
