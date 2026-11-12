@@ -281,7 +281,7 @@ static void write_proc_name(const char *name)
 static void dump_dmesg(void)
 {
 	char *argv[] = { "sh", "-c",
-		"dmesg | grep -E 'wind-cfg|wind-hide|ace|gyro-sock|kgsl' | tail -12",
+		"dmesg | grep -E 'wind-cfg|wind-hide|ace|gyro-sock|kgsl|version magic|invalid module|Unknown symbol' | tail -16",
 		NULL };
 
 	printf(TAG " " K_DIM "内核日志:" K_RST "\n");
@@ -412,9 +412,23 @@ do_load:
 		k_info("insmod 中 ...");
 		rc = run(ins);
 		if (rc != 0) {
-			k_err("insmod 失败 rc=%d", rc);
-			dump_dmesg();
-			return rc;
+			/* vermagic 真改不动时, 内核只在 CONFIG_MODULE_FORCE_LOAD=y
+			 * 的情况下吃 -f。试一次, 不行再报。 */
+			char *insf[11];
+			int i;
+
+			k_warn("insmod 失败 rc=%d, 试 -f", rc);
+			insf[0] = "insmod";
+			insf[1] = "-f";
+			for (i = 1; i <= 8; i++)
+				insf[i + 1] = ins[i];
+			insf[10] = NULL;
+			rc = run(insf);
+			if (rc != 0) {
+				k_err("insmod -f 也失败 rc=%d", rc);
+				dump_dmesg();
+				return rc;
+			}
 		}
 	}
 
