@@ -381,7 +381,7 @@ static struct kprobe ace_smaps_kp = {
 };
 
 /* ---- 新增: /proc/<pid>/fd 目录枚举阻断 ----
- * 6.6 没有可挂的 proc_fd_readdir, 改在 open 入口拦目标进程对 "*/fd" 目录的
+ * 6.6 没有可挂的 proc_fd_readdir, 改在 open 入口拦目标进程对 任意/fd 目录的
  * 打开请求: 路径指针置 NULL 让 getname_flags 返回 -EFAULT。
  * 只匹配以 /fd 结尾的目录本身, 不误伤 fdinfo 和具体 fd 节点。
  */
