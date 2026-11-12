@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -23,6 +24,53 @@
 #define PROCNAME_PATH  "/data/local/tmp/wind_proc_name"
 #define KO_DEFAULT     "/data/local/tmp/wind.ko"
 #define MOD_NAME       "wind"
+
+/* 终端配色 */
+#define K_RST "\033[0m"
+#define K_BLD "\033[1m"
+#define K_DIM "\033[2m"
+#define K_CYA "\033[36m"
+#define K_GRN "\033[32m"
+#define K_YEL "\033[33m"
+#define K_RED "\033[31m"
+#define K_MAG "\033[35m"
+
+#define TAG K_CYA "[+]" K_RST
+
+static void banner(void)
+{
+	fputs(K_CYA K_BLD
+	      "\n"
+	      "██╗    ██╗██╗███╗   ██╗██████╗ \n"
+	      "██║    ██║██║████╗  ██║██╔══██╗\n"
+	      "██║ █╗ ██║██║██╔██╗ ██║██║  ██║\n"
+	      "██║███╗██║██║██║╚██╗██║██║  ██║\n"
+	      "╚███╔███╔╝██║██║ ╚████║██████╔╝\n"
+	      " ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚═════╝ \n"
+	      K_RST, stdout);
+	fputs(TAG " " K_MAG "[Wind-channel] 驱动更新频道@Winddrivers" K_RST "\n\n", stdout);
+	fflush(stdout);
+}
+
+/* 统一输出: 每行都以 [+] 开头, 颜色区分轻重 */
+static void klog(const char *color, const char *fmt, ...)
+{
+	va_list ap;
+
+	fputs(TAG " ", stdout);
+	fputs(color, stdout);
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	fputs(K_RST "\n", stdout);
+	fflush(stdout);
+}
+
+#define k_ok(...)   klog(K_GRN, __VA_ARGS__)
+#define k_info(...) klog(K_CYA, __VA_ARGS__)
+#define k_warn(...) klog(K_YEL, __VA_ARGS__)
+#define k_err(...)  klog(K_RED, __VA_ARGS__)
+#define k_dim(...)  klog(K_DIM, __VA_ARGS__)
 
 struct cfg {
 	int  hide_driver;
@@ -65,7 +113,8 @@ static int ask01(const char *title, int def)
 	char line[32];
 	int v;
 
-	printf("\n %s [0-关/1-开] [默认:%d]\n 请选择: ", title, def);
+	printf(TAG " " K_YEL "%s" K_RST " " K_DIM "[0-关/1-开] 默认:%d" K_RST "\n", title, def);
+	printf(TAG " 请选择: ");
 	fflush(stdout);
 	if (read_line(line, sizeof(line)) < 0)
 		return def;
@@ -77,11 +126,11 @@ static int ask01(const char *title, int def)
 
 /* 常见系统进程名, 让用户有得选 */
 static const char *kProcNames[] = {
-	"",             /* 1  不伪装 */
-	"nvpmgr",       /* 2 */
-	"installer",    /* 3 */
-	"dumpsys",      /* 4 */
-	"media.codec",  /* 5 */
+	"",                 /* 1  不伪装 */
+	"nvpmgr",           /* 2 */
+	"installer",        /* 3 */
+	"dumpsys",          /* 4 */
+	"media.codec",      /* 5 */
 	"android.hardware", /* 6 */
 };
 #define PROC_NAME_CNT ((int)(sizeof(kProcNames) / sizeof(kProcNames[0])))
@@ -91,12 +140,12 @@ static void choose_proc_name(struct cfg *c)
 	char line[64];
 	int i, v;
 
-	printf("\n 进程名伪装\n");
+	printf(TAG " " K_YEL "进程名伪装" K_RST "\n");
 	for (i = 0; i < PROC_NAME_CNT; i++)
-		printf("  %d  %s\n", i + 1,
+		printf(TAG "  %d  %s\n", i + 1,
 		       kProcNames[i][0] ? kProcNames[i] : "不伪装");
-	printf("  %d  自定义\n", PROC_NAME_CNT + 1);
-	printf(" 请选择 [1-%d] [默认:1]: ", PROC_NAME_CNT + 1);
+	printf(TAG "  %d  自定义\n", PROC_NAME_CNT + 1);
+	printf(TAG " 请选择 [1-%d] 默认:1: ", PROC_NAME_CNT + 1);
 	fflush(stdout);
 
 	if (read_line(line, sizeof(line)) < 0 || !line[0]) {
@@ -105,7 +154,7 @@ static void choose_proc_name(struct cfg *c)
 	}
 	v = atoi(line);
 	if (v == PROC_NAME_CNT + 1) {
-		printf(" 输入进程名: ");
+		printf(TAG " 输入进程名: ");
 		fflush(stdout);
 		if (read_line(c->proc_name, sizeof(c->proc_name)) < 0)
 			c->proc_name[0] = 0;
@@ -153,7 +202,7 @@ static void save_cfg(const struct cfg *c)
 	FILE *f = fopen(CFG_PATH, "w");
 
 	if (!f) {
-		printf("[!] 写 %s 失败: %s\n", CFG_PATH, strerror(errno));
+		k_err("写 %s 失败: %s", CFG_PATH, strerror(errno));
 		return;
 	}
 	fprintf(f, "hide_driver=%d\n",   c->hide_driver);
@@ -164,7 +213,7 @@ static void save_cfg(const struct cfg *c)
 	fprintf(f, "gyro=%d\n",          c->gyro);
 	fprintf(f, "proc_name=%s\n",     c->proc_name);
 	fclose(f);
-	printf("\n[+] 配置已存 %s\n", CFG_PATH);
+	k_ok("配置已存 %s", CFG_PATH);
 }
 
 /* 跑一条命令, 返回退出码; 失败返回 -1 */
@@ -175,7 +224,7 @@ static int run(char *const argv[])
 
 	pid = fork();
 	if (pid < 0) {
-		printf("[x] fork 失败: %s\n", strerror(errno));
+		k_err("fork 失败: %s", strerror(errno));
 		return -1;
 	}
 	if (pid == 0) {
@@ -191,17 +240,14 @@ static int run(char *const argv[])
 
 static int module_loaded(void)
 {
-	char *argv[] = { "lsmod", NULL };
 	FILE *p;
 	char line[256];
 	int found = 0;
 
 	/* lsmod 不一定有, 用 /proc/modules 更稳 */
 	p = fopen("/proc/modules", "r");
-	if (!p) {
-		(void)argv;
+	if (!p)
 		return 0;
-	}
 	while (fgets(line, (int)sizeof(line), p)) {
 		if (!strncmp(line, MOD_NAME " ", sizeof(MOD_NAME))) {
 			found = 1;
@@ -218,18 +264,18 @@ static void write_proc_name(const char *name)
 
 	if (!name || !name[0]) {
 		remove(PROCNAME_PATH);
-		printf("[*] 进程名伪装: 关闭\n");
+		k_dim("进程名伪装: 关闭");
 		return;
 	}
 	f = fopen(PROCNAME_PATH, "w");
 	if (!f) {
-		printf("[!] 写 %s 失败: %s\n", PROCNAME_PATH, strerror(errno));
+		k_err("写 %s 失败: %s", PROCNAME_PATH, strerror(errno));
 		return;
 	}
 	fputs(name, f);
 	fclose(f);
 	chmod(PROCNAME_PATH, 0644);
-	printf("[*] 进程名伪装: %s\n", name);
+	k_ok("进程名伪装: %s", name);
 }
 
 static void dump_dmesg(void)
@@ -238,7 +284,7 @@ static void dump_dmesg(void)
 		"dmesg | grep -E 'wind-cfg|wind-hide|ace|gyro-sock|kgsl' | tail -12",
 		NULL };
 
-	printf("\n-------------------\n内核日志:\n");
+	printf(TAG " " K_DIM "内核日志:" K_RST "\n");
 	run(argv);
 }
 
@@ -248,6 +294,8 @@ int main(int argc, char **argv)
 	struct cfg c;
 	char line[64];
 
+	banner();
+
 	/* 非 root 自举: 用 su -c 重新执行自己 */
 	if (getuid() != 0) {
 		char self[512];
@@ -255,15 +303,14 @@ int main(int argc, char **argv)
 		ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
 
 		if (n <= 0) {
-			printf("[x] 取自身路径失败, 请用 su 执行\n");
+			k_err("取自身路径失败, 请用 su 执行");
 			return 1;
 		}
 		self[n] = 0;
 		snprintf(cmd, sizeof(cmd), "%s %s", self, ko);
-		printf("[!] 需要 root, 尝试 su\n");
-		fflush(stdout);
+		k_warn("需要 root, 尝试 su");
 		execlp("su", "su", "-c", cmd, (char *)NULL);
-		printf("[x] su 不可用\n");
+		k_err("su 不可用");
 		return 1;
 	}
 
@@ -272,17 +319,15 @@ int main(int argc, char **argv)
 	if (argc <= 1 && wind_payload_cnt > 0) {
 		int prc = wind_payload_extract(ko);
 
-		if (prc != WPE_OK && prc != WPE_NO_PAYLOAD) {
-			printf("[!] 内嵌载荷解包失败 rc=%d, 尝试用现成文件\n", prc);
-		}
+		if (prc != WPE_OK && prc != WPE_NO_PAYLOAD)
+			k_warn("内嵌载荷没解出来 rc=%d, 试现成文件", prc);
 	}
 
 	if (access(ko, R_OK) != 0) {
-		printf("[x] 找不到 %s (%s)\n", ko, strerror(errno));
+		k_err("找不到 %s (%s)", ko, strerror(errno));
 		return 1;
 	}
-
-	printf("wind 驱动刷入器\n目标: %s\n-------------------\n", ko);
+	k_info("目标: %s", ko);
 
 	cfg_defaults(&c);
 
@@ -292,13 +337,11 @@ int main(int argc, char **argv)
 
 		cfg_defaults(&old);
 		load_cfg(&old);
-		printf("检测到上次配置：\n");
-		printf("  隐藏驱动=%d  pid隐藏=%d  GPU隐藏=%d\n",
-		       old.hide_driver, old.hide_pid, old.hide_gpu);
-		printf("  oppo后门=%d  强制加载=%d  陀螺仪=%d\n",
-		       old.oppo_backdoor, old.force_load, old.gyro);
-		printf("  进程名=%s\n", old.proc_name[0] ? old.proc_name : "无");
-		printf("\n 使用上次配置 [1-是/2-否]\n 请选择: ");
+		k_dim("上次: 驱动隐藏=%d pid隐藏=%d GPU隐藏=%d oppo后门=%d 强制加载=%d 陀螺仪=%d 进程名=%s",
+		      old.hide_driver, old.hide_pid, old.hide_gpu,
+		      old.oppo_backdoor, old.force_load, old.gyro,
+		      old.proc_name[0] ? old.proc_name : "无");
+		printf(TAG " 使用上次配置 " K_DIM "[1-是/2-否]" K_RST " 请选择: ");
 		fflush(stdout);
 		if (read_line(line, sizeof(line)) == 0 && line[0] != '2') {
 			c = old;
@@ -307,18 +350,18 @@ int main(int argc, char **argv)
 	}
 
 	/* 是否加载 */
-	printf("\n 是否加载 Wind 驱动 [1-是/2-否]\n 请选择: ");
+	printf(TAG " " K_YEL "是否加载 Wind 驱动" K_RST " " K_DIM "[1-是/2-否]" K_RST " 请选择: ");
 	fflush(stdout);
 	if (read_line(line, sizeof(line)) == 0 && line[0] == '2') {
-		printf("已取消\n");
+		k_dim("已取消");
 		return 0;
 	}
 
-	c.hide_driver   = ask01("隐藏 Wind 驱动", 1);
-	c.oppo_backdoor = ask01("屏蔽一加/Oppo proc 后门", 1);
+	c.hide_driver   = ask01("隐藏驱动", 1);
+	c.oppo_backdoor = ask01("屏蔽一加后门", 1);
 	c.force_load    = ask01("强制加载", 1);
 
-	printf("\n ---- 以下三项与游戏进程相关, 可单独关闭 ----\n");
+	printf(TAG " " K_DIM "以下三项与游戏进程相关, 可单独关闭" K_RST "\n");
 
 	c.gyro     = ask01("陀螺仪控制", 1);
 	c.hide_pid = ask01("pid 隐藏", 1);
@@ -333,9 +376,9 @@ do_load:
 	/* 卸载旧的 */
 	if (module_loaded()) {
 		char *rm[] = { "rmmod", MOD_NAME, NULL };
-		printf("[*] 卸载已加载的 %s\n", MOD_NAME);
+		k_info("卸载已加载的 %s", MOD_NAME);
 		if (run(rm) != 0)
-			printf("[!] rmmod 失败, 可能仍在使用, 继续尝试加载\n");
+			k_warn("rmmod 失败, 可能仍在使用, 继续加载");
 	}
 
 	write_proc_name(c.proc_name);
@@ -366,29 +409,26 @@ do_load:
 		ins[8]  = a_kp;
 		ins[9]  = NULL;
 
-		printf("\n[*] insmod ...\n");
-		fflush(stdout);
+		k_info("insmod 中 ...");
 		rc = run(ins);
 		if (rc != 0) {
-			printf("[x] insmod 失败 rc=%d\n", rc);
+			k_err("insmod 失败 rc=%d", rc);
 			dump_dmesg();
 			return rc;
 		}
 	}
 
-	printf("[+] insmod 成功\n");
+	k_ok("insmod 成功");
 	sleep(1);
 
 	if (module_loaded())
-		printf("[+] 模块在线\n");
+		k_ok("模块在线");
 	else
-		printf("[!] 不在 /proc/modules 里（hide_driver 生效时属正常）\n");
+		k_warn("/proc/modules 里没有 (hide_driver 生效时正常)");
 
 	dump_dmesg();
 
-	printf("\n-------------------\n");
-	printf("目标进程: 由 Keep 启动时自己读到 pid, 走 OP_BIND 传给驱动。\n");
-	printf("内核不识别包名, 也不扫进程列表。\n");
-	printf("验证: dmesg | grep wind-cfg | tail -5\n");
+	k_dim("目标 pid 由 Keep 启动时读到, 走 OP_BIND 交给驱动");
+	k_dim("验证: dmesg | grep wind-cfg | tail -5");
 	return 0;
 }

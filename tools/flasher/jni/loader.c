@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <stdint.h>
 
 #include "loader.h"
 #include "payload.h"
@@ -125,20 +126,32 @@ static int current_release(char *buf, size_t cap)
 	return 0;
 }
 
-/* "6.6.118-android15-8" -> "6";  "5.10.198" -> "5"
- * 只认大版本: 6.6.66 的 ko 也要能在 6.6.118 上被选中 */
-static int major_ver(const char *in, char *out, size_t cap)
+/* "6.6.118-android15-8" -> "6.6";  "5.10.198" -> "5.10"
+ * 只比前两段: 6.6.x 的 ko 能在 6.6.y 上刷, 6.1 的不会串到 6.6 去。 */
+static int major_minor(const char *in, char *out, size_t cap)
 {
-	size_t i = 0;
+	size_t n = 0;
+	int dot = 0;
 
-	if (!in || in[0] < '0' || in[0] > '9')
+	if (!in)
 		return -1;
-	while (in[i] >= '0' && in[i] <= '9')
-		i++;
-	if (i == 0 || i >= cap)
+	while (in[n] && n + 1 < cap) {
+		if (in[n] >= '0' && in[n] <= '9') {
+			out[n] = in[n];
+			n++;
+			continue;
+		}
+		if (in[n] == '.' && dot == 0) {
+			out[n] = '.';
+			n++;
+			dot = 1;
+			continue;
+		}
+		break;
+	}
+	if (n == 0)
 		return -1;
-	memcpy(out, in, i);
-	out[i] = 0;
+	out[n] = 0;
 	return 0;
 }
 
@@ -170,7 +183,7 @@ static long patch_level(const char *in)
 	return -1;
 }
 
-/* 先找版本段全等, 没有再退回大版本相同; 大版本里取 patch 最大的 */
+/* 先找版本段全等, 再退回同版本线; 同线里取 patch 最大的那条 */
 static const struct wind_payload *pick_payload(const char *release)
 {
 	char want[8];
@@ -179,7 +192,7 @@ static const struct wind_payload *pick_payload(const char *release)
 	long loose_patch = -1;
 	int i;
 
-	if (major_ver(release, want, sizeof(want)) != 0)
+	if (major_minor(release, want, sizeof(want)) != 0)
 		return NULL;
 
 	for (i = 0; i < wind_payload_cnt; i++) {
@@ -188,12 +201,11 @@ static const struct wind_payload *pick_payload(const char *release)
 
 		if (!p->kver)
 			continue;
-
 		if (!strcmp(p->kver, release)) {
 			exact = p;
 			continue;
 		}
-		if (major_ver(p->kver, have, sizeof(have)) != 0)
+		if (major_minor(p->kver, have, sizeof(have)) != 0)
 			continue;
 		if (strcmp(have, want) != 0)
 			continue;
@@ -209,49 +221,99 @@ static const struct wind_payload *pick_payload(const char *release)
 	return exact ? exact : loose;
 }
 
+/* 取 .modinfo 段的 [start,end), 用来判断 vermagic 能不能写长 */
+static int find_modinfo(const unsigned char *buf, size_t len,
+			size_t *sec_start, size_t *sec_end)
+{
+	uint64_t shoff;
+	uint16_t shentsize, shnum, shstrndx;
+	size_t names;
+	uint64_t i;
+
+	if (len < 64 || buf[0] != 0x7f || buf[1] != 'E' ||
+	    buf[2] != 'L' || buf[3] != 'F')
+		return -1;
+	if (buf[4] != 2 || buf[5] != 1)         /* ELFCLASS64, LSB */
+		return -1;
+
+	memcpy(&shoff, buf + 0x28, 8);
+	memcpy(&shentsize, buf + 0x3A, 2);
+	memcpy(&shnum, buf + 0x3C, 2);
+	memcpy(&shstrndx, buf + 0x3E, 2);
+	if (shentsize < 64 || shnum == 0 || shstrndx >= shnum)
+		return -1;
+	if (shoff + (uint64_t)shentsize * shnum > len)
+		return -1;
+
+	{
+		size_t tab = (size_t)(shoff + (uint64_t)shentsize * shstrndx);
+
+		memcpy(&names, buf + tab + 0x18, 8);
+		if (names >= len)
+			return -1;
+	}
+
+	for (i = 0; i < shnum; i++) {
+		size_t sh = (size_t)(shoff + i * shentsize);
+		uint32_t nameoff;
+		uint64_t off, size;
+		const char *nm;
+
+		memcpy(&nameoff, buf + sh, 4);
+		memcpy(&off, buf + sh + 0x18, 8);
+		memcpy(&size, buf + sh + 0x20, 8);
+		if (names + nameoff >= len)
+			continue;
+		nm = (const char *)(buf + names + nameoff);
+		if (strcmp(nm, ".modinfo") != 0)
+			continue;
+		if (off > len || off + size > len)
+			return -1;
+		*sec_start = (size_t)off;
+		*sec_end = (size_t)(off + size);
+		return 0;
+	}
+	return -1;
+}
+
 /* 把 ko 里的 vermagic 版本段改成当前内核的。
- * .modinfo 是定长字符串, 只能写不长于原串的值; 短了就补 NUL 收尾。 */
-static int patch_vermagic(unsigned char *buf, size_t len, const char *release)
+ * 比原串短: 直接覆盖并用 NUL 截断。
+ * 比原串长: 只有 .modinfo 里后面还有空余才写, 否则原样留着。 */
+static void patch_vermagic(unsigned char *buf, size_t len, const char *release)
 {
 	const char *tag = "vermagic=";
-	unsigned char *p, *val;
-	size_t taglen = strlen(tag);
-	size_t toklen;
+	unsigned char *val;
+	size_t toklen = 0;
 	size_t devlen;
+	size_t sec_s = 0, sec_e = 0;
 
-	p = memmem(buf, len, tag, taglen);
-	if (!p)
-		return -1;
-	val = p + taglen;
+	val = memmem(buf, len, tag, strlen(tag));
+	if (!val)
+		return;
+	val += strlen(tag);
 
-	/* 版本段 = 到空格或 NUL 为止 */
-	toklen = 0;
 	while (val + toklen < buf + len && val[toklen] != ' ' && val[toklen] != 0)
 		toklen++;
 
 	devlen = strlen(release);
 	if (toklen == devlen && !memcmp(val, release, devlen))
-		return 0;               /* 已经一致 */
+		return;                         /* 本来就一致 */
 
 	if (devlen <= toklen) {
-		char old[64];
-		size_t keep = toklen < sizeof(old) - 1 ? toklen : sizeof(old) - 1;
-
-		memcpy(old, val, keep);
-		old[keep] = 0;
 		memcpy(val, release, devlen);
-		val[devlen] = 0;        /* 短串: 截断, 后面残留不影响解析 */
-		printf("[*] vermagic 改写: [%s] -> [%s]\n", old, release);
-		return 1;
+		val[devlen] = 0;
+		return;
 	}
 
-	fprintf(stderr,
-		"[!] vermagic 版本段比载荷长, 原地改不下\n"
-		"    载荷 %zu 字节 [%.*s]\n"
-		"    本机 %zu 字节 [%s]\n"
-		"    insmod 会报 version magic 不匹配, 这版内核得单独编\n",
-		toklen, (int)toklen, (char *)val, devlen, release);
-	return 0;
+	if (find_modinfo(buf, len, &sec_s, &sec_e) != 0)
+		return;
+	if ((size_t)(val - buf) + devlen + 1 > sec_e) {
+		printf("[+] vermagic 改不长 (载荷 %zuB / 本机 %zuB), insmod 可能拒绝\n",
+		       toklen, devlen);
+		return;
+	}
+	memcpy(val, release, devlen);
+	val[devlen] = 0;
 }
 
 int wind_payload_extract(const char *dest)
@@ -274,24 +336,20 @@ int wind_payload_extract(const char *dest)
 	if (!hit) {
 		char want[32];
 
-		if (major_ver(release, want, sizeof(want)) != 0)
+		if (major_minor(release, want, sizeof(want)) != 0)
 			snprintf(want, sizeof(want), "?");
-		fprintf(stderr, "[x] 内嵌载荷没有 %s 的, 有:\n", want);
+		printf("\033[31m[+] 没有 %s 的载荷, 可用: ", want);
 		for (i = 0; i < wind_payload_cnt; i++)
-			fprintf(stderr, "      %s\n", wind_payloads[i].kver);
+			printf("%s ", wind_payloads[i].kver);
+		printf("\033[0m\n");
 		return WPE_NO_MATCH;
 	}
-
-	if (strcmp(hit->kver, release) != 0)
-		printf("[*] 大版本匹配: 本机 %s -> 用载荷 %s\n",
-		       release, hit->kver);
 
 	plain = b64_decode(hit->b64, strlen(hit->b64), &plainlen);
 	if (!plain)
 		return WPE_BAD_B64;
 	if (plainlen != hit->size) {
-		fprintf(stderr, "[x] 解出来 %zu 字节, 头部声明 %u\n",
-			plainlen, hit->size);
+		printf("[+] 解出来 %zu 字节, 头部声明 %u\n", plainlen, hit->size);
 		free(plain);
 		return WPE_BAD_SIZE;
 	}
@@ -304,7 +362,7 @@ int wind_payload_extract(const char *dest)
 
 	fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0755);
 	if (fd < 0) {
-		fprintf(stderr, "[x] 写 %s 失败: %s\n", dest, strerror(errno));
+		printf("[+] 写 %s 失败: %s\n", dest, strerror(errno));
 		memset(plain, 0, plainlen);
 		free(plain);
 		return WPE_IO;
@@ -315,11 +373,10 @@ int wind_payload_extract(const char *dest)
 	free(plain);
 
 	if (w != (ssize_t)plainlen) {
-		fprintf(stderr, "[x] 写入不完整: %zd / %zu\n", w, plainlen);
+		printf("[+] 写入不完整: %zd / %zu\n", w, plainlen);
 		return WPE_IO;
 	}
 
-	printf("[+] 载荷 %s → %s (%zu 字节)\n", hit->kver, dest, plainlen);
-	printf("    vermagic: %s\n", hit->vermagic);
+	printf("\033[36m[+]\033[0m 载荷 \033[32m%s\033[0m → %s\n", hit->kver, dest);
 	return rc;
 }
