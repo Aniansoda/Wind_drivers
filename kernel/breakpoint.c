@@ -1591,10 +1591,16 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 			 * 整机每秒多出几万次异常 -> 表现为"用 wind 读取非常卡",
 			 * 断点打得多的时候直接把机器拖死重启。
 			 * register_user_hw_breakpoint 只在该 task 调度上 CPU 时生效。 */
-			(void)wide;
+			/* 按任务优先; 解析不到 user 版时退回 wide, 别把功能整个搞没 */
 			ev = wind_register_user_hw_breakpoint(&attr,
 							      wrpbp_triggered,
 							      NULL, sess->task);
+			if (IS_ERR(ev) && PTR_ERR(ev) == -EOPNOTSUPP)
+			{
+				wide = true;
+				ev = wind_register_wide_hw_breakpoint(&attr,
+								      wrpbp_triggered, NULL);
+			}
 			if (IS_ERR(ev))
 			{
 				ret = PTR_ERR(ev);
