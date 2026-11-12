@@ -1075,8 +1075,17 @@ void clonebp_get_diag(uint32_t *active, uint32_t *pages,
 	/* g_cb_point_cnt / g_cb_page_cnt 由 g_cb_lock 保护;
 	 * 统计数组是 atomic64, 直接读即可。 */
 	mutex_lock(&g_cb_lock);
-	if (active)
-		*active = (uint32_t)g_cb_point_cnt;
+	if (active) {
+		/* 数真正的活跃点: ONESHOT 命中后 active 会清 0,
+		 * 但 g_cb_point_cnt 是分配数, 不会减。 */
+		int i, n = 0;
+
+		for (i = 0; i < CLONEBP_MAX_POINTS; ++i) {
+			if (g_cb_points[i].active && g_cb_points[i].page)
+				n++;
+		}
+		*active = (uint32_t)n;
+	}
 	if (pages)
 		*pages = (uint32_t)g_cb_page_cnt;
 	mutex_unlock(&g_cb_lock);
