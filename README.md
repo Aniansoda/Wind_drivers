@@ -55,7 +55,7 @@ Android / Linux ARM64 内核态内存读写与调试框架
 | 陀螺仪 | 单个执行断点常驻 | 执行断点定位 → **转 WRP 稳态**，X/Y 改写，Z 不进窗口 |
 | 符号 | 直接引用 | 32 个白名单外符号全部 `register_kprobe` 运行时解析 |
 | 兼容 | `#ifdef` 散在代码里 | 统一 `compat.h`，5.10 → 6.18 一份源码 |
-| `0x50..0x55` | — | **ACE 反检测伪装**，10 个 feature bit / 11 个 kprobe |
+| `0x50..0x56` | — | **ACE 反检测伪装**，10 个 feature bit / 11 个 kprobe |
 | `0x0C / 0x0D` | ETM 遗留空位 | 恢复 **BRK 软断点**老接口 `brk_set` / `brk_clear` |
 
 ETM 那条路已删除：Coresight 需要目标 SoC 打开时钟与 funnel，机型覆盖率不够，且观测不到数据本身
@@ -249,6 +249,7 @@ insmod wind.ko transport=0            # 只加载，不装通道，用于排查
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 节点接管 / 仅摘除 |
 | 0x54 | `OP_ACE_SET_FEATURES` | 位掩码 | 写 10 个伪装开关，低 10 位有效 |
 | 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 读当前开关掩码 |
+| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP 浮点寄存器写回（S0..S31） |
 
 `0x38..0x3D` 已撤销，不要在客户端里占位
 

@@ -50,7 +50,7 @@ Source `kernel/` 8067 lines across 19 `.c` / `.h` files
 | `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
 | `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
 | `0x3E / 0x3F` | — | `BP_DIAG` / `BP_ALL_OFF` |
-| `0x50..0x55` | — | **ACE anti-detection camouflage**, 10 feature bits / 11 kprobes |
+| `0x50..0x56` | — | **ACE anti-detection camouflage**, 10 feature bits / 11 kprobes |
 | `0x0C / 0x0D` | ETM leftovers | restored **BRK software breakpoints** `brk_set` / `brk_clear` |
 | Gyro | one resident execution breakpoint | execution breakpoint to locate, then **switch to steady WRP**, X/Y rewritten, Z never in window |
 | Symbols | direct references | 32 out-of-whitelist symbols resolved at runtime via `register_kprobe` |
@@ -246,7 +246,7 @@ No collision with the common `0x800` demo drivers
 | 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | Toggle the module's own logging, off by default |
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` nodes: rebuild fakes / detach only |
 | 0x54 | `OP_ACE_SET_FEATURES` | bitmask | Write the 10 camouflage switches, low 10 bits |
-| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | Read the current switch mask |
+| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP float register write-back (S0..S31) |
 
 `0x38..0x3D` are removed; do not reserve them client-side
 

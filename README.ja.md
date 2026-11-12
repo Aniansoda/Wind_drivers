@@ -46,7 +46,7 @@ Android / Linux ARM64 向けカーネル空間メモリアクセス・デバッ�
 |---|---|---|
 | `0x26..0x2B` | ETM/PTM 分岐追跡 | **WRP データ監視点** `wrpbp` |
 | `0x38..0x3D` | 予約 | 廃止、定義しない |
-| `0x50..0x55` | — | **ACE 検出回避カモフラージュ**、10 feature bit / 11 kprobe |
+| `0x50..0x56` | — | **ACE 検出回避カモフラージュ**、10 feature bit / 11 kprobe |
 | `0x0C / 0x0D` | ETM の残骸 | **BRK ソフトブレーク**旧インタフェース `brk_set` / `brk_clear` を復活 |
 | `0x33` | — | `OP_STATS` キャッシュ統計 |
 | `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
@@ -248,7 +248,7 @@ insmod wind.ko transport=0            # 通信路なしで読み込みのみ、�
 | 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | モジュール自身のログ切替、既定はオフ |
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` ノードの接収 / 摘除のみ |
 | 0x54 | `OP_ACE_SET_FEATURES` | ビットマスク | 10 個のスイッチを書く、下位 10 ビット |
-| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 現在のスイッチマスクを読む |
+| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP 浮動小数点レジスタ書き戻し (S0..S31) |
 
 詳細は `README.md` の「8 ACE 反检测伪装」を参照
 

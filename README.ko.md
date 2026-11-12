@@ -46,7 +46,7 @@ Android / Linux ARM64 커널 공간 메모리 읽기·쓰기 및 디버깅 프�
 |---|---|---|
 | `0x26..0x2B` | ETM/PTM 분기 추적 | **WRP 데이터 관측점** `wrpbp` |
 | `0x38..0x3D` | 예약 | 폐지, 정의하지 않음 |
-| `0x50..0x55` | — | **ACE 탐지 회피 위장**, 10 feature bit / 11 kprobe |
+| `0x50..0x56` | — | **ACE 탐지 회피 위장**, 10 feature bit / 11 kprobe |
 | `0x0C / 0x0D` | ETM 잔재 | **BRK 소프트 브레이크** 구 인터페이스 `brk_set` / `brk_clear` 복원 |
 | `0x33` | — | `OP_STATS` 캐시 통계 |
 | `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
@@ -248,7 +248,7 @@ insmod wind.ko transport=0            # 통신 경로 없이 적재만, 진단�
 | 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | 모듈 자체 로그 전환, 기본 꺼짐 |
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 노드 인수 / 제거만 |
 | 0x54 | `OP_ACE_SET_FEATURES` | 비트마스크 | 10 개 스위치 기록, 하위 10 비트 |
-| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 현재 스위치 마스크 읽기 |
+| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP 부동소수점 레지스터 쓰기 (S0..S31) |
 
 자세한 내용은 `README.md` 의 「8 ACE 反检测伪装」 참조
 
