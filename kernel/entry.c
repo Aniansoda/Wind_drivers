@@ -635,6 +635,14 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return clonebp_clear_records(NULL, (int32_t)arg);
 	case OP_CLONEBP_REFRESH:
 		return clonebp_refresh(NULL);
+	case OP_CLONEBP_SET_RECORD:
+	{
+		CLONEBP_SET_RECORD_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		return clonebp_set_record(req.pid, req.point_index, &req.point);
+	}
 	case OP_ACE_SET:
 		return ace_set_pid((uint32_t)arg);
 	case OP_ACE_SET_FEATURES:

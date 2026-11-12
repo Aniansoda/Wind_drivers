@@ -43,6 +43,9 @@ struct clonebp_point {
 	uint32_t reg_base;
 	uint32_t reg_mask;
 	uint64_t reg_val[CLONEBP_REG_MAX];
+	uint32_t freg_base;            /* 起始 S 寄存器号 0..31 */
+	uint32_t freg_mask;            /* bit0..bit7 -> freg_base+0..7 */
+	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
 	uint32_t imm;                  /* BRK 立即数, 用于区分点 */
 	uint32_t flags;
 	uint64_t trigger_pc;           /* 最近命中 PC */
@@ -61,6 +64,9 @@ int  clonebp_set_pid(uint32_t pid, const void __user *ureq);
 int  clonebp_remove_all(struct mm_struct *mm);
 int  clonebp_clear_records(struct mm_struct *mm, int32_t point_index);
 int  clonebp_refresh(struct mm_struct *mm);
+/* 就地改单点改写配置 (OP_CLONEBP_SET_RECORD): 只采纳 reg_*/freg_*/mode/flags */
+int  clonebp_set_record(uint32_t pid, uint32_t point_index,
+			const CLONEBP_POINT_CONFIG *cfg);
 int  clonebp_get_config(void *uout);
 int  clonebp_set_timing(CLONEBP_TIMING_CONFIG *cfg);
 int  clonebp_get_timing(CLONEBP_TIMING_CONFIG *cfg);

@@ -27,6 +27,8 @@
 #include <asm/ptrace.h>
 #include <asm/insn.h>
 #include <linux/ktime.h>
+#include <asm/fpsimd.h>
+#include "sym.h"   /* wind_fpsimd_preserve_current_state */
 
 #include "clonebp.h"
 
@@ -44,6 +46,7 @@ static DEFINE_MUTEX(g_cb_lock);
 static struct clonebp_page g_cb_pages[CB_MAX_PAGES_TOTAL];
 static int g_cb_page_cnt;
 static atomic64_t g_cb_stat[CLONEBP_ST_MAX];
+static bool g_cb_fp_warned;
 
 /* 全局当前挂载的 kprobe 上下文 */
 static struct mm_struct *g_cb_mm;
@@ -443,6 +446,7 @@ static int cb_brk_do(struct pt_regs *regs)
 
 		if (pt->mode == CLONEBP_MODE_REWRITE) {
 			int k;
+			bool fp_dirty = false;
 
 			for (k = 0; k < CLONEBP_REG_MAX; ++k) {
 				int rn;
@@ -450,8 +454,44 @@ static int cb_brk_do(struct pt_regs *regs)
 				if (!(pt->reg_mask & (1u << k)))
 					continue;
 				rn = (int)pt->reg_base + k;
+				/* x29 = FP, x30 = LR, 都可以写, 但 sp(x31) 不能 */
 				if (rn >= 0 && rn <= 30)
 					regs->regs[rn] = pt->reg_val[k];
+			}
+
+			/* 浮点: arm64 的 S<n> 就是 V<n> 的低 32 位。
+			 * pt_regs 没有 FPSIMD 现场, 只能改 thread.uw.fpsimd_state,
+			 * 再置 TIF_FOREIGN_FPSTATE 让返回用户态时按内存重载。
+			 * 只改内存不置标志 = 改了一份没人读的副本,
+			 * 表现就是"断点命中了但弹道没变"。 */
+			if (pt->freg_mask) {
+				unsigned long fl;
+
+				if (wind_fpsimd_preserve_current_state()) {
+					local_irq_save(fl);
+					for (k = 0; k < CLONEBP_FREG_MAX; ++k) {
+						int rn;
+						u32 *v;
+
+						if (!(pt->freg_mask & (1u << k)))
+							continue;
+						rn = (int)pt->freg_base + k;
+						if (rn < 0 || rn > 31)
+							continue;
+						/* 低 32 位 = S<n>, 高 32 位(D 的另一半)不动 */
+						v = (u32 *)&current->thread.uw.fpsimd_state.vregs[rn];
+						v[0] = pt->freg_val[k];
+						fp_dirty = true;
+					}
+					if (fp_dirty)
+						set_thread_flag(TIF_FOREIGN_FPSTATE);
+					local_irq_restore(fl);
+				} else if (!g_cb_fp_warned) {
+					g_cb_fp_warned = true;
+					printk(KERN_ERR "clonebp: 解析不到 fpsimd_preserve_current_state, "
+					       "浮点写回不会生效 (freg_mask=0x%x)\n",
+					       pt->freg_mask);
+				}
 			}
 		}
 		if (pt->flags & CLONEBP_F_ONESHOT)
@@ -697,9 +737,12 @@ int clonebp_set(struct task_struct *task, const void __user *uconf, uint32_t cou
 		pt->mode = cfg.mode;
 		pt->reg_base = cfg.reg_base;
 		pt->reg_mask = cfg.reg_mask;
+		pt->freg_base = cfg.freg_base;
+		pt->freg_mask = cfg.freg_mask;
 		pt->flags = cfg.flags;
 		pt->imm = cfg.imm ? cfg.imm : (u32)(CLONEBP_BRK_IMM_BASE + i);
 		memcpy(pt->reg_val, cfg.reg_val, sizeof(pt->reg_val));
+		memcpy(pt->freg_val, cfg.freg_val, sizeof(pt->freg_val));
 
 		cp = cb_page_get(mm, cfg.addr, offset, pt->imm, cfg.patch, cfg.patch_len);
 		if (!cp) {
@@ -924,6 +967,50 @@ int clonebp_set_pid(uint32_t pid_arg, const void __user *ureq)
 		return -ESRCH;
 	ret = clonebp_set(task, points, count);
 	put_task_struct(task);
+	return ret;
+}
+
+/* ---- OP_CLONEBP_SET_RECORD: 就地改单个点的写回配置 ----
+ * 已经装好的点不用先拆再装, 直接改 reg_*/freg_*/mode/flags。
+ * addr / patch / imm 属于装载期的东西, 这里不动。
+ */
+int clonebp_set_record(uint32_t pid, uint32_t point_index,
+		       const CLONEBP_POINT_CONFIG *cfg)
+{
+	struct clonebp_point *pt;
+	int ret = 0;
+
+	(void)pid;   /* 目前单目标 mm, pid 只用于将来多目标校验 */
+
+	if (!cfg)
+		return -EINVAL;
+	if (point_index >= (uint32_t)CLONEBP_MAX_POINTS)
+		return -EINVAL;
+
+	mutex_lock(&g_cb_lock);
+
+	if (point_index >= (uint32_t)g_cb_point_cnt) {
+		ret = -ENOENT;
+		goto out;
+	}
+	pt = &g_cb_points[point_index];
+	if (!pt->active) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	/* 只认这几个字段, 其余保持装载时的值 */
+	pt->mode      = cfg->mode;
+	pt->flags     = cfg->flags;
+	pt->reg_base  = cfg->reg_base;
+	pt->reg_mask  = cfg->reg_mask;
+	memcpy(pt->reg_val, cfg->reg_val, sizeof(pt->reg_val));
+	pt->freg_base = cfg->freg_base;
+	pt->freg_mask = cfg->freg_mask;
+	memcpy(pt->freg_val, cfg->freg_val, sizeof(pt->freg_val));
+
+out:
+	mutex_unlock(&g_cb_lock);
 	return ret;
 }
 

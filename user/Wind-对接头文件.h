@@ -528,6 +528,7 @@ typedef struct _WIND_MAP_STATS
 #define CLONEBP_MAX_PAGES    64
 #define CLONEBP_PATCH_MAX    16
 #define CLONEBP_REG_MAX      8
+#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
 #define CLONEBP_BRK_IMM_BASE 0x1000
 
 #define CLONEBP_MODE_LOG     0
@@ -559,6 +560,21 @@ typedef struct _CLONEBP_POINT_CONFIG
 	uint32_t imm;
 	uint32_t patch_len;
 	uint8_t  patch[CLONEBP_PATCH_MAX];
+
+	/* ---- 浮点寄存器写回 (arm64 S0..S31) ----
+	 * reg_base/reg_mask/reg_val 只能写 X0..X30。要改 float 参数
+	 * (比如 UE4 里通过 S0..S7 传的 FVector / 弹道参数) 就得走这里。
+	 *
+	 *   S3 = vregs[3] 的低 32 位, 所以 freg_base=3 就是 S3。
+	 *   freg_mask bit0..bit7 -> freg_base+0 .. freg_base+7。
+	 *   freg_val[k] 是 float 的位模式 (不是 double, 高位补 0)。
+	 *
+	 * 写 S3/S4/S5 三个 float: freg_base=3, freg_mask=0x7,
+	 *   freg_val[0..2] = {x,y,z} 的位模式。
+	 */
+	uint32_t freg_base;               /* 起始 S 寄存器号 0..31 */
+	uint32_t freg_mask;               /* bit0..bit7 对应 freg_base+0..7, 0=不写浮点 */
+	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
 } CLONEBP_POINT_CONFIG, *PCLONEBP_POINT_CONFIG;
 
 typedef struct _CLONEBP_SET_REQUEST
@@ -575,6 +591,18 @@ typedef struct _CLONEBP_RECORD
 	uint32_t hits;
 	uint32_t reserved;
 } CLONEBP_RECORD, *PCLONEBP_RECORD;
+
+/* ---- 改单点配置 (OP_CLONEBP_SET_RECORD = 0x44) ----
+ * 已经装好的点就地改寄存器写回值, 不用先拆再装。
+ * point_index 是 clonebp_set 时的下标; point 里只有
+ * reg_* / freg_* / mode / flags 会被采纳, addr / patch 忽略。
+ */
+typedef struct _CLONEBP_SET_RECORD_REQUEST
+{
+	uint32_t pid;                     /* 目标进程, 0 = 用已绑定的 mm */
+	uint32_t point_index;             /* 第几个点 */
+	CLONEBP_POINT_CONFIG point;       /* 新配置 */
+} CLONEBP_SET_RECORD_REQUEST, *PCLONEBP_SET_RECORD_REQUEST;
 
 typedef struct _CLONEBP_CONFIG
 {
