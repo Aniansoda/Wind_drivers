@@ -61,6 +61,21 @@ jobs:
             cc: "LLVM=-18"
             llvmver: "18"
             mode: modpost
+          # 真机 PJZ110 就是这一版: 6.6.118-android15-8-g9bc34d5b0c79-abogki537459655-4k
+          - name: android15-6.6.118
+            kernel_version: "6.6.118"
+            device_vermagic_prefix: "6.6.118-android15-8-g9bc34d5b0c79-abogki537459655-4k"
+            urls: >-
+              https://android.googlesource.com/kernel/common
+              https://github.com/aosp-mirror/kernel_common.git
+              https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/common.git
+            ref: android15-6.6.118_r00
+            localversion: "-android15-8-g9bc34d5b0c79-abogki537459655-4k"
+            zero_versions: "1"
+            config: gki_defconfig
+            cc: "LLVM=-18"
+            llvmver: "18"
+            mode: modpost
           - name: android16-6.12.58-device
             kernel_version: "6.12.58"
             device_sha: "7704a1ae279b"
@@ -302,10 +317,14 @@ jobs:
               --disable CONFIG_CFI_PERMISSIVE \
               --disable CONFIG_WERROR \
               || true
-            LV="${{ matrix.localversion }}"
-            if [ -n "$LV" ]; then
-              ./scripts/config --set-str CONFIG_LOCALVERSION "$LV" --disable CONFIG_LOCALVERSION_AUTO
-            fi
+          fi
+
+          # LOCALVERSION 不再只在设备 config 下生效 —— 真机内核带
+          # -androidNN-N-gSHA-ab... 后缀, gki_defconfig 默认是空的,
+          # 不补上去 vermagic 第一段就对不上。
+          LV="${{ matrix.localversion }}"
+          if [ -n "$LV" ]; then
+            ./scripts/config --set-str CONFIG_LOCALVERSION "$LV" --disable CONFIG_LOCALVERSION_AUTO
             echo "强制 LOCALVERSION = $LV"
           fi
 
