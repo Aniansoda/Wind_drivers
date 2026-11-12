@@ -74,8 +74,33 @@ if [ "$USE_OLD" != "1" ]; then
     ask01 "GPU 隐藏" hide_gpu 1
 
     # ---- 进程名伪装 ----
-    printf '\n 进程名伪装（回车跳过）\n 输入: '
-    read proc_name
+    # 常见系统进程名, 免得用户不知道填什么
+    PROC_NAMES="|nvpmgr|installer|dumpsys|media.codec|android.hardware"
+    say ""
+    say " 进程名伪装"
+    say "  1  不伪装"
+    _i=2
+    _oldifs="$IFS"
+    IFS='|'
+    for _n in $PROC_NAMES; do
+        [ -z "$_n" ] && continue
+        say "  $_i  $_n"
+        _i=$((_i + 1))
+    done
+    IFS="$_oldifs"
+    say "  $_i  自定义"
+    printf ' 请选择 [1-%s] [默认:1]: ' "$_i"
+    read _pn
+    case "$_pn" in
+        ""|1) proc_name="" ;;
+        2) proc_name=nvpmgr ;;
+        3) proc_name=installer ;;
+        4) proc_name=dumpsys ;;
+        5) proc_name=media.codec ;;
+        6) proc_name=android.hardware ;;
+        "$_i") printf ' 输入进程名: '; read proc_name ;;
+        *) proc_name="" ;;
+    esac
 
     # ---- 目标进程 ----
     printf '\n 目标进程 comm（回车用 com.tencent.tmgp.pubgmhd）\n 输入: '

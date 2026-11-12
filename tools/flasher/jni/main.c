@@ -74,6 +74,48 @@ static int ask01(const char *title, int def)
 	return (v == 0 || v == 1) ? v : def;
 }
 
+/* 常见系统进程名, 让用户有得选 */
+static const char *kProcNames[] = {
+	"",             /* 1  不伪装 */
+	"nvpmgr",       /* 2 */
+	"installer",    /* 3 */
+	"dumpsys",      /* 4 */
+	"media.codec",  /* 5 */
+	"android.hardware", /* 6 */
+};
+#define PROC_NAME_CNT ((int)(sizeof(kProcNames) / sizeof(kProcNames[0])))
+
+static void choose_proc_name(struct cfg *c)
+{
+	char line[64];
+	int i, v;
+
+	printf("\n 进程名伪装\n");
+	for (i = 0; i < PROC_NAME_CNT; i++)
+		printf("  %d  %s\n", i + 1,
+		       kProcNames[i][0] ? kProcNames[i] : "不伪装");
+	printf("  %d  自定义\n", PROC_NAME_CNT + 1);
+	printf(" 请选择 [1-%d] [默认:1]: ", PROC_NAME_CNT + 1);
+	fflush(stdout);
+
+	if (read_line(line, sizeof(line)) < 0 || !line[0]) {
+		c->proc_name[0] = 0;
+		return;
+	}
+	v = atoi(line);
+	if (v == PROC_NAME_CNT + 1) {
+		printf(" 输入进程名: ");
+		fflush(stdout);
+		if (read_line(c->proc_name, sizeof(c->proc_name)) < 0)
+			c->proc_name[0] = 0;
+		return;
+	}
+	if (v >= 1 && v <= PROC_NAME_CNT)
+		snprintf(c->proc_name, sizeof(c->proc_name), "%s", kProcNames[v - 1]);
+	else
+		c->proc_name[0] = 0;
+}
+
 static void load_cfg(struct cfg *c)
 {
 	FILE *f = fopen(CFG_PATH, "r");
@@ -275,10 +317,7 @@ int main(int argc, char **argv)
 	c.hide_gpu = ask01("GPU 隐藏", 1);
 
 	/* 进程名伪装 */
-	printf("\n 进程名伪装（回车跳过）\n 输入: ");
-	fflush(stdout);
-	if (read_line(c.proc_name, sizeof(c.proc_name)) < 0)
-		c.proc_name[0] = 0;
+	choose_proc_name(&c);
 
 	/* 目标进程 */
 	printf("\n 目标进程 comm（回车用 com.tencent.tmgp.pubgmhd）\n 输入: ");
