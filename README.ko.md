@@ -46,6 +46,8 @@ Android / Linux ARM64 커널 공간 메모리 읽기·쓰기 및 디버깅 프�
 |---|---|---|
 | `0x26..0x2B` | ETM/PTM 분기 추적 | **WRP 데이터 관측점** `wrpbp` |
 | `0x38..0x3D` | 예약 | 폐지, 정의하지 않음 |
+| `0x50..0x55` | — | **ACE 탐지 회피 위장**, 10 feature bit / 11 kprobe |
+| `0x0C / 0x0D` | ETM 잔재 | **BRK 소프트 브레이크** 구 인터페이스 `brk_set` / `brk_clear` 복원 |
 | `0x33` | — | `OP_STATS` 캐시 통계 |
 | `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
 | `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
@@ -236,6 +238,20 @@ insmod wind.ko transport=0            # 통신 경로 없이 적재만, 진단�
 | 0x3F | `OP_BP_ALL_OFF` | 모든 계열 일괄 해제, 추적 방식 전환 전에 호출 |
 
 `0x38..0x3D` 는 폐지. 클라이언트에서 자리를 잡지 말 것
+
+### ACE 탐지 회피 위장
+
+| 코드 | 이름 | 인수 | 기능 |
+|---|---|---|---|
+| 0x50 | `OP_ACE_SET` | tgid | 위장 대상 지정, 0 이면 해제 |
+| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | 10 개 히트 카운터 읽기 |
+| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | 모듈 자체 로그 전환, 기본 꺼짐 |
+| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 노드 인수 / 제거만 |
+| 0x54 | `OP_ACE_SET_FEATURES` | 비트마스크 | 10 개 스위치 기록, 하위 10 비트 |
+| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 현재 스위치 마스크 읽기 |
+
+자세한 내용은 `README.md` 의 「8 ACE 反检测伪装」 참조
+
 
 ---
 
@@ -585,6 +601,7 @@ Wind_driver/
 │   ├── breakpoint.c        다섯 계열 + UDP + 섀도 페이지
 │   ├── gyro.c              자이로 hook(실행 bp → WRP 정상 상태)
 │   ├── kgsl.c              GPU kgsl hook
+│   ├── ace.c               ACE 탐지 회피 위장 (kprobe 10 개)
 │   ├── nlcomm.c            netlink 경로와 op 화이트리스트
 │   ├── sym.c               화이트리스트 밖 32개 심볼 실행 시 해석
 │   ├── comm.h              오퍼코드와 프로토콜 구조체

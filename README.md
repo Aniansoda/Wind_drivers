@@ -55,6 +55,8 @@ Android / Linux ARM64 内核态内存读写与调试框架
 | 陀螺仪 | 单个执行断点常驻 | 执行断点定位 → **转 WRP 稳态**，X/Y 改写，Z 不进窗口 |
 | 符号 | 直接引用 | 32 个白名单外符号全部 `register_kprobe` 运行时解析 |
 | 兼容 | `#ifdef` 散在代码里 | 统一 `compat.h`，5.10 → 6.18 一份源码 |
+| `0x50..0x55` | — | **ACE 反检测伪装**，10 个 feature bit / 11 个 kprobe |
+| `0x0C / 0x0D` | ETM 遗留空位 | 恢复 **BRK 软断点**老接口 `brk_set` / `brk_clear` |
 
 ETM 那条路已删除：Coresight 需要目标 SoC 打开时钟与 funnel，机型覆盖率不够，且观测不到数据本身
 `0x26..0x2B` 六个码位改给 WRP，结构体大小与旧 `ETMBP_POINT_CONFIG` 同为 24 字节，老二进制不会错位
@@ -237,6 +239,17 @@ insmod wind.ko transport=0            # 只加载，不装通道，用于排查
 | 0x3E | `OP_BP_DIAG` | 一次性读五个断点家族的槽位与命中计数 |
 | 0x3F | `OP_BP_ALL_OFF` | 一把关掉全部断点，切换追踪方式前先调它 |
 
+### ACE 反检测伪装
+
+| 码 | 名称 | 参数 | 功能 |
+|---|---|---|---|
+| 0x50 | `OP_ACE_SET` | tgid | 指定伪装目标，0 为解除 |
+| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | 读 10 项命中计数 |
+| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | 开关驱动自身日志，默认关 |
+| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 节点接管 / 仅摘除 |
+| 0x54 | `OP_ACE_SET_FEATURES` | 位掩码 | 写 10 个伪装开关，低 10 位有效 |
+| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 读当前开关掩码 |
+
 `0x38..0x3D` 已撤销，不要在客户端里占位
 
 ---
@@ -407,6 +420,37 @@ WRP 递归安全 自己的 `copy_to_user_nofault` 会再次触发观察点
 `set_memory_rw` 不接受内核镜像地址，这里自行走页表把镜像页改成可写
 `ro_state` 只读探测 校验整条页表路径后读叶子 AP[2]，不写页表即可判定只读状态
 
+### 8 ACE 反检测伪装
+
+目标只有 `OP_ACE_SET` 指定的那个 tgid 会被处理，其他进程走原始路径
+每个 feature bit 独立开关，由 `OP_ACE_SET_FEATURES` 一次性写入，低 10 位有效
+
+| bit | 宏 | 挂点 | 处理方式 |
+|---|---|---|---|
+| 0 | `ACE_F_MAPS` | `show_map_vma` | 命中行从 `seq_file` 里滤掉 |
+| 1 | `ACE_F_MODS` | `m_show` | `/proc/modules` 行过滤 |
+| 2 | `ACE_F_KSYM` | `kallsyms_expand_symbol` | 命中符号名清空 |
+| 3 | `ACE_F_TRACERP` | `proc_pid_status` | `TracerPid` 写 0 |
+| 4 | `ACE_F_FS` | `do_sys_openat2` / `do_faccessat` / `vfs_statx` | 路径指针置 `NULL` 走 `-EFAULT` |
+| 5 | `ACE_F_COMM` | `proc_task_name` | 命中线程名过滤 |
+| 6 | `ACE_F_PORT` | `__sys_connect` | 调试端口连接阻断 |
+| 7 | `ACE_F_PROP` | `mmap_region` | 属性区共享映射识别计数 |
+| 8 | `ACE_F_FD` | `do_sys_openat2` | `/proc/<pid>/fd` 目录枚举阻断 |
+| 9 | `ACE_F_SMAPS` | `show_smap` | smaps 段级过滤 |
+
+**顺序** 先 `ace_set(pid)` 绑定目标，再 `ace_set_features(mask)` 打开需要的位
+`ace_get_stat` 回读 10 个计数器，确认每一项是否真的命中过
+计数为 0 说明该挂点没被走到，通常是 symbol 名在该内核版本上变了，看 `dmesg` 里的解析结果
+
+**bit 7 / 8 / 9 是后加的** 分别覆盖属性区识别、fd 目录枚举、smaps 段过滤
+这三条都要求目标进程正在被读取时才计数，空闲时保持 0 属正常
+
+**`ace_enable_feature(bit, on)`** 是单个位的便捷包装，内部先读后写，不是原子操作
+多线程改不同位时自己加锁，或者直接用 `ace_set_features` 一次写完整掩码
+
+**OnePlus `inte` 节点** `ace_inte(0)` 重建三个假节点，`ace_inte(1)` 只摘除不重建
+非 OnePlus 机型上返回 `-ENODEV`，可以先试一次再决定是否走这条
+
 ---
 
 ## 符号策略：零 CRC + 运行时解析
@@ -492,7 +536,7 @@ nofault   copy_from_user_nofault  copy_to_user_nofault
 
 | 文件 | 作用 |
 |---|---|
-| `user/Wind-对接头文件.h` | 一个 `c_wind` 类包含全部能力：读写 / 批量 / 帧缓存 / 快照 / 隐藏 / kgsl / 陀螺仪 / 五套断点 |
+| `user/Wind-对接头文件.h` | 一个 `c_wind` 类包含全部能力：读写 / 批量 / 帧缓存 / 快照 / 隐藏 / kgsl / 陀螺仪 / 五套断点 / 克隆页断点 / ACE 伪装 |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink 通道客户端示例 |
 | `user/Wind-Drivers-*.sh` | 各内核版本自解压安装包（5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18） |
 | `user/Wind-Drivers-6.6.ko` | 6.6 预编译模块 |
@@ -588,6 +632,7 @@ Wind_driver/
 │   ├── breakpoint.c        五套断点框架 + UDP 断点 + 影子页
 │   ├── gyro.c              陀螺仪 hook（exec bp → WRP 稳态）
 │   ├── kgsl.c              GPU kgsl hook
+│   ├── ace.c               ACE 反检测伪装（10 个 kprobe）
 │   ├── nlcomm.c            netlink 私有通道与 op 白名单
 │   ├── sym.c               32 个白名单外符号的运行时解析
 │   ├── comm.h              操作码与协议结构

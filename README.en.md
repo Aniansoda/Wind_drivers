@@ -50,6 +50,8 @@ Source `kernel/` 8067 lines across 19 `.c` / `.h` files
 | `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
 | `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
 | `0x3E / 0x3F` | — | `BP_DIAG` / `BP_ALL_OFF` |
+| `0x50..0x55` | — | **ACE anti-detection camouflage**, 10 feature bits / 11 kprobes |
+| `0x0C / 0x0D` | ETM leftovers | restored **BRK software breakpoints** `brk_set` / `brk_clear` |
 | Gyro | one resident execution breakpoint | execution breakpoint to locate, then **switch to steady WRP**, X/Y rewritten, Z never in window |
 | Symbols | direct references | 32 out-of-whitelist symbols resolved at runtime via `register_kprobe` |
 | Compat | `#ifdef` scattered in code | one `compat.h`, single source tree for 5.10 → 6.18 |
@@ -235,6 +237,17 @@ No collision with the common `0x800` demo drivers
 | 0x3E | `OP_BP_DIAG` | one-shot state of all five breakpoint families |
 | 0x3F | `OP_BP_ALL_OFF` | tear down every family before switching tracking mode |
 
+### ACE anti-detection camouflage
+
+| Opcode | Name | Argument | Purpose |
+|---|---|---|---|
+| 0x50 | `OP_ACE_SET` | tgid | Select the camouflage target; 0 clears it |
+| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | Read the 10 hit counters |
+| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | Toggle the module's own logging, off by default |
+| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` nodes: rebuild fakes / detach only |
+| 0x54 | `OP_ACE_SET_FEATURES` | bitmask | Write the 10 camouflage switches, low 10 bits |
+| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | Read the current switch mask |
+
 `0x38..0x3D` are removed; do not reserve them client-side
 
 ---
@@ -404,6 +417,37 @@ On 52-bit PA parts the top two PA bits live at PTE `[9:8]`, so a plain `| page_t
 `set_memory_rw` refuses image addresses, so the module walks the page table and makes the image page writable itself
 `ro_state` verifies the whole page-table path and reads leaf AP[2] without writing anything
 
+### 8 ACE anti-detection camouflage
+
+Only the tgid handed to `OP_ACE_SET` is affected; every other process takes the original path
+Each feature bit is independent and written in one shot by `OP_ACE_SET_FEATURES`, low 10 bits valid
+
+| bit | Macro | Hook point | Handling |
+|---|---|---|---|
+| 0 | `ACE_F_MAPS` | `show_map_vma` | matching lines filtered out of the `seq_file` |
+| 1 | `ACE_F_MODS` | `m_show` | `/proc/modules` line filtering |
+| 2 | `ACE_F_KSYM` | `kallsyms_expand_symbol` | matching symbol names blanked |
+| 3 | `ACE_F_TRACERP` | `proc_pid_status` | `TracerPid` written as 0 |
+| 4 | `ACE_F_FS` | `do_sys_openat2` / `do_faccessat` / `vfs_statx` | path pointer set to `NULL`, yields `-EFAULT` |
+| 5 | `ACE_F_COMM` | `proc_task_name` | matching thread names filtered |
+| 6 | `ACE_F_PORT` | `__sys_connect` | debug-port connections blocked |
+| 7 | `ACE_F_PROP` | `mmap_region` | property-area shared mappings counted |
+| 8 | `ACE_F_FD` | `do_sys_openat2` | `/proc/<pid>/fd` directory enumeration blocked |
+| 9 | `ACE_F_SMAPS` | `show_smap` | smaps segment-level filtering |
+
+**Order** call `ace_set(pid)` first, then `ace_set_features(mask)`
+Read back with `ace_get_stat` to confirm each counter actually fired
+A zero counter means that hook point was never reached — usually the symbol name differs on that kernel, check the resolution result in `dmesg`
+
+**bits 7 / 8 / 9 were added later** covering property-area detection, fd directory enumeration and smaps filtering
+All three only count while the target is being read; staying at 0 when idle is normal
+
+**`ace_enable_feature(bit, on)`** is a convenience wrapper for a single bit — read-modify-write, not atomic
+Add your own lock when toggling different bits from multiple threads, or write the whole mask with `ace_set_features`
+
+**OnePlus `inte` nodes** `ace_inte(0)` rebuilds three fake nodes, `ace_inte(1)` detaches without rebuilding
+Returns `-ENODEV` on non-OnePlus devices; try once before relying on it
+
 ---
 
 ## Symbol strategy: zero CRC plus runtime resolution
@@ -489,7 +533,7 @@ The related capability degrades but loading still succeeds
 
 | File | Purpose |
 |---|---|
-| `user/Wind-对接头文件.h` | one `c_wind` class with every capability: read / write / batch / frame cache / snapshot / hiding / kgsl / gyro / five breakpoint families |
+| `user/Wind-对接头文件.h` | one `c_wind` class with every capability: read / write / batch / frame cache / snapshot / hiding / kgsl / gyro / five breakpoint families / clone-page breakpoints / ACE camouflage |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink client sample |
 | `user/Wind-Drivers-*.sh` | self-extracting installers (5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18) |
 | `user/Wind-Drivers-6.6.ko` | prebuilt 6.6 module |
@@ -585,6 +629,7 @@ Wind_driver/
 │   ├── breakpoint.c        five breakpoint families + UDP + shadow page
 │   ├── gyro.c              gyro hook (exec bp -> WRP steady state)
 │   ├── kgsl.c              GPU kgsl hook
+│   ├── ace.c               ACE anti-detection camouflage (10 kprobes)
 │   ├── nlcomm.c            netlink transport and op whitelist
 │   ├── sym.c               runtime resolution for 32 out-of-whitelist symbols
 │   ├── comm.h              opcodes and protocol structs

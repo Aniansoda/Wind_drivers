@@ -1,111 +1,75 @@
-#pragma once
-/*
- * wind.h — wind 驱动用户态完整对接头文件 (作者: 川上富江Tomie)
- *
- * 一个头文件包含全部内容:
- *   - 传输层: 内核 netlink 私有协议 (默认, 无设备节点) / 文件 + ioctl (兼容)
- *   - 全部操作码 (与 kernel/comm.h 一一对应)
- *   - 全部请求/响应结构 (布局与内核逐字节一致)
- *   - c_wind: 读写 / 批量 / 隐藏 / kgsl / 陀螺仪 /
- *               hwbp / ptebp / brkbp / etmbp / udpbp 全功能封装
- *
- * 用法 (全部能力都在 c_wind 一个类里, 没有第二个类要管):
- *     #include "wind.hpp"
- *     c_wind &d = c_wind::instance(target_pid);   // 进程内单例, 默认 netlink unit 31
- *     int v = d.read<int>(base + 0x10);
- *     d.write<int>(base + 0x10, 123);
- *
- *     d.frame_begin();                 // 一帧内同地址只读一次
- *     uint64_t hp = 0; d.frame_read(base + 0x100, hp);
- *
- *     d.snap_start(base + 0x200, 60);  // 后台 60Hz 刷新
- *     uint32_t cur = d.snap_value<uint32_t>();
- *     d.snap_stop();
- *
- * 需要多个通道实例时自己构造, 都是 c_wind 的实例:
- *     c_wind d2(30);                 // netlink, 指定协议号
- *     c_wind d3("/dev/null");        // 文件模式 transport=1
- *     c_wind d4("/data/local/tmp/windc");  // 文件模式 transport=2
- *
- * 内存占用: sizeof(c_wind) 约 48 KB, 其中 47 KB 是 frame_ 的帧缓存表 (2048 槽)
- *           单例与静态实例不占栈; 要在函数里建局部实例, 建议 new 到堆上
- *
- * 传输选择:
- *     c_wind()               → netlink (驱动 transport=3, 默认)
- *     c_wind(30)             → netlink, 指定协议号
- *     c_wind("/dev/null")    → 文件模式 (驱动 transport=1)
- *     c_wind("/data/local/tmp/windc") → 文件模式 (驱动 transport=2, 自己 mknod)
- *
- */
+#ifndef WIND_DRIVER_USER_H
+#define WIND_DRIVER_USER_H
 
-#include <sys/fcntl.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <atomic>
+#include <thread>
+#include <poll.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <poll.h>
-#include <pthread.h>
-
-#include <atomic>
-#include <chrono>
-#include <thread>
 #include <linux/netlink.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <stdint.h>
-#include <string.h>
-#include <errno.h>
-#include <stddef.h>
 
-#define WIND_NL_DEFAULT_UNIT 31
-#define WIND_NL_MAGIC        0x574E4C31u /* "WNL1" */
-
-#define HOOK_DEVICE "/dev/null"
-
-typedef struct _WIND_NL_MSG
-{
-	uint32_t magic;  /* WIND_NL_MAGIC */
-	uint32_t op;     /* OPERATIONS 之一 */
-	uint64_t arg;    /* 用户指针/值, 语义同 ioctl 第三参数 */
-	int64_t  result; /* 内核回填 */
-} WIND_NL_MSG;
+#ifndef WIND_NL_DEFAULT_UNIT
+#define WIND_NL_DEFAULT_UNIT 29
+#define WIND_NL_UNIT_MIN     29
+#define WIND_NL_UNIT_MAX     35
+#endif
 
 #define WIND_OP_BASE 0x574E0000
 
+#define WIND_NL_MAGIC 0x574E4C31u
+
+#define WIND_OP_FIRST (WIND_OP_BASE + 0x01)
+#define WIND_OP_LAST  (WIND_OP_BASE + 0x3F)
+
+#define WIND_DEV_MISC  "/dev/windc"
+#define WIND_DEV_NULL  "/dev/null"
+#define WIND_DEV_LOCAL "/data/local/tmp/windc"
+
+#define MMAP_PID_SHIFT 32
+#define MMAP_OFF_MASK  0xFFFFFFFFULL
+
+#define UDPBP_MAX_SLOTS   8
+#define UDPBP_PATCH_MAX   64
+#define UDPBP_PREVIEW_MAX 32
+#define UDPBP_RECORD_MAX  256
+
+#define WIND_BP_MAX_POINTS     16
+
+#define WIND_BP_RECORDS_MAX    4096
+#define WIND_WRPBP_RECORDS_MAX 256
+
 enum OPERATIONS
 {
-	/* 核心 */
-	OP_BIND          = WIND_OP_BASE + 0x01, /* arg = pid */
-	OP_UNBIND        = WIND_OP_BASE + 0x02, /* arg = 0 */
-	OP_READ_MEM      = WIND_OP_BASE + 0x03, /* arg = COPY_MEMORY* */
-	OP_WRITE_MEM     = WIND_OP_BASE + 0x04, /* arg = COPY_MEMORY* */
-	OP_READ_BATCH    = WIND_OP_BASE + 0x05, /* arg = BATCH_REQUEST* */
-	OP_WRITE_BATCH   = WIND_OP_BASE + 0x06, /* arg = BATCH_REQUEST* */
-	OP_SET_MODE      = WIND_OP_BASE + 0x07, /* arg = MODE_REQUEST* */
-	OP_MODULE_BASE   = WIND_OP_BASE + 0x08, /* arg = MODULE_BASE* */
+	OP_BIND          = WIND_OP_BASE + 0x01,
+	OP_UNBIND        = WIND_OP_BASE + 0x02,
+	OP_READ_MEM      = WIND_OP_BASE + 0x03,
+	OP_WRITE_MEM     = WIND_OP_BASE + 0x04,
+	OP_READ_BATCH    = WIND_OP_BASE + 0x05,
+	OP_WRITE_BATCH   = WIND_OP_BASE + 0x06,
+	OP_SET_MODE      = WIND_OP_BASE + 0x07,
+	OP_MODULE_BASE   = WIND_OP_BASE + 0x08,
+	OP_HIDE_FILE     = WIND_OP_BASE + 0x09,
+	OP_HIDE_PROCESS  = WIND_OP_BASE + 0x0A,
+	OP_UNHIDE_ALL    = WIND_OP_BASE + 0x0B,
+	OP_BRK_SET       = WIND_OP_BASE + 0x0C, /* arg = BRK_REQUEST*，老接口，等价 BRKBP 单点安装 */
+	OP_BRK_CLEAR     = WIND_OP_BASE + 0x0D, /* arg = BRK_REQUEST*，按 addr 摘除对应点 */
+	OP_KGSL_HIDE     = WIND_OP_BASE + 0x0E,
+	OP_KGSL_HOOK     = WIND_OP_BASE + 0x0F,
+	OP_GYRO_INSTALL  = WIND_OP_BASE + 0x10,
+	OP_GYRO_REMOVE   = WIND_OP_BASE + 0x11,
+	OP_GYRO_SET      = WIND_OP_BASE + 0x12,
+	OP_GYRO_ENABLE   = WIND_OP_BASE + 0x13,
 
-	/* 隐藏 */
-	OP_HIDE_FILE     = WIND_OP_BASE + 0x09, /* arg = char* 路径 */
-	OP_HIDE_PROCESS  = WIND_OP_BASE + 0x0A, /* arg = pid */
-	OP_UNHIDE_ALL    = WIND_OP_BASE + 0x0B, /* arg = 0 */
-
-	/* 旧版断点 (perf hw_breakpoint 直通) */
-	OP_BRK_SET       = WIND_OP_BASE + 0x0C, /* arg = BRK_REQUEST* */
-	OP_BRK_CLEAR     = WIND_OP_BASE + 0x0D, /* arg = BRK_REQUEST* */
-
-	/* kgsl (GPU 侧隐藏) */
-	OP_KGSL_HIDE     = WIND_OP_BASE + 0x0E, /* arg = pid */
-	OP_KGSL_HOOK     = WIND_OP_BASE + 0x0F, /* arg = 0 */
-
-	/* 陀螺仪 */
-	OP_GYRO_INSTALL  = WIND_OP_BASE + 0x10, /* arg = pid */
-	OP_GYRO_REMOVE   = WIND_OP_BASE + 0x11, /* arg = 0 */
-	OP_GYRO_SET      = WIND_OP_BASE + 0x12, /* arg = GYRO_REQUEST* */
-	OP_GYRO_ENABLE   = WIND_OP_BASE + 0x13, /* arg = 0/1 */
-	OP_GYRO_STOP     = WIND_OP_BASE + 0x2C, /* arg = 0 */
-	OP_GYRO_RESUME   = WIND_OP_BASE + 0x2D, /* arg = 0 */
-
-	/* 硬件断点 (BRP/WRP debug 寄存器, 最多 16 点) */
 	OP_HWBP_SET           = WIND_OP_BASE + 0x14,
 	OP_HWBP_REMOVE        = WIND_OP_BASE + 0x15,
 	OP_HWBP_GET_CONFIG    = WIND_OP_BASE + 0x16,
@@ -113,7 +77,6 @@ enum OPERATIONS
 	OP_HWBP_SET_RECORD    = WIND_OP_BASE + 0x18,
 	OP_HWBP_CLEAR_RECORDS = WIND_OP_BASE + 0x19,
 
-	/* PTE 影子页执行断点 (改权限位触发 fault, 不占 debug 寄存器) */
 	OP_PTEBP_SET           = WIND_OP_BASE + 0x1A,
 	OP_PTEBP_REMOVE        = WIND_OP_BASE + 0x1B,
 	OP_PTEBP_GET_CONFIG    = WIND_OP_BASE + 0x1C,
@@ -121,7 +84,6 @@ enum OPERATIONS
 	OP_PTEBP_SET_RECORD    = WIND_OP_BASE + 0x1E,
 	OP_PTEBP_CLEAR_RECORDS = WIND_OP_BASE + 0x1F,
 
-	/* BRK 软断点 (改写指令为 BRK, 数量无限, 有完整性暴露面) */
 	OP_BRKBP_SET           = WIND_OP_BASE + 0x20,
 	OP_BRKBP_REMOVE        = WIND_OP_BASE + 0x21,
 	OP_BRKBP_GET_CONFIG    = WIND_OP_BASE + 0x22,
@@ -129,71 +91,59 @@ enum OPERATIONS
 	OP_BRKBP_SET_RECORD    = WIND_OP_BASE + 0x24,
 	OP_BRKBP_CLEAR_RECORDS = WIND_OP_BASE + 0x25,
 
-	/* ETM 硬件分支追踪 (Coresight, 不改代码不改页表) */
-	OP_ETMBP_SET           = WIND_OP_BASE + 0x26,
-	OP_ETMBP_REMOVE        = WIND_OP_BASE + 0x27,
-	OP_ETMBP_GET_CONFIG    = WIND_OP_BASE + 0x28,
-	OP_ETMBP_GET_RECORDS   = WIND_OP_BASE + 0x29,
-	OP_ETMBP_SET_RECORD    = WIND_OP_BASE + 0x2A,
-	OP_ETMBP_CLEAR_RECORDS = WIND_OP_BASE + 0x2B,
+	OP_WRPBP_SET           = WIND_OP_BASE + 0x26,
+	OP_WRPBP_REMOVE        = WIND_OP_BASE + 0x27,
+	OP_WRPBP_GET_CONFIG    = WIND_OP_BASE + 0x28,
+	OP_WRPBP_GET_RECORDS   = WIND_OP_BASE + 0x29,
+	OP_WRPBP_SET_VEC       = WIND_OP_BASE + 0x2A,
+	OP_WRPBP_CLEAR_RECORDS = WIND_OP_BASE + 0x2B,
 
-	/* UDP 断点 (内核 UDP 收发路径 kprobe) */
+	OP_GYRO_STOP   = WIND_OP_BASE + 0x2C,
+	OP_GYRO_RESUME = WIND_OP_BASE + 0x2D,
+
 	OP_UDPBP_SET           = WIND_OP_BASE + 0x2E,
 	OP_UDPBP_REMOVE        = WIND_OP_BASE + 0x2F,
 	OP_UDPBP_GET_CONFIG    = WIND_OP_BASE + 0x30,
 	OP_UDPBP_GET_RECORDS   = WIND_OP_BASE + 0x31,
 	OP_UDPBP_CLEAR_RECORDS = WIND_OP_BASE + 0x32,
+
+	OP_STATS = WIND_OP_BASE + 0x33,
+
+	OP_HWBP_SET_REGS = WIND_OP_BASE + 0x34,
+
+	OP_PTEBP_SET_REGS = WIND_OP_BASE + 0x35,
+
+	OP_PTEBP_REFRESH = WIND_OP_BASE + 0x36,
+
+	OP_HWBP_REFRESH = WIND_OP_BASE + 0x37,
+
+	OP_BP_DIAG = WIND_OP_BASE + 0x3E,
+
+	OP_BP_ALL_OFF = WIND_OP_BASE + 0x3F,
+
+	OP_CLONEBP_SET          = WIND_OP_BASE + 0x40,
+	OP_CLONEBP_REMOVE       = WIND_OP_BASE + 0x41,
+	OP_CLONEBP_GET_CONFIG   = WIND_OP_BASE + 0x42,
+	OP_CLONEBP_GET_RECORDS  = WIND_OP_BASE + 0x43,
+	OP_CLONEBP_SET_RECORD   = WIND_OP_BASE + 0x44,
+	OP_CLONEBP_CLEAR_RECORDS= WIND_OP_BASE + 0x45,
+	OP_CLONEBP_REFRESH      = WIND_OP_BASE + 0x46,
+	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47,
+
+	OP_ACE_SET              = WIND_OP_BASE + 0x50,
+	OP_ACE_GET_STAT         = WIND_OP_BASE + 0x51,
+	OP_ACE_VERBOSE          = WIND_OP_BASE + 0x52,
+	OP_ACE_INTE             = WIND_OP_BASE + 0x53,
+	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54,
+	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55,
 };
 
-/* 读取模式 */
 enum READ_MODE
 {
-	MODE_FAST = 0, /* ioremap_cache: 快, 低发热, 可能被 cache 侧信道发现 */
-	MODE_SAFE = 1, /* ioremap_nocache + flush: 慢, 防侧信道 */
+	MODE_FAST = 0,
+	MODE_SAFE = 1,
 };
 
-typedef struct _COPY_MEMORY
-{
-	pid_t pid;
-	uintptr_t addr;
-	void *buffer;
-	size_t size;
-} COPY_MEMORY, *PCOPY_MEMORY;
-
-typedef struct _MODULE_BASE
-{
-	pid_t pid;
-	char *name; /* 模块名, 内核按 basename 匹配 */
-	uintptr_t base;
-} MODULE_BASE, *PMODULE_BASE;
-
-typedef struct _BATCH_ITEM
-{
-	uintptr_t addr;
-	size_t size;
-	void *buffer;
-} BATCH_ITEM, *PBATCH_ITEM;
-
-typedef struct _BATCH_REQUEST
-{
-	uint32_t count;
-	uint32_t reserved;
-	BATCH_ITEM items[]; /* 变长, 最多 1024 */
-} BATCH_REQUEST, *PBATCH_REQUEST;
-
-typedef struct _MODE_REQUEST
-{
-	uint32_t mode; /* MODE_FAST / MODE_SAFE */
-} MODE_REQUEST, *PMODE_REQUEST;
-
-typedef struct _BRK_REQUEST
-{
-	pid_t pid;
-	uintptr_t addr;
-	uint32_t type;
-} BRK_REQUEST, *PBRK_REQUEST;
-
-/* 断点类型 / 长度 */
 enum BP_TYPE
 {
 	BP_TYPE_EXEC  = 1,
@@ -210,14 +160,77 @@ enum BP_LEN
 	BP_LEN_8 = 8,
 };
 
-#define MMAP_PID_SHIFT 32
-#define MMAP_OFF_MASK  0xFFFFFFFFULL
+enum UDPBP_DIR
+{
+	UDPBP_DIR_TX   = 0,
+	UDPBP_DIR_RX   = 1,
+	UDPBP_DIR_BOTH = 2,
+};
+
+enum UDPBP_ACTION
+{
+	UDPBP_ACT_LOG     = 0,
+	UDPBP_ACT_REWRITE = 1,
+};
+
+typedef struct _WIND_NL_MSG
+{
+	uint32_t magic;
+	uint32_t op;
+	uint64_t arg;
+	int64_t  result;
+} WIND_NL_MSG, *PWIND_NL_MSG;
+
+typedef struct _COPY_MEMORY
+{
+	pid_t pid;
+	uintptr_t addr;
+	void *buffer;
+	size_t size;
+} COPY_MEMORY, *PCOPY_MEMORY;
+
+typedef struct _MODULE_BASE
+{
+	pid_t pid;
+	char *name;
+	uintptr_t base;
+} MODULE_BASE, *PMODULE_BASE;
+
+typedef struct _BATCH_ITEM
+{
+	uintptr_t addr;
+	size_t size;
+	void *buffer;
+} BATCH_ITEM, *PBATCH_ITEM;
+
+typedef struct _BATCH_REQUEST
+{
+	uint32_t count;
+	uint32_t reserved;
+	BATCH_ITEM items[];
+} BATCH_REQUEST, *PBATCH_REQUEST;
+
+typedef struct _MODE_REQUEST
+{
+	uint32_t mode;
+} MODE_REQUEST, *PMODE_REQUEST;
+
+/* ---- 老接口 BRK 软断点（0x0C/0x0D）----
+ * 只保留单点安装/摘除，等价 BRKBP 家族的单点形式。
+ * 新代码优先用 brkbp_* 系列；这两个为兼容旧工具保留。
+ */
+typedef struct _BRK_REQUEST
+{
+	pid_t pid;
+	uintptr_t addr;
+	uint32_t type;	/* HW_BREAKPOINT_X / _R / _W / _RW */
+} BRK_REQUEST, *PBRK_REQUEST;
 
 typedef struct _HWBP_POINT_CONFIG
 {
 	uint64_t addr;
-	uint32_t type;   /* BP_TYPE_* */
-	uint32_t length; /* BP_LEN_* */
+	uint32_t type;
+	uint32_t length;
 } HWBP_POINT_CONFIG, *PHWBP_POINT_CONFIG;
 
 typedef struct _HWBP_CONFIG
@@ -232,7 +245,7 @@ typedef struct _HWBP_RECORD
 {
 	uint64_t trigger_pc;
 	uint64_t hit_addr;
-	uint32_t op_mask; /* bit0=读 bit1=写 */
+	uint32_t op_mask;
 	uint32_t reserved;
 } HWBP_RECORD, *PHWBP_RECORD;
 
@@ -263,15 +276,23 @@ typedef struct _HWBP_RECORD_REQUEST
 
 typedef struct _HWBP_CLEAR_REQUEST
 {
-	int32_t point_index; /* -1 = 全部 */
+	int32_t point_index;
 	uint32_t reserved;
 } HWBP_CLEAR_REQUEST, *PHWBP_CLEAR_REQUEST;
+
+typedef struct _HWBP_REG_REQUEST
+{
+	int32_t  point_index;
+	uint32_t enable;
+	uint32_t rx, ry, rz;
+	uint32_t reserved;
+} HWBP_REG_REQUEST, *PHWBP_REG_REQUEST;
 
 typedef struct _PTEBP_POINT_CONFIG
 {
 	uint64_t addr;
-	uint32_t type;   /* 恒 BP_TYPE_EXEC */
-	uint32_t length; /* 恒 4 */
+	uint32_t type;
+	uint32_t length;
 } PTEBP_POINT_CONFIG, *PPTEBP_POINT_CONFIG;
 
 typedef struct _PTEBP_CONFIG
@@ -322,8 +343,8 @@ typedef struct _PTEBP_CLEAR_REQUEST
 typedef struct _BRKBP_POINT_CONFIG
 {
 	uint64_t addr;
-	uint32_t type;   /* 恒 BP_TYPE_EXEC */
-	uint32_t length; /* 恒 4 */
+	uint32_t type;
+	uint32_t length;
 } BRKBP_POINT_CONFIG, *PBRKBP_POINT_CONFIG;
 
 typedef struct _BRKBP_CONFIG
@@ -371,90 +392,72 @@ typedef struct _BRKBP_CLEAR_REQUEST
 	uint32_t reserved;
 } BRKBP_CLEAR_REQUEST, *PBRKBP_CLEAR_REQUEST;
 
-typedef struct _ETMBP_POINT_CONFIG
+typedef struct _WRPBP_POINT_CONFIG
 {
-	uint64_t start; /* 区间起始 */
-	uint64_t end;   /* 区间结束 (开区间) */
-	uint32_t flags; /* 0=分支追踪 1=指令追踪 */
+	uint64_t watch_addr;
+	uint32_t watch_len;
+	uint32_t type;
+	uint32_t components;
 	uint32_t reserved;
-} ETMBP_POINT_CONFIG, *PETMBP_POINT_CONFIG;
+} WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
 
-typedef struct _ETMBP_CONFIG
-{
-	uint32_t active_count;
-	uint32_t trace_id;
-	uint32_t reserved;
-} ETMBP_CONFIG, *PETMBP_CONFIG;
-
-typedef struct _ETMBP_RECORD
-{
-	uint64_t addr;
-	uint64_t timestamp;
-	uint32_t flags; /* bit0=分支 1=异常 2=返回 */
-	uint32_t reserved;
-} ETMBP_RECORD, *PETMBP_RECORD;
-
-typedef struct _ETMBP_SET_REQUEST
+typedef struct _WRPBP_SET_REQUEST
 {
 	uint32_t point_count;
 	uint32_t reserved;
-	ETMBP_POINT_CONFIG points[];
-} ETMBP_SET_REQUEST, *PETMBP_SET_REQUEST;
+	WRPBP_POINT_CONFIG points[];
+} WRPBP_SET_REQUEST, *PWRPBP_SET_REQUEST;
 
-typedef struct _ETMBP_RECORDS_REQUEST
+typedef struct _WRPBP_VEC_REQUEST
 {
-	uint32_t point_index;
-	uint32_t start_index;
-	uint32_t capacity;
-	uint32_t reserved;
-	ETMBP_RECORD *records;
-	uint32_t *count_out;
-} ETMBP_RECORDS_REQUEST, *PETMBP_RECORDS_REQUEST;
+	int32_t  point_index;
+	uint32_t enable;
+	uint32_t x, y, z;
+	uint32_t mask;
+} WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
 
-typedef struct _ETMBP_RECORD_REQUEST
+typedef struct _WRPBP_CONFIG
 {
-	uint32_t point_index;
-	uint32_t record_index;
+	uint32_t active_count;
+	uint32_t watch_addr_lo;
+	uint32_t watch_addr_hi;
 	uint32_t reserved;
-	ETMBP_RECORD record;
-} ETMBP_RECORD_REQUEST, *PETMBP_RECORD_REQUEST;
+} WRPBP_CONFIG, *PWRPBP_CONFIG;
 
-typedef struct _ETMBP_CLEAR_REQUEST
+typedef struct _WIND_BP_DIAG
 {
-	int32_t point_index;
+	uint64_t last_hit_pc;
+	uint32_t hwbp_armed;
+	uint32_t hwbp_hits;
+	uint32_t hwbp_writes;
+	uint32_t hwbp_write_fails;
+	uint32_t ptebp_armed;
+	uint32_t ptebp_reloads;
+	uint32_t ptebp_heal_ok;
+	uint32_t ptebp_heal_fail;
+	uint32_t wrpbp_armed;
+	uint32_t wrpbp_hits;
+	uint32_t wrpbp_writes;
+	uint32_t wrpbp_skips;
+	uint32_t wrpbp_fails;
+	uint32_t last_rx;
+	uint32_t last_ry;
+	uint32_t last_rz;
 	uint32_t reserved;
-} ETMBP_CLEAR_REQUEST, *PETMBP_CLEAR_REQUEST;
+} WIND_BP_DIAG, *PWIND_BP_DIAG;
 
 typedef struct _GYRO_REQUEST
 {
 	uint32_t rx, ry, rz;
 } GYRO_REQUEST, *PGYRO_REQUEST;
 
-enum UDPBP_DIR
-{
-	UDPBP_DIR_TX   = 0,
-	UDPBP_DIR_RX   = 1,
-	UDPBP_DIR_BOTH = 2,
-};
-
-enum UDPBP_ACTION
-{
-	UDPBP_ACT_LOG     = 0,
-	UDPBP_ACT_REWRITE = 1,
-};
-
-#define UDPBP_MAX_SLOTS   8
-#define UDPBP_PATCH_MAX   64
-#define UDPBP_PREVIEW_MAX 32
-#define UDPBP_RECORD_MAX  256
-
 typedef struct _UDPBP_POINT_CONFIG
 {
-	uint32_t pid;       /* 0 = 任意 tgid */
-	uint16_t port;      /* 0 = 任意 (主机序; TX 比目的端口, RX 比源端口) */
-	uint16_t dir;       /* UDPBP_DIR_* */
-	uint16_t action;    /* UDPBP_ACTION_* */
-	uint16_t patch_len; /* <= UDPBP_PATCH_MAX */
+	uint32_t pid;
+	uint16_t port;
+	uint16_t dir;
+	uint16_t action;
+	uint16_t patch_len;
 	uint8_t  patch[UDPBP_PATCH_MAX];
 } UDPBP_POINT_CONFIG, *PUDPBP_POINT_CONFIG;
 
@@ -462,9 +465,9 @@ typedef struct _UDPBP_RECORD
 {
 	uint64_t ts_ns;
 	uint32_t pid;
-	uint32_t saddr; /* 网络序 IPv4 */
+	uint32_t saddr;
 	uint32_t daddr;
-	uint16_t sport; /* 主机序 */
+	uint16_t sport;
 	uint16_t dport;
 	uint16_t dir;
 	uint16_t action;
@@ -505,8 +508,179 @@ typedef struct _UDPBP_CLEAR_REQUEST
 	uint32_t reserved;
 } UDPBP_CLEAR_REQUEST, *PUDPBP_CLEAR_REQUEST;
 
+typedef struct _WIND_MAP_STATS
+{
+	uint64_t reads;
+	uint64_t hits;
+	uint64_t misses;
+	uint64_t evicts;
+	uint64_t cached;
+	uint64_t tr_hits;
+	uint64_t tr_misses;
+} WIND_MAP_STATS, *PWIND_MAP_STATS;
+
+#define CLONEBP_MAX_POINTS   32
+#define CLONEBP_RECORD_MAX   256
+#define CLONEBP_MAX_PAGES    64
+#define CLONEBP_PATCH_MAX    16
+#define CLONEBP_REG_MAX      8
+#define CLONEBP_BRK_IMM_BASE 0x1000
+
+#define CLONEBP_MODE_LOG     0
+#define CLONEBP_MODE_REWRITE 1
+
+#define CLONEBP_F_ONESHOT    0x1
+#define CLONEBP_F_KEEP_ORIG  0x2
+#define CLONEBP_F_NO_FLUSH   0x4
+
+enum CLONEBP_STAT_IDX
+{
+	CLONEBP_ST_IFAULT_IN = 0,
+	CLONEBP_ST_DFAULT_IN = 1,
+	CLONEBP_ST_BRK_HIT   = 2,
+	CLONEBP_ST_TLB_FLUSH = 3,
+	CLONEBP_ST_CLONE_OK  = 4,
+	CLONEBP_ST_CLONE_FAIL= 5,
+	CLONEBP_ST_MAX       = 6,
+};
+
+typedef struct _CLONEBP_POINT_CONFIG
+{
+	uint64_t addr;
+	uint32_t mode;
+	uint32_t reg_base;
+	uint32_t reg_mask;
+	uint32_t flags;
+	uint64_t reg_val[CLONEBP_REG_MAX];
+	uint32_t imm;
+	uint32_t patch_len;
+	uint8_t  patch[CLONEBP_PATCH_MAX];
+} CLONEBP_POINT_CONFIG, *PCLONEBP_POINT_CONFIG;
+
+typedef struct _CLONEBP_SET_REQUEST
+{
+	uint32_t pid;
+	uint32_t point_count;
+	CLONEBP_POINT_CONFIG points[];
+} CLONEBP_SET_REQUEST, *PCLONEBP_SET_REQUEST;
+
+typedef struct _CLONEBP_RECORD
+{
+	uint64_t trigger_pc;
+	uint64_t hit_addr;
+	uint32_t hits;
+	uint32_t reserved;
+} CLONEBP_RECORD, *PCLONEBP_RECORD;
+
+typedef struct _CLONEBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t shadow_pages;
+	uint64_t faults_in_i;
+	uint64_t faults_in_d;
+	uint64_t brk_hits;
+	uint64_t tlb_flushes;
+	uint64_t clone_ok;
+	uint64_t clone_fail;
+	uint32_t reserved[2];
+} CLONEBP_CONFIG, *PCLONEBP_CONFIG;
+
+typedef struct _CLONEBP_RECORDS_REQUEST
+{
+	uint32_t point_index;
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	CLONEBP_RECORD *records;
+	uint32_t *count_out;
+} CLONEBP_RECORDS_REQUEST, *PCLONEBP_RECORDS_REQUEST;
+
+#define CLONEBP_TIMING_BALANCE  (1u << 0)
+#define CLONEBP_TIMING_JITTER   (1u << 1)
+#define CLONEBP_TIMING_TARGET_MAX 200000u
+#define CLONEBP_TIMING_BAILOUT_MIN 1u
+#define CLONEBP_TIMING_BAILOUT_MAX 4096u
+
+typedef struct _CLONEBP_TIMING_CONFIG
+{
+	uint32_t mode;
+	uint32_t target_ns;
+	uint32_t jitter_ns;
+	uint32_t bailout_max;
+	uint64_t cost_ns;
+	uint64_t pad_ns;
+	uint64_t evt_cnt;
+	uint32_t reserved[2];
+} CLONEBP_TIMING_CONFIG, *PCLONEBP_TIMING_CONFIG;
+
+#define ACE_F_MAPS     (1u << 0)
+#define ACE_F_MODS     (1u << 1)
+#define ACE_F_KSYM     (1u << 2)
+#define ACE_F_TRACERP  (1u << 3)
+#define ACE_F_FS       (1u << 4)
+#define ACE_F_COMM     (1u << 5)
+#define ACE_F_PORT     (1u << 6)
+#define ACE_F_PROP     (1u << 7)
+#define ACE_F_FD       (1u << 8)
+#define ACE_F_SMAPS    (1u << 9)
+#define ACE_F_MASK     0x3FFu
+#define ACE_F_NONE     0u
+
+typedef struct _ACE_STAT
+{
+	uint32_t tgid;
+	uint32_t features;
+	uint64_t maps_drop;
+	uint64_t mod_drop;
+	uint64_t ksym_drop;
+	uint64_t tracerp_hide;
+	uint64_t fs_drop;
+	uint64_t comm_drop;
+	uint64_t port_drop;
+	uint64_t smaps_drop;
+	uint64_t fd_drop;
+	uint64_t prop_hit;
+} ACE_STAT, *PACE_STAT;
+
 class c_wind
 {
+public:
+
+	int clonebp_set(const CLONEBP_SET_REQUEST *req) { return xfer(OP_CLONEBP_SET, (uintptr_t)req); }
+	int clonebp_remove() { return xfer(OP_CLONEBP_REMOVE, 0); }
+	int clonebp_get_config(CLONEBP_CONFIG *out) { return out ? xfer(OP_CLONEBP_GET_CONFIG, (uintptr_t)out) : -1; }
+	int clonebp_get_records(uint32_t idx, uint32_t start, CLONEBP_RECORD *recs, uint32_t cap, uint32_t *cnt)
+	{
+		CLONEBP_RECORDS_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.point_index = idx; r.start_index = start; r.capacity = cap;
+		r.records = recs; r.count_out = cnt;
+		return xfer(OP_CLONEBP_GET_RECORDS, (uintptr_t)&r);
+	}
+	int clonebp_clear_records(int32_t idx) { int32_t a[2] = { idx, 0 }; return xfer(OP_CLONEBP_CLEAR_RECORDS, (uintptr_t)a); }
+	int clonebp_refresh() { return xfer(OP_CLONEBP_REFRESH, 0); }
+
+	int clonebp_set_timing(CLONEBP_TIMING_CONFIG *io) { return io ? xfer(OP_CLONEBP_TIMING, (uintptr_t)io) : -1; }
+
+	int brk_set(const BRK_REQUEST *req) { return req ? xfer(OP_BRK_SET, (uintptr_t)req) : -1; }
+	int brk_clear(const BRK_REQUEST *req) { return req ? xfer(OP_BRK_CLEAR, (uintptr_t)req) : -1; }
+
+	int ace_set(uint32_t tgid) { return xfer(OP_ACE_SET, (uintptr_t)tgid); }
+	int ace_get_stat(ACE_STAT *out) { return out ? xfer(OP_ACE_GET_STAT, (uintptr_t)out) : -1; }
+	int ace_verbose(int on) { return xfer(OP_ACE_VERBOSE, (uintptr_t)on); }
+	int ace_inte(int mode) { return xfer(OP_ACE_INTE, (uintptr_t)mode); }
+	int ace_set_features(uint32_t mask) { return xfer(OP_ACE_SET_FEATURES, (uintptr_t)mask); }
+	int ace_get_features(uint32_t *out) { return out ? xfer(OP_ACE_GET_FEATURES, (uintptr_t)out) : -1; }
+
+	int ace_enable_feature(uint32_t bit, bool on)
+	{
+		uint32_t cur = 0;
+		uintptr_t ret = xfer(OP_ACE_GET_FEATURES, (uintptr_t)&cur);
+		if (ret < 0) return (int)ret;
+		cur = on ? (cur | bit) : (cur & ~bit);
+		return xfer(OP_ACE_SET_FEATURES, (uintptr_t)cur);
+	}
+
 private:
 	int fd;
 	int nl_fd;
@@ -514,7 +688,7 @@ private:
 	uint32_t nl_seq;
 	pid_t pid;
 	bool bound;
-	pthread_mutex_t mtx;   /* 后台快照线程与绘制线程共用一条通道, 必须串行 */
+	pthread_mutex_t mtx;
 
 	long xfer_impl(unsigned int op, uintptr_t arg)
 	{
@@ -676,11 +850,8 @@ public:
 		return xfer_impl(op, (uintptr_t)arg);
 	}
 
-	/* 默认 netlink (驱动 transport=3), 无设备节点 */
 	explicit c_wind(int unit = WIND_NL_DEFAULT_UNIT)
 	{
-		struct sockaddr_nl sa;
-
 		fd = -1;
 		nl_unit = -1;
 		bound = false;
@@ -690,26 +861,44 @@ public:
 		frame_.attach(this);
 		snap_.attach(this);
 
-		nl_fd = socket(AF_NETLINK, SOCK_RAW, unit);
-		if (nl_fd < 0)
+		if (unit <= 0)
 		{
-			printf("[-] netlink socket(unit=%d) 失败: %s\n", unit, strerror(errno));
+			for (int u = WIND_NL_UNIT_MIN; u <= WIND_NL_UNIT_MAX; ++u)
+			{
+				if (try_unit(u))
+					break;
+			}
+			if (nl_fd < 0)
+				printf("[-] netlink 探测 %d..%d 全部失败, 请确认已加载\n",
+				       WIND_NL_UNIT_MIN, WIND_NL_UNIT_MAX);
 			return;
 		}
+		if (!try_unit(unit))
+			printf("[-] netlink unit=%d 不可用: %s\n", unit, strerror(errno));
+	}
+
+	bool try_unit(int unit)
+	{
+		struct sockaddr_nl sa;
+
+		int fd = socket(AF_NETLINK, SOCK_RAW, unit);
+
+		if (fd < 0)
+			return false;
 		memset(&sa, 0, sizeof(sa));
 		sa.nl_family = AF_NETLINK;
 		sa.nl_pid = (uint32_t)getpid();
-		if (bind(nl_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+		if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 &&
+		    errno != EADDRINUSE)
 		{
-			printf("[-] netlink bind 失败: %s\n", strerror(errno));
-			close(nl_fd);
-			nl_fd = -1;
-			return;
+			close(fd);
+			return false;
 		}
+		nl_fd = fd;
 		nl_unit = unit;
+		return true;
 	}
 
-	/* 文件模式: transport=1 用 /dev/null, transport=2 用自己 mknod 的节点 */
 	explicit c_wind(const char *dev)
 	{
 		fd = -1;
@@ -744,8 +933,6 @@ public:
 	pid_t target_pid() const { return pid; }
 	int netlink_unit() const { return nl_unit; }
 
-	/* ---- 会话 ---- */
-
 	bool initialize(pid_t target)
 	{
 		if (xfer_impl(OP_BIND, (uintptr_t)target) != 0)
@@ -777,8 +964,6 @@ public:
 
 	int set_fast() { return set_mode(MODE_FAST); }
 	int set_safe() { return set_mode(MODE_SAFE); }
-
-	/* ---- 内存读写 ---- */
 
 	bool read(uintptr_t addr, void *buffer, size_t size)
 	{
@@ -868,6 +1053,62 @@ public:
 		return ret;
 	}
 
+	template <typename C>
+	int read_batch(const C &items)
+	{
+		uint32_t n = (uint32_t)items.size();
+		uintptr_t *a;
+		void **b;
+		size_t *s;
+		int ret;
+
+		if (n == 0 || n > 1024)
+			return -1;
+		a = (uintptr_t *)malloc(sizeof(uintptr_t) * n);
+		b = (void **)malloc(sizeof(void *) * n);
+		s = (size_t *)malloc(sizeof(size_t) * n);
+		if (!a || !b || !s) {
+			free(a); free(b); free(s);
+			return -1;
+		}
+		for (uint32_t i = 0; i < n; ++i) {
+			a[i] = items[i].addr;
+			b[i] = items[i].buffer;
+			s[i] = items[i].size;
+		}
+		ret = read_batch(a, b, s, n);
+		free(a); free(b); free(s);
+		return ret;
+	}
+
+	template <typename C>
+	int write_batch(const C &items)
+	{
+		uint32_t n = (uint32_t)items.size();
+		uintptr_t *a;
+		void **b;
+		size_t *s;
+		int ret;
+
+		if (n == 0 || n > 1024)
+			return -1;
+		a = (uintptr_t *)malloc(sizeof(uintptr_t) * n);
+		b = (void **)malloc(sizeof(void *) * n);
+		s = (size_t *)malloc(sizeof(size_t) * n);
+		if (!a || !b || !s) {
+			free(a); free(b); free(s);
+			return -1;
+		}
+		for (uint32_t i = 0; i < n; ++i) {
+			a[i] = items[i].addr;
+			b[i] = items[i].buffer;
+			s[i] = items[i].size;
+		}
+		ret = write_batch(a, b, s, n);
+		free(a); free(b); free(s);
+		return ret;
+	}
+
 	struct FieldRef
 	{
 		size_t off;
@@ -902,8 +1143,6 @@ public:
 		return ret;
 	}
 
-	/* ---- 模块基址 ---- */
-
 	uintptr_t get_module_base(const char *name)
 	{
 		MODULE_BASE mb;
@@ -927,8 +1166,6 @@ public:
 		return b ? b + off : 0;
 	}
 
-	/* ---- mmap 直读 (仅文件模式有效) ---- */
-
 	void *map(uintptr_t target_va, size_t length)
 	{
 		if (fd < 0)
@@ -943,8 +1180,6 @@ public:
 			munmap(p, length);
 	}
 
-	/* 按目标虚拟地址直接映射, 返回值已经加上页内偏移, 读它就是一条 load。
-	 * 只读映射, 页表被改后看到的是旧页 —— 要绝对新鲜就走 read()。 */
 	void *map_target(uintptr_t va, size_t length)
 	{
 		uintptr_t page = va & ~(uintptr_t)(getpagesize() - 1);
@@ -968,40 +1203,12 @@ public:
 			munmap((char *)p - (va - page), span);
 	}
 
-	/* ---- 隐藏 ---- */
-
 	int hide_file(const char *path) { return (int)xfer_impl(OP_HIDE_FILE, (uintptr_t)path); }
 	int hide_process(pid_t target) { return (int)xfer_impl(OP_HIDE_PROCESS, (uintptr_t)target); }
 	int unhide_all() { return (int)xfer_impl(OP_UNHIDE_ALL, 0); }
 
-	/* ---- kgsl (GPU 侧 pid 隐藏) ---- */
-
 	int kgsl_hide(pid_t target) { return (int)xfer_impl(OP_KGSL_HIDE, (uintptr_t)target); }
 	int kgsl_hook() { return (int)xfer_impl(OP_KGSL_HOOK, 0); }
-
-	/* ---- 旧版断点 (perf 直通) ---- */
-
-	int brk_set(pid_t target, uintptr_t addr, uint32_t type)
-	{
-		BRK_REQUEST br;
-
-		br.pid = target;
-		br.addr = addr;
-		br.type = type;
-		return (int)xfer_impl(OP_BRK_SET, (uintptr_t)&br);
-	}
-
-	int brk_clear(pid_t target, uintptr_t addr)
-	{
-		BRK_REQUEST br;
-
-		br.pid = target;
-		br.addr = addr;
-		br.type = 0;
-		return (int)xfer_impl(OP_BRK_CLEAR, (uintptr_t)&br);
-	}
-
-	/* ---- 陀螺仪 ---- */
 
 	int gyro_install(pid_t target) { return (int)xfer_impl(OP_GYRO_INSTALL, (uintptr_t)target); }
 	int gyro_remove() { return (int)xfer_impl(OP_GYRO_REMOVE, 0); }
@@ -1020,8 +1227,6 @@ public:
 	int gyro_enable(bool enabled) { return (int)xfer_impl(OP_GYRO_ENABLE, (uintptr_t)(enabled ? 1 : 0)); }
 	int gyro_stop() { return (int)xfer_impl(OP_GYRO_STOP, 0); }
 	int gyro_resume() { return (int)xfer_impl(OP_GYRO_RESUME, 0); }
-
-	/* ---- 硬件断点 HWBP ---- */
 
 	int hwbp_set(const HWBP_POINT_CONFIG *pts, uint32_t count)
 	{
@@ -1067,8 +1272,6 @@ public:
 		return (int)bp_clear_records_raw(OP_HWBP_CLEAR_RECORDS, point_index);
 	}
 
-	/* ---- PTE 影子页断点 PTEBP ---- */
-
 	int ptebp_set(const PTEBP_POINT_CONFIG *pts, uint32_t count)
 	{
 		return (int)bp_set_raw(OP_PTEBP_SET, pts, count, sizeof(PTEBP_POINT_CONFIG));
@@ -1106,8 +1309,6 @@ public:
 		return (int)bp_clear_records_raw(OP_PTEBP_CLEAR_RECORDS, point_index);
 	}
 
-	/* ---- BRK 软断点 BRKBP ---- */
-
 	int brkbp_set(const BRKBP_POINT_CONFIG *pts, uint32_t count)
 	{
 		return (int)bp_set_raw(OP_BRKBP_SET, pts, count, sizeof(BRKBP_POINT_CONFIG));
@@ -1144,47 +1345,6 @@ public:
 	{
 		return (int)bp_clear_records_raw(OP_BRKBP_CLEAR_RECORDS, point_index);
 	}
-
-	/* ---- ETM/PTM 分支追踪 ETMBP ---- */
-
-	int etmbp_set(const ETMBP_POINT_CONFIG *pts, uint32_t count)
-	{
-		return (int)bp_set_raw(OP_ETMBP_SET, pts, count, sizeof(ETMBP_POINT_CONFIG));
-	}
-
-	int etmbp_trace(uint64_t start, uint64_t end, uint32_t flags = 0)
-	{
-		ETMBP_POINT_CONFIG p = {start, end, flags, 0};
-
-		return etmbp_set(&p, 1);
-	}
-
-	int etmbp_remove() { return (int)xfer_impl(OP_ETMBP_REMOVE, 0); }
-
-	int etmbp_get_config(ETMBP_CONFIG *out)
-	{
-		return out ? (int)xfer_impl(OP_ETMBP_GET_CONFIG, (uintptr_t)out) : -1;
-	}
-
-	int etmbp_get_records(uint32_t point_index, uint32_t start, ETMBP_RECORD *recs,
-	                      uint32_t cap, uint32_t *count_out)
-	{
-		return (int)bp_get_records_raw(OP_ETMBP_GET_RECORDS, point_index, start,
-		                               recs, cap, count_out);
-	}
-
-	int etmbp_set_record(uint32_t point_index, uint32_t record_index, const ETMBP_RECORD &rec)
-	{
-		return (int)bp_set_record_raw(OP_ETMBP_SET_RECORD, point_index, record_index,
-		                              &rec, sizeof(rec));
-	}
-
-	int etmbp_clear_records(int32_t point_index)
-	{
-		return (int)bp_clear_records_raw(OP_ETMBP_CLEAR_RECORDS, point_index);
-	}
-
-	/* ---- UDP 断点 ---- */
 
 	int udpbp_set(const UDPBP_POINT_CONFIG &point, int32_t *slot_out = NULL)
 	{
@@ -1268,7 +1428,7 @@ public:
 		memcpy(p.patch, patch, len);
 		return udpbp_set(p, slot_out);
 	}
-	
+
 	class Frame
 	{
 	public:
@@ -1426,9 +1586,85 @@ public:
 private:
 	Frame frame_;
 	Snapshot<uint64_t> snap_;
+
+public:
+
+	int hwbp_refresh() { return xfer(OP_HWBP_REFRESH, 0); }
+
+	int hwbp_set_regs(int32_t point_index, bool enable, float x, float y, float z, uint32_t mask = 0x7)
+	{
+		HWBP_REG_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.enable = enable ? 1u : 0u;
+		memcpy(&r.rx, &x, 4);
+		memcpy(&r.ry, &y, 4);
+		memcpy(&r.rz, &z, 4);
+		r.reserved = mask;
+
+		return xfer(OP_HWBP_SET_REGS, (uintptr_t)&r);
+	}
+
+	int ptebp_set_regs(int32_t point_index, bool enable, float x, float y, float z, uint32_t mask = 0x7)
+	{
+		HWBP_REG_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.enable = enable ? 1u : 0u;
+		memcpy(&r.rx, &x, 4);
+		memcpy(&r.ry, &y, 4);
+		memcpy(&r.rz, &z, 4);
+		r.reserved = mask;
+
+		return xfer(OP_PTEBP_SET_REGS, (uintptr_t)&r);
+	}
+	int ptebp_refresh() { return xfer(OP_PTEBP_REFRESH, 0); }
+
+	int wrpbp_set(const WRPBP_POINT_CONFIG *pts, uint32_t count)
+	{
+		if (!pts || count == 0)
+			return -1;
+		return bp_set_raw(OP_WRPBP_SET, pts, count, sizeof(WRPBP_POINT_CONFIG));
+	}
+	int wrpbp_remove() { return xfer(OP_WRPBP_REMOVE, 0); }
+	int wrpbp_get_config(WRPBP_CONFIG *out)
+	{
+		return out ? xfer(OP_WRPBP_GET_CONFIG, (uintptr_t)out) : -1;
+	}
+	int wrpbp_get_records(uint32_t point_index, uint32_t start, HWBP_RECORD *recs,
+	                      uint32_t cap, uint32_t *count_out)
+	{
+		return bp_get_records_raw(OP_WRPBP_GET_RECORDS, point_index, start,
+		                          recs, cap, count_out);
+	}
+	int wrpbp_clear_records(int32_t point_index)
+	{
+		return bp_clear_records_raw(OP_WRPBP_CLEAR_RECORDS, point_index);
+	}
+
+	int wrpbp_set_vec(int32_t point_index, bool enable, float x, float y, float z, uint32_t mask = 0x7)
+	{
+		WRPBP_VEC_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.enable = enable ? 1u : 0u;
+		memcpy(&r.x, &x, 4);
+		memcpy(&r.y, &y, 4);
+		memcpy(&r.z, &z, 4);
+		r.mask = mask;
+
+		return xfer(OP_WRPBP_SET_VEC, (uintptr_t)&r);
+	}
+
+	int bp_all_off() { return xfer(OP_BP_ALL_OFF, 0); }
+	int bp_diag(WIND_BP_DIAG *out)
+	{
+		return out ? xfer(OP_BP_DIAG, (uintptr_t)out) : -1;
+	}
 };
 
-/* 需要全局 driver 指针时, 在包含本头文件前定义这个宏 */
 #ifdef WIND_ENABLE_LEGACY_GLOBAL_DRIVER
 static c_wind *driver = &c_wind::instance();
+#endif
+
 #endif
