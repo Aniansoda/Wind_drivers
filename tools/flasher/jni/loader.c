@@ -282,9 +282,8 @@ static int find_modinfo(const unsigned char *buf, size_t len, struct modinfo_loc
 	return -1;
 }
 
-/* 原地写不下就把整段 .modinfo 搬到文件尾, 再把段头指过去。
- * 内核只按段头读, 追加在 EOF 完全合法; 文件因此长几百字节。
- * 返回新缓冲区(可能 realloc 过), NULL 表示失败。 */
+/* 把 vermagic 的版本号换成当前内核的, 后面 " SMP preempt mod_unload ..."
+ * 这些 flags 原样保留 —— 内核比的就是空格之后那一段, 丢了必炸。 */
 static unsigned char *fix_vermagic(unsigned char *buf, size_t *lenp, const char *release)
 {
 	const char *tag = "vermagic=";
@@ -292,8 +291,10 @@ static unsigned char *fix_vermagic(unsigned char *buf, size_t *lenp, const char 
 	size_t devlen = strlen(release);
 	struct modinfo_loc ml;
 	unsigned char *val;
-	size_t toklen = 0;
-	size_t pos, end, bn = 0, newoff;
+	const unsigned char *suf;
+	char sufbuf[128];
+	size_t toklen = 0, suflen, newlen;
+	size_t pos, end, bn = 0, newoff, cap;
 	unsigned char *blob, *nb;
 	uint64_t o64, s64;
 
@@ -301,34 +302,47 @@ static unsigned char *fix_vermagic(unsigned char *buf, size_t *lenp, const char 
 	if (!val)
 		return buf;
 	val += taglen;
+
 	while (val + toklen < buf + *lenp && val[toklen] != ' ' && val[toklen] != 0)
 		toklen++;
+	if (val + toklen >= buf + *lenp)
+		return buf;
+
+	suflen = strnlen((const char *)(val + toklen),
+			 (size_t)(buf + *lenp - (val + toklen)));
+	if (suflen >= sizeof(sufbuf))
+		return buf;
+	/* flags 先抄到本地再动 buf: 覆盖版本号会把原位置冲掉 */
+	memcpy(sufbuf, val + toklen, suflen);
+	sufbuf[suflen] = 0;
+	suf = (const unsigned char *)sufbuf;
+	newlen = devlen + suflen;
 
 	if (toklen == devlen && !memcmp(val, release, devlen))
-		return buf;                     /* 本来就一致 */
+		return buf;                     /* 版本号本来就对 */
 
-	if (devlen <= toklen) {                 /* 原地够放 */
+	/* 版本号不变长: 原地重写 版本号 + flags */
+	if (devlen <= toklen) {
 		memcpy(val, release, devlen);
-		val[devlen] = 0;
+		memcpy(val + devlen, suf, suflen);
+		val[newlen] = 0;
 		return buf;
 	}
 
 	if (find_modinfo(buf, *lenp, &ml) != 0)
 		return buf;                     /* 不是 ELF, 动不了 */
 
-	/* 原地往后还有空档就直接覆盖 */
-	if ((size_t)(val - buf) + devlen + 1 <= ml.off + ml.size) {
-		size_t room = ml.off + ml.size - (size_t)(val - buf);
-
-		if (room >= devlen + 1) {
-			memcpy(val, release, devlen);
-			val[devlen] = 0;
-			return buf;
-		}
+	/* .modinfo 里后面还有空档就直接写 */
+	if ((size_t)(val - buf) + newlen + 1 <= ml.off + ml.size) {
+		memcpy(val, release, devlen);
+		memcpy(val + devlen, suf, suflen);
+		val[newlen] = 0;
+		return buf;
 	}
 
-	/* 搬段: 逐条复制 modinfo 条目, vermagic 换成新的 */
-	blob = malloc(ml.size + devlen + 128);
+	/* 写不下: 整段 .modinfo 搬到文件尾, 段头指过去 */
+	cap = ml.size + devlen + suflen + 128;
+	blob = malloc(cap);
 	if (!blob)
 		return buf;
 
@@ -341,8 +355,9 @@ static unsigned char *fix_vermagic(unsigned char *buf, size_t *lenp, const char 
 		if (elen == 0)
 			break;                  /* 后面全是填充 */
 		if (!strncmp((const char *)e, tag, taglen)) {
-			bn += (size_t)snprintf((char *)blob + bn, ml.size + devlen + 128 - bn,
-					       "%s%s", tag, release) + 1;
+			bn += (size_t)snprintf((char *)blob + bn, cap - bn,
+					       "%s%s%s", tag, release,
+					       (const char *)suf) + 1;
 		} else {
 			memcpy(blob + bn, e, elen);
 			bn += elen;
