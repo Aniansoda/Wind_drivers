@@ -687,11 +687,13 @@ static void cb_fixup_remote_read(unsigned long addr, void *buf, int len)
 
 		cp = cb_find_page(page_base);
 		if (cp && cp->inited && cp->shadow_page) {
-			char *src = kmap_local_page(cp->shadow_page);
+			/* 必须走 cb_kmap: kmap_local_page 是 5.11 才有的,
+			 * 5.4/5.10 要退到 kmap_atomic。文件顶部已有这对宏。 */
+			char *src = cb_kmap(cp->shadow_page);
 
 			if (src) {
 				memcpy((char *)buf + off, src + in_page, n);
-				kunmap_local(src);
+				cb_kunmap(src);
 				cb_stat_inc(CLONEBP_ST_CLONE_OK);
 			}
 		}
