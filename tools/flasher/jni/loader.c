@@ -414,6 +414,27 @@ int wind_payload_extract(const char *dest)
 	chacha20_xor(plain, plainlen, key, hit->nonce);
 	memset(key, 0, sizeof(key));
 
+	/* 落盘前先认一下是不是 ELF。不是就别让它白跑一趟 insmod,
+	 * 内核那边只会回一句 Exec format error, 看不出是哪一步坏的。 */
+	if (plainlen < 64 || memcmp(plain, "\177ELF", 4) != 0) {
+		unsigned int a = plainlen > 0 ? plain[0] : 0;
+		unsigned int b = plainlen > 1 ? plain[1] : 0;
+		unsigned int c = plainlen > 2 ? plain[2] : 0;
+		unsigned int d = plainlen > 3 ? plain[3] : 0;
+
+		printf("\033[31m[+]\033[0m 解出来不是 ELF: 头 %02x %02x %02x %02x, %zu 字节\n",
+		       a, b, c, d, plainlen);
+		memset(plain, 0, plainlen);
+		free(plain);
+		return WPE_BAD_SIZE;
+	}
+	{
+		unsigned int mach = (unsigned int)plain[18] | ((unsigned int)plain[19] << 8);
+
+		if (mach != 0xb7)
+			printf("\033[33m[+]\033[0m e_machine=0x%x, 期望 0xb7 (AArch64)\n", mach);
+	}
+
 	plain = fix_vermagic(plain, &plainlen, release);
 	if (!plain)
 		return WPE_IO;
