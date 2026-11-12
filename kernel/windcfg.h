@@ -3,13 +3,14 @@
 
 #include <linux/types.h>
 
-/* 刷入器在 insmod 时一次性决定; 加载后不改。
- * 全部默认开启 —— 用户态不再提供任何开关入口。 */
+/* 刷入期配置: 默认全开, 加载后不改, 用户态不提供任何开关入口 */
 int  windcfg_init(void);
 void windcfg_exit(void);
 
-/* 目标进程自动绑定: 由内核自己扫 task 列表,
- * 不依赖用户态 ioctl, 也不要求 insmod 时游戏已经在跑。 */
-pid_t windcfg_target_tgid(void);
+/* 目标进程由用户态传进来 —— 驱动不猜。
+ * 用户态 OP_BIND 成功之后调用, 这里做 ACE 绑定 + 进程隐藏 + GPU 隐藏。 */
+void windcfg_bind_pid(pid_t tgid);
+
+bool windcfg_gyro_on(void);
 
 #endif /* _WINCFG_H_ */

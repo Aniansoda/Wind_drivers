@@ -29,7 +29,6 @@ struct cfg {
 	int  force_load;
 	int  gyro;
 	char proc_name[64];
-	char target_comm[64];
 };
 
 static void cfg_defaults(struct cfg *c)
@@ -42,7 +41,6 @@ static void cfg_defaults(struct cfg *c)
 	c->force_load    = 1;
 	c->gyro          = 1;
 	strcpy(c->proc_name, "");
-	strcpy(c->target_comm, "com.tencent.tmgp.pubgmhd");
 }
 
 /* 读一行, 去掉行尾空白。返回 0 表示读到内容 */
@@ -143,7 +141,6 @@ static void load_cfg(struct cfg *c)
 		else if (!strcmp(line, "force_load"))    c->force_load    = atoi(v) != 0;
 		else if (!strcmp(line, "gyro"))          c->gyro          = atoi(v) != 0;
 		else if (!strcmp(line, "proc_name"))     snprintf(c->proc_name, sizeof(c->proc_name), "%s", v);
-		else if (!strcmp(line, "target_comm"))   snprintf(c->target_comm, sizeof(c->target_comm), "%s", v);
 	}
 	fclose(f);
 }
@@ -163,7 +160,6 @@ static void save_cfg(const struct cfg *c)
 	fprintf(f, "force_load=%d\n",    c->force_load);
 	fprintf(f, "gyro=%d\n",          c->gyro);
 	fprintf(f, "proc_name=%s\n",     c->proc_name);
-	fprintf(f, "target_comm=%s\n",   c->target_comm);
 	fclose(f);
 	printf("\n[+] 配置已存 %s\n", CFG_PATH);
 }
@@ -288,8 +284,7 @@ int main(int argc, char **argv)
 		       old.hide_driver, old.hide_pid, old.hide_gpu);
 		printf("  oppo后门=%d  强制加载=%d  陀螺仪=%d\n",
 		       old.oppo_backdoor, old.force_load, old.gyro);
-		printf("  进程名=%s  目标=%s\n",
-		       old.proc_name[0] ? old.proc_name : "无", old.target_comm);
+		printf("  进程名=%s\n", old.proc_name[0] ? old.proc_name : "无");
 		printf("\n 使用上次配置 [1-是/2-否]\n 请选择: ");
 		fflush(stdout);
 		if (read_line(line, sizeof(line)) == 0 && line[0] != '2') {
@@ -319,21 +314,9 @@ int main(int argc, char **argv)
 	/* 进程名伪装 */
 	choose_proc_name(&c);
 
-	/* 目标进程 */
-	printf("\n 目标进程 comm（回车用 com.tencent.tmgp.pubgmhd）\n 输入: ");
-	fflush(stdout);
-	{
-		char t[64];
-		if (read_line(t, sizeof(t)) == 0 && t[0])
-			snprintf(c.target_comm, sizeof(c.target_comm), "%s", t);
-	}
-
 	save_cfg(&c);
 
 do_load:
-	if (!c.target_comm[0])
-		snprintf(c.target_comm, sizeof(c.target_comm), "%s", "com.tencent.tmgp.pubgmhd");
-
 	/* 卸载旧的 */
 	if (module_loaded()) {
 		char *rm[] = { "rmmod", MOD_NAME, NULL };
@@ -347,8 +330,8 @@ do_load:
 	/* 加载 */
 	{
 		char a_hd[32], a_hp[32], a_hg[32], a_ob[32], a_fl[32], a_gy[32];
-		char a_tc[160], a_kp[320];
-		char *ins[11];
+		char a_kp[320];
+		char *ins[10];
 		int rc;
 
 		snprintf(a_hd, sizeof(a_hd), "hide_driver=%d",   c.hide_driver);
@@ -357,7 +340,6 @@ do_load:
 		snprintf(a_ob, sizeof(a_ob), "oppo_backdoor=%d", c.oppo_backdoor);
 		snprintf(a_fl, sizeof(a_fl), "force_load=%d",    c.force_load);
 		snprintf(a_gy, sizeof(a_gy), "gyro=%d",          c.gyro);
-		snprintf(a_tc, sizeof(a_tc), "target_comm=%s",   c.target_comm);
 		snprintf(a_kp, sizeof(a_kp), "ko_path=%s",       ko);
 
 		ins[0]  = "insmod";
@@ -368,9 +350,8 @@ do_load:
 		ins[5]  = a_ob;
 		ins[6]  = a_fl;
 		ins[7]  = a_gy;
-		ins[8]  = a_tc;
-		ins[9]  = a_kp;
-		ins[10] = NULL;
+		ins[8]  = a_kp;
+		ins[9]  = NULL;
 
 		printf("\n[*] insmod ...\n");
 		fflush(stdout);
@@ -393,8 +374,8 @@ do_load:
 	dump_dmesg();
 
 	printf("\n-------------------\n");
-	printf("自动绑定目标: %s\n", c.target_comm);
-	printf("游戏未启动时内核每 5 秒扫一次, 最多 5 分钟。\n");
+	printf("目标进程: 由 Keep 启动时自己读到 pid, 走 OP_BIND 传给驱动。\n");
+	printf("内核不识别包名, 也不扫进程列表。\n");
 	printf("验证: dmesg | grep wind-cfg | tail -5\n");
 	return 0;
 }

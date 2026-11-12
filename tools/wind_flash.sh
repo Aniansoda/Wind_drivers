@@ -49,7 +49,7 @@ if [ -f "$CFG" ]; then
     say "检测到上次配置："
     say "  隐藏驱动=$hide_driver  pid隐藏=$hide_pid  GPU隐藏=$hide_gpu"
     say "  oppo后门=$oppo_backdoor  强制加载=$force_load  陀螺仪=$gyro"
-    say "  进程名=${proc_name:-无}  目标=${target_comm}"
+    say "  进程名=${proc_name:-无}"
     printf '\n 使用上次配置 [1-是/2-否]\n 请选择: '
     read _u
     [ "$_u" != "2" ] && USE_OLD=1
@@ -102,11 +102,6 @@ if [ "$USE_OLD" != "1" ]; then
         *) proc_name="" ;;
     esac
 
-    # ---- 目标进程 ----
-    printf '\n 目标进程 comm（回车用 com.tencent.tmgp.pubgmhd）\n 输入: '
-    read target_comm
-    [ -z "${target_comm:-}" ] && target_comm=com.tencent.tmgp.pubgmhd
-
     cat > "$CFG" <<CFGEOF
 hide_driver=$hide_driver
 oppo_backdoor=$oppo_backdoor
@@ -115,13 +110,10 @@ gyro=$gyro
 hide_pid=$hide_pid
 hide_gpu=$hide_gpu
 proc_name=$proc_name
-target_comm=$target_comm
 CFGEOF
     say ""
     say "[+] 配置已存 $CFG"
 fi
-
-[ -z "${target_comm:-}" ] && target_comm=com.tencent.tmgp.pubgmhd
 
 # ---- 卸载旧的 ----
 if lsmod 2>/dev/null | grep -q "^$MOD "; then
@@ -151,7 +143,6 @@ insmod "$KO" \
     oppo_backdoor="$oppo_backdoor" \
     force_load="$force_load" \
     gyro="$gyro" \
-    target_comm="$target_comm" \
     ko_path="$KO"
 rc=$?
 
@@ -177,6 +168,6 @@ sep
 say "内核日志:"
 dmesg | grep -E "wind-cfg|wind-hide|ace|gyro-sock|kgsl" | tail -12
 sep
-say "自动绑定目标: $target_comm"
-say "若游戏还没启动，内核会每 5 秒扫一次，最多 5 分钟。"
+say "目标进程: 由 Keep 启动时自己读到 pid, 走 OP_BIND 传给驱动。"
+say "内核不识别包名, 也不扫进程列表。"
 say "验证: dmesg | grep wind-cfg | tail -5"

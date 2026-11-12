@@ -181,6 +181,9 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 			return -ESRCH;
 		}
 		pr_info("wind: BIND pid=%d ok\n", pid);
+		/* 绑上之后按刷入器配置做反检测/隐藏。
+		 * pid 是用户态传进来的, 驱动不自己找游戏。 */
+		windcfg_bind_pid(pid);
 		return 0;
 	}
 	case OP_UNBIND:
