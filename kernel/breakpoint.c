@@ -1392,6 +1392,12 @@ static void wrpbp_apply_fregs(int slot)
 	preempt_enable();
 }
 
+/* 每秒最多写回这么多次, 超了就暂停该槽位的写回 */
+#define WRPBP_RATE_MAX 4000
+static unsigned long wrpbp_rate_last[BP_SLOT_MAX];
+static atomic_t wrpbp_rate_cnt[BP_SLOT_MAX];
+static bool wrpbp_rate_warned[BP_SLOT_MAX];
+
 static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 			    struct pt_regs *regs)
 {
@@ -1434,10 +1440,35 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 
 			if (wrpbp_vec[i].enabled)
 			{
-				this_cpu_inc(wrpbp_busy);
-				wrpbp_apply_vec(i);
-				wrpbp_apply_fregs(i);
-				this_cpu_dec(wrpbp_busy);
+				/* 每秒写回次数限流。
+				 * 观察点打在一个极热的字段上时, 每次命中都改内存
+				 * 等于持续往目标进程里灌数据, 一旦地址或值不对,
+				 * 游戏过一会儿就 SIGSEGV。超限就停手, 只保留计数。 */
+				unsigned long now = jiffies;
+
+				if (!wrpbp_rate_last[i] ||
+				    time_after(now, wrpbp_rate_last[i] + HZ)) {
+					wrpbp_rate_last[i] = now;
+					atomic_set(&wrpbp_rate_cnt[i], 0);
+				}
+				if (atomic_inc_return(&wrpbp_rate_cnt[i]) >
+				    WRPBP_RATE_MAX) {
+					if (!wrpbp_rate_warned[i]) {
+						wrpbp_rate_warned[i] = true;
+						pr_warn("wrpbp: slot %d 写入频率超限(%d/s), "
+							"已暂停写回地址 %llx\n",
+							i, WRPBP_RATE_MAX,
+							(unsigned long long)
+							wrpbp_slots[i].watch_addr);
+					}
+				}
+				else
+				{
+					this_cpu_inc(wrpbp_busy);
+					wrpbp_apply_vec(i);
+					wrpbp_apply_fregs(i);
+					this_cpu_dec(wrpbp_busy);
+				}
 			}
 			return;
 		}
@@ -1460,6 +1491,32 @@ static void wrpbp_clear_slot(int i)
 		wrpbp_slots[i].ev[j] = NULL;
 	}
 	wrpbp_slots[i].active = false;
+}
+
+/* watch_addr 必须整个落在目标进程一个可写 VMA 里。
+ * 不校验的话, 用户传一个错的/过期的地址, apply_vec 就往别处写 12 字节,
+ * 游戏跑一会儿踩到被写坏的数据就 SIGSEGV, 看起来像"读取完数据过一秒崩"。
+ */
+static bool wrpbp_addr_writable(struct mm_struct *mm, uint64_t addr, u32 len)
+{
+	struct vm_area_struct *vma;
+	bool ok = false;
+
+	if (!mm || !len)
+		return false;
+	if (addr < 0x1000ULL || addr >= 0x0001000000000000ULL)
+		return false;
+	if (addr + len < addr)
+		return false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, (unsigned long)addr);
+	if (vma && (unsigned long)addr >= vma->vm_start &&
+	    (unsigned long)addr + len <= vma->vm_end &&
+	    (vma->vm_flags & VM_WRITE))
+		ok = true;
+	mmap_read_unlock(mm);
+	return ok;
 }
 
 int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
@@ -1492,6 +1549,15 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 		if (bp_len_to_hw(len) < 0)
 		{
 			ret = -EINVAL;
+			goto fail;
+		}
+		if (!wrpbp_addr_writable(sess->task->mm, points[i].watch_addr,
+					 WRPBP_VEC_BYTES))
+		{
+			printk(KERN_ERR "wrpbp: point %d addr=%llx 不在目标可写 VMA 内, "
+			       "拒绝安装\n", i,
+			       (unsigned long long)points[i].watch_addr);
+			ret = -EFAULT;
 			goto fail;
 		}
 

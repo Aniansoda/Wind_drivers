@@ -50,6 +50,7 @@ static struct clonebp_page g_cb_pages[CB_MAX_PAGES_TOTAL];
 static int g_cb_page_cnt;
 static atomic64_t g_cb_stat[CLONEBP_ST_MAX];
 static bool g_cb_fp_warned;
+static bool g_cb_reg_warned;
 
 /* 全局当前挂载的 kprobe 上下文 */
 static struct mm_struct *g_cb_mm;
@@ -269,12 +270,11 @@ static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_
 	mmap_read_unlock(mm);
 
 	atomic_set(&cp->state, to_shadow);
-	if (to_shadow != CLONEBP_STATE_BAILOUT) {
-		int _i = cb_page_index(cp);
-
-		if (_i >= 0)
-			atomic_set(&cb_bailout_cnt[_i], 0);
-	}
+	/* 这里绝对不能清 cb_bailout_cnt。
+	 * 「原页->影子页->原页」每切一次都清零, 计数就永远停在 1,
+	 * cb_try_bailout 的阈值永远够不到, 异常环破不掉 ->
+	 * 该页读写交替的地方一路异常风暴, 表现就是卡死然后看门狗重启。
+	 * 计数只在 cb_try_bailout 里按时间窗衰减。 */
 	flush_tlb_page_range_local(mm, cp->user_va);
 	cb_stat_inc(CLONEBP_ST_TLB_FLUSH);
 	return 0;
@@ -309,12 +309,24 @@ static int cb_page_index(struct clonebp_page *cp)
 }
 
 /* 返回 1 表示已进入兜底态, 调用方直接放行异常返回 */
+/* 每页上一次异常的时刻, 用来做计数衰减窗口。
+ * 一秒钟没再出异常就把计数归零, 避免长时间运行后偶发交替把页误判成异常环。 */
+static unsigned long cb_bailout_last[CLONEBP_MAX_PAGES];
+
 static int cb_try_bailout(struct clonebp_page *cp)
 {
 	int idx = cb_page_index(cp);
+	unsigned long now;
 
 	if (idx < 0)
 		return 0;
+
+	now = jiffies;
+	if (!cb_bailout_last[idx] || time_after(now, cb_bailout_last[idx] + HZ)) {
+		atomic_set(&cb_bailout_cnt[idx], 0);
+		cb_bailout_last[idx] = now;
+	}
+
 	if (atomic_inc_return(&cb_bailout_cnt[idx]) < (int)g_cb_tm.bailout_max)
 		return 0;
 	cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_BAILOUT);
@@ -457,9 +469,16 @@ static int cb_brk_do(struct pt_regs *regs)
 				if (!(pt->reg_mask & (1u << k)))
 					continue;
 				rn = (int)pt->reg_base + k;
-				/* x29 = FP, x30 = LR, 都可以写, 但 sp(x31) 不能 */
-				if (rn >= 0 && rn <= 30)
+				/* 只放行 x0..x28。
+				 * x29 = 帧指针, x30 = 返回地址, sp = x31:
+				 * 写这三个里的任何一个, 用户态返回到垃圾地址,
+				 * 表现就是"断点一开程序异常退出"。 */
+				if (rn >= 0 && rn <= 28)
 					regs->regs[rn] = pt->reg_val[k];
+				else if (rn <= 30 && !g_cb_reg_warned) {
+					g_cb_reg_warned = true;
+					pr_warn("[clonebp] 拒绝写 x%d: 只允许 x0..x28\n", rn);
+				}
 			}
 
 			/* 浮点: arm64 的 S<n> 就是 V<n> 的低 32 位。
@@ -930,9 +949,11 @@ int clonebp_module_init(void)
 
 void clonebp_module_exit(void)
 {
-	cb_remove_hooks();
+	/* 顺序不能反: 页还挂在影子态时把 do_mem_abort hook 摘了,
+	 * 之后用户读这一页就没人换回来 -> 直接 SIGSEGV。 */
 	if (g_cb_mm)
 		clonebp_remove_all(g_cb_mm);
+	cb_remove_hooks();
 	kfree(g_cb_points);
 	g_cb_points = NULL;
 }
