@@ -435,6 +435,10 @@ typedef struct _WIND_BP_DIAG
 	uint32_t ptebp_reloads;
 	uint32_t ptebp_heal_ok;
 	uint32_t ptebp_heal_fail;
+	uint32_t clonebp_active;
+	uint32_t clonebp_pages;
+	uint32_t clonebp_brk_hits;
+	uint32_t clonebp_tlb_flush;
 	uint32_t wrpbp_armed;
 	uint32_t wrpbp_hits;
 	uint32_t wrpbp_writes;
