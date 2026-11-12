@@ -1259,6 +1259,8 @@ struct wrpbp_slot
 	uint32_t watch_len;
 	uint32_t type;
 	uint32_t components;
+	uint32_t freg_base;         /* 起始 S 寄存器号 */
+	uint32_t freg_mask;         /* bit0..bit7 -> freg_base+0..7 */
 	struct perf_event *ev[3];   /* 覆盖 12 字节: 8 + 4, 极端情况 4+4+4 */
 	uint64_t ev_addr[3];
 	uint32_t ev_len[3];
@@ -1271,6 +1273,8 @@ struct wrpbp_vecmod
 	bool enabled;
 	u32 mask;
 	u32 x, y, z;
+	u32 freg_mask;                     /* 本次要不要写浮点寄存器 */
+	u32 freg_val[CLONEBP_FREG_MAX];    /* float 位模式 */
 };
 
 static struct wrpbp_slot wrpbp_slots[BP_SLOT_MAX];
@@ -1327,6 +1331,40 @@ out:
 	}
 }
 
+/* WRP 的浮点寄存器通道: 内存改写对"先搬进 S 寄存器再算"的代码无效,
+ * 这里补一条寄存器写回。与 clonebp 走同一套 fpsimd 机制:
+ *   先 preserve 把硬件状态落到 thread.uw.fpsimd_state,
+ *   再改 vregs[n] 低 32 位, 最后置 TIF_FOREIGN_FPSTATE 让返回用户态时重载。
+ */
+static void wrpbp_apply_fregs(int slot)
+{
+	struct wrpbp_vecmod *v = &wrpbp_vec[slot];
+	struct wrpbp_slot *sl = &wrpbp_slots[slot];
+	unsigned long fl;
+	int k;
+
+	if (!v->freg_mask || !sl->freg_mask)
+		return;
+	if (!wind_fpsimd_preserve_current_state())
+		return;
+
+	local_irq_save(fl);
+	for (k = 0; k < CLONEBP_FREG_MAX; ++k) {
+		int rn;
+		u32 *p;
+
+		if (!((v->freg_mask | sl->freg_mask) & (1u << k)))
+			continue;
+		rn = (int)sl->freg_base + k;
+		if (rn < 0 || rn > 31)
+			continue;
+		p = (u32 *)&current->thread.uw.fpsimd_state.vregs[rn];
+		p[0] = v->freg_val[k];
+	}
+	set_thread_flag(TIF_FOREIGN_FPSTATE);
+	local_irq_restore(fl);
+}
+
 static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data,
 			    struct pt_regs *regs)
 {
@@ -1371,6 +1409,7 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 			{
 				this_cpu_inc(wrpbp_busy);
 				wrpbp_apply_vec(i);
+				wrpbp_apply_fregs(i);
 				this_cpu_dec(wrpbp_busy);
 			}
 			return;
@@ -1482,6 +1521,8 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 		sl->watch_len = len;
 		sl->type = points[i].type ? points[i].type : BP_TYPE_WRITE;
 		sl->components = points[i].components ? points[i].components : HWBP_MASK_ALL;
+		sl->freg_base = points[i].freg_base;
+		sl->freg_mask = points[i].freg_mask;
 		sl->active = true;
 		wrpbp_head[i] = wrpbp_count[i] = 0;
 
@@ -1511,6 +1552,29 @@ int wrpbp_set_vec(int32_t point_index, u32 enable, u32 x, u32 y, u32 z, u32 mask
 		wrpbp_vec[i].x = x;
 		wrpbp_vec[i].y = y;
 		wrpbp_vec[i].z = z;
+	}
+	return 0;
+}
+
+int wrpbp_set_fregs(int32_t point_index, u32 freg_base, u32 freg_mask,
+		     const u32 *vals, u32 count)
+{
+	int i, lo = 0, hi = BP_SLOT_MAX - 1;
+
+	if (point_index >= BP_SLOT_MAX)
+		return -EINVAL;
+	if (count > CLONEBP_FREG_MAX)
+		count = CLONEBP_FREG_MAX;
+	if (point_index >= 0)
+		lo = hi = point_index;
+
+	for (i = lo; i <= hi; i++) {
+		u32 k;
+
+		wrpbp_slots[i].freg_base = freg_base;
+		wrpbp_vec[i].freg_mask = freg_mask;
+		for (k = 0; k < count; ++k)
+			wrpbp_vec[i].freg_val[k] = vals ? vals[k] : 0;
 	}
 	return 0;
 }

@@ -136,6 +136,7 @@ enum OPERATIONS
 	OP_ACE_INTE             = WIND_OP_BASE + 0x53,
 	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54,
 	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55,
+	OP_WRPBP_SET_FREGS      = WIND_OP_BASE + 0x56, /* WRP 浮点寄存器写回 */
 };
 
 enum READ_MODE
@@ -392,6 +393,8 @@ typedef struct _BRKBP_CLEAR_REQUEST
 	uint32_t reserved;
 } BRKBP_CLEAR_REQUEST, *PBRKBP_CLEAR_REQUEST;
 
+#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
+
 typedef struct _WRPBP_POINT_CONFIG
 {
 	uint64_t watch_addr;
@@ -399,6 +402,12 @@ typedef struct _WRPBP_POINT_CONFIG
 	uint32_t type;
 	uint32_t components;
 	uint32_t reserved;
+
+	/* 浮点寄存器通道: 内存改写对"先搬进 S 寄存器再算"的代码无效。
+	 * freg_base = 起始 S 号, freg_mask = bit0..bit7 -> freg_base+0..7。
+	 * 具体值走 OP_WRPBP_SET_FREGS 持续更新。 */
+	uint32_t freg_base;
+	uint32_t freg_mask;
 } WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
 
 typedef struct _WRPBP_SET_REQUEST
@@ -415,6 +424,17 @@ typedef struct _WRPBP_VEC_REQUEST
 	uint32_t x, y, z;
 	uint32_t mask;
 } WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
+
+/* OP_WRPBP_SET_FREGS: 单列一个 op, 因为 WRPBP_VEC_REQUEST 很多调用方
+ * 只传 24 字节(HWBP_REG_REQUEST 布局), 加长会读到栈上的垃圾。
+ */
+typedef struct _WRPBP_FREG_REQUEST
+{
+	int32_t  point_index;              /* -1 = 所有点 */
+	uint32_t freg_base;                /* 起始 S 号 0..31 */
+	uint32_t freg_mask;                /* bit0..bit7 */
+	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
+} WRPBP_FREG_REQUEST, *PWRPBP_FREG_REQUEST;
 
 typedef struct _WRPBP_CONFIG
 {
@@ -528,7 +548,6 @@ typedef struct _WIND_MAP_STATS
 #define CLONEBP_MAX_PAGES    64
 #define CLONEBP_PATCH_MAX    16
 #define CLONEBP_REG_MAX      8
-#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
 #define CLONEBP_BRK_IMM_BASE 0x1000
 
 #define CLONEBP_MODE_LOG     0

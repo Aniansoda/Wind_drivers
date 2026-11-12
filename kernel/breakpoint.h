@@ -58,6 +58,8 @@ int brkbp_clear_records(int32_t point_index);
 int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 	      size_t point_count);
 int wrpbp_set_vec(int32_t point_index, u32 enable, u32 x, u32 y, u32 z, u32 mask);
+int wrpbp_set_fregs(int32_t point_index, u32 freg_base, u32 freg_mask,
+		     const u32 *vals, u32 count);
 int wrpbp_get_config(WRPBP_CONFIG *out);
 int wrpbp_get_records(uint32_t point_index, uint32_t start_index,
 		      HWBP_RECORD *records, uint32_t capacity, uint32_t *count_out);

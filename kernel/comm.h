@@ -116,6 +116,7 @@ enum OPERATIONS
 	OP_ACE_VERBOSE          = WIND_OP_BASE + 0x52, /* 开关驱动自身日志(默认关) */
 	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54, /* 设单项伪装开关位掩码 */
 	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55, /* 读当前开关位掩码 */
+	OP_WRPBP_SET_FREGS      = WIND_OP_BASE + 0x56, /* WRP 浮点寄存器写回 */
 	OP_ACE_INTE             = WIND_OP_BASE + 0x53, /* 0=接管 inte 三节点(重建假节点) 1=只摘除 */
 };
 
@@ -397,6 +398,8 @@ typedef struct _HWBP_REG_REQUEST
 /* 注: 上面 reserved 字段当 mask 用, bit0=s3/x bit1=s4/y bit2=s5/z, 0 视为 0x7 */
 
 /* ---- WRP 数据断点 (观察点写回, 不碰代码也不碰页表) ---- */
+#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
+
 typedef struct _WRPBP_POINT_CONFIG
 {
 	uint64_t watch_addr;  /* 弹道/朝向向量首地址 */
@@ -404,6 +407,16 @@ typedef struct _WRPBP_POINT_CONFIG
 	uint32_t type;        /* BP_TYPE_WRITE / BP_TYPE_RW */
 	uint32_t components;  /* bit0=x bit1=y bit2=z: 要写回哪些分量 */
 	uint32_t reserved;
+
+	/* ---- 浮点寄存器写回 (arm64 S0..S31) ----
+	 * 内存改写只在游戏"读那块向量"时生效; 如果游戏把向量直接搬进
+	 * S 寄存器再算, 光改内存没用。这里补上寄存器通道。
+	 *   freg_base: 起始 S 号 0..31
+	 *   freg_mask: bit0..bit7 -> freg_base+0..7, 0 = 不写寄存器
+	 * 具体值走 WRPBP_VEC_REQUEST.freg_val[], 跟 x/y/z 一样持续更新。
+	 */
+	uint32_t freg_base;
+	uint32_t freg_mask;
 } WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
 
 typedef struct _WRPBP_SET_REQUEST
@@ -420,7 +433,24 @@ typedef struct _WRPBP_VEC_REQUEST
 	uint32_t enable;
 	uint32_t x, y, z;     /* float 位模式 */
 	uint32_t mask;        /* bit0=x bit1=y bit2=z, 0 视为 0x7 */
+
+	/* 浮点寄存器值: freg_val[k] 写到 freg_base+k
+	 * freg_mask bit0..bit7, 0 = 本次不动浮点寄存器 */
+	uint32_t freg_mask;
+	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
 } WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
+
+/* OP_WRPBP_SET_FREGS: 给已装好的 WRP 观察点设浮点寄存器写回。
+ * 单独一个 op 而不是塞进 WRPBP_VEC_REQUEST, 是因为后者很多调用方
+ * 只传 24 字节(HWBP_REG_REQUEST 布局), 加长会读到栈上的垃圾。
+ */
+typedef struct _WRPBP_FREG_REQUEST
+{
+	int32_t  point_index;              /* -1 = 所有点 */
+	uint32_t freg_base;                /* 起始 S 号 0..31, 每次可改 */
+	uint32_t freg_mask;                /* bit0..bit7 */
+	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
+} WRPBP_FREG_REQUEST, *PWRPBP_FREG_REQUEST;
 
 typedef struct _WRPBP_CONFIG
 {
@@ -595,7 +625,6 @@ typedef struct _CLONEBP_TIMING_CONFIG
 #define CLONEBP_MAX_PAGES    64
 #define CLONEBP_PATCH_MAX    16
 #define CLONEBP_REG_MAX      8
-#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
 #define CLONEBP_BRK_IMM_BASE 0x1000
 
 #define CLONEBP_MODE_LOG     0

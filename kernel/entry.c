@@ -537,6 +537,16 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return wrpbp_set_vec(req.point_index, req.enable, req.rx, req.ry,
 				     req.rz, req.reserved);
 	}
+	case OP_WRPBP_SET_FREGS:
+	{
+		WRPBP_FREG_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)) != 0)
+			return -EFAULT;
+		return wrpbp_set_fregs(req.point_index, req.freg_base,
+				       req.freg_mask, req.freg_val,
+				       CLONEBP_FREG_MAX);
+	}
 	case OP_WRPBP_REMOVE:
 		return wrpbp_remove();
 	case OP_WRPBP_GET_CONFIG:
