@@ -13,6 +13,8 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/pid.h>
+#include <linux/rcupdate.h>
 
 #include "windcfg.h"
 #include "ace.h"
@@ -54,6 +56,47 @@ bool windcfg_gyro_on(void)
 
 /* 用户态传 pid 进来之后做的事。
  * 重复传同一个 pid 直接返回, 免得每次 attach 重装一次 hook。 */
+/* 这些进程一旦被藏起来, 指纹/传感器/合成器就会跟着挂, 一律不隐藏 */
+static const char *const g_wind_keep_pids[] = {
+	"system_server", "zygote", "zygote64", "surfaceflinger", "installd",
+	"servicemanager", "vold", "netd", "fingerprintd", "idmap2d",
+	"android.hardware.biometrics.fingerprint", "sensors", "sensorservice",
+	"vendor.qti.hardware.display", "oplus.sensor",
+};
+
+static const char *windcfg_pid_comm(pid_t tgid)
+{
+	struct task_struct *t;
+	const char *c = "?";
+
+	rcu_read_lock();
+	t = pid_task(find_vpid(tgid), PIDTYPE_PID);
+	if (t)
+		c = t->comm;
+	rcu_read_unlock();
+	return c;
+}
+
+static bool windcfg_pid_protected(pid_t tgid)
+{
+	struct task_struct *t;
+	bool hit = false;
+	unsigned int i;
+
+	rcu_read_lock();
+	t = pid_task(find_vpid(tgid), PIDTYPE_PID);
+	if (t) {
+		for (i = 0; i < ARRAY_SIZE(g_wind_keep_pids); i++) {
+			if (!strcmp(t->comm, g_wind_keep_pids[i])) {
+				hit = true;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+	return hit;
+}
+
 void windcfg_bind_pid(pid_t tgid)
 {
 	int ret;
@@ -73,6 +116,20 @@ void windcfg_bind_pid(pid_t tgid)
 
 	if (tgid == g_bound_tgid)
 		return;
+
+	/* 保护性拒绝: 有些 ROM 上用户态会把 system_server / 指纹 HAL 的 pid
+	 * 当成"目标进程"传进来 (尤其陀螺仪那边拿的是 system_server 的 pid)。
+	 * 把这些进程藏起来 = 指纹、传感器、SurfaceFlinger 一起坏掉,
+	 * 表现为刷入后指纹不可用、应用连不上。这里直接不隐藏, 只记日志。 */
+	if (windcfg_pid_protected(tgid)) {
+		if (tgid != g_bound_tgid)
+			pr_warn("[wind-cfg] tgid=%d(%s) 是系统关键进程, 只绑定不隐藏\n",
+				tgid, windcfg_pid_comm(tgid));
+		g_bound_tgid = tgid;
+		ace_set_pid((u32)tgid);
+		return;
+	}
+
 	g_bound_tgid = tgid;
 
 	ret = ace_set_pid((u32)tgid);

@@ -39,10 +39,10 @@
 #include <linux/mman.h>
 #include <asm/ptrace.h>
 #include <linux/smp.h>
+#include <linux/workqueue.h>
 #include "windcfg.h"	/* windcfg_gyro_on() */
 
-extern void gyro_sock_stats(long long *msgs, long long *rewrites);
-extern bool gyro_sock_active(void);
+
 #include <asm/page.h>
 #include <asm/memory.h>
 #include "sym.h"
@@ -103,6 +103,30 @@ static unsigned long gyro_addr;         /* sendObjects 运行时地址 */
 static bool gyro_active;
 static bool gyro_enabled;
 static u32 gyro_rx, gyro_ry; /* 目标角速度 x/y, float 位模式 (rad/s); z 恒不动 */
+
+extern void gyro_sock_stats(long long *msgs, long long *rewrites);
+extern bool gyro_sock_active(void);
+extern bool g_wind_unloading;
+
+/* 用户态一帧都没推的时候, 以前 gyro-diag 一行都不会出, 看起来像"驱动没反应"。
+ * 改成独立心跳: 装上之后每 2 秒一条, 不管用户态推没推。 */
+static struct delayed_work gyro_diag_work;
+
+static void gyro_diag_tick(struct work_struct *w)
+{
+	long long sm = 0, sr = 0;
+
+	(void)w;
+	if (READ_ONCE(g_wind_unloading))
+		return;
+	gyro_sock_stats(&sm, &sr);
+	pr_info("[wind] gyro-tick: sock_on=%d msgs=%lld rewrites=%lld "
+		"x=%08x y=%08x active=%d\n",
+		(int)gyro_sock_active(), sm, sr,
+		gyro_rx, gyro_ry, (int)gyro_active);
+	if (gyro_active)
+		schedule_delayed_work(&gyro_diag_work, 2 * HZ);
+}
 static u32 gyro_rz_unused;   /* 兼容旧 set 接口, 不再写进事件 */
 
 /* ---- WRP 数据断点: 学到事件缓冲地址后, 只盯 x/y 那 8 字节 ----
@@ -706,6 +730,8 @@ int gyro_install(pid_t pid)
 	if (ret == 0) {
 		gyro_active = true;
 		printk(KERN_INFO "gyro: socket 路线已启用 tgid=%d\n", pid);
+		INIT_DELAYED_WORK(&gyro_diag_work, gyro_diag_tick);
+		schedule_delayed_work(&gyro_diag_work, 2 * HZ);
 		return 0;
 	}
 
@@ -721,6 +747,8 @@ int gyro_install(pid_t pid)
 
 void gyro_remove(void)
 {
+	/* 先停心跳, 否则卸载过程中还会有一条 tick 打到已经拆掉的 kprobe 上 */
+	cancel_delayed_work_sync(&gyro_diag_work);
 	gyro_sock_remove();
 	if (gyro_bp)
 	{

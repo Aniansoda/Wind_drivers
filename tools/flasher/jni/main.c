@@ -82,6 +82,28 @@ struct cfg {
 	char proc_name[64];
 };
 
+/* 这台机器是不是 ColorOS/OPPO 系 (一加/真我)。只有那一系才有 oplus_* 的
+ * proc 后门; vivo/iQOO 上强行去抹这些节点没有好处, 反而容易误伤。 */
+static int brand_is_oppo(void)
+{
+	FILE *pf = popen("getprop ro.product.brand 2>/dev/null; "
+			 "getprop ro.product.manufacturer 2>/dev/null", "r");
+	char b[256] = {0};
+	int hit = 0;
+
+	if (!pf)
+		return 0;
+	while (fgets(b, sizeof(b), pf)) {
+		if (strcasestr(b, "oppo") || strcasestr(b, "oneplus") ||
+		    strcasestr(b, "oplus") || strcasestr(b, "realme")) {
+			hit = 1;
+			break;
+		}
+	}
+	pclose(pf);
+	return hit;
+}
+
 static void cfg_defaults(struct cfg *c)
 {
 	memset(c, 0, sizeof(*c));
@@ -378,7 +400,13 @@ int main(int argc, char **argv)
 	}
 
 	c.hide_driver   = ask01("隐藏驱动", 1);
-	c.oppo_backdoor = ask01("屏蔽一加后门", 1);
+	{
+		const int oppo = brand_is_oppo();
+
+		if (!oppo)
+			k_dim("非 ColorOS 机型, 默认不碰 oplus proc 节点");
+		c.oppo_backdoor = ask01("屏蔽一加后门", oppo ? 1 : 0);
+	}
 	c.force_load    = ask01("强制加载", 1);
 
 	printf(TAG " " K_DIM "以下三项与游戏进程相关, 可单独关闭" K_RST "\n");
@@ -460,23 +488,12 @@ do_load:
 		k_info("insmod 中 ...");
 		rc = run(ins);
 		if (rc != 0) {
-			/* vermagic 真改不动时, 内核只在 CONFIG_MODULE_FORCE_LOAD=y
-			 * 的情况下吃 -f。试一次, 不行再报。 */
-			char *insf[11];
-			int i;
-
-			k_warn("insmod 失败 rc=%d, 试 -f", rc);
-			insf[0] = "insmod";
-			insf[1] = "-f";
-			for (i = 1; i <= 8; i++)
-				insf[i + 1] = ins[i];
-			insf[10] = NULL;
-			rc = run(insf);
-			if (rc != 0) {
-				k_err("insmod -f 也失败 rc=%d", rc);
-				dump_dmesg();
-				return rc;
-			}
+			/* toybox 的 insmod 没有 -f, CONFIG_MODULE_FORCE_LOAD 也不一定开。
+			 * 以前那次 "-f" 会被当成模块路径, 报 No such file or directory,
+			 * 把真正的错误盖住了。直接打内核日志。 */
+			k_err("insmod 失败 rc=%d, 下面看内核原因", rc);
+			dump_dmesg();
+			return rc;
 		}
 	}
 
