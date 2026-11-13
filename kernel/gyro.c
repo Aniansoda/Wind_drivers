@@ -38,6 +38,7 @@
 #include <linux/uaccess.h>
 #include <linux/mman.h>
 #include <asm/ptrace.h>
+#include "windcfg.h"	/* windcfg_gyro_on() */
 #include <asm/page.h>
 #include <asm/memory.h>
 #include "sym.h"
@@ -671,9 +672,15 @@ int gyro_install(pid_t pid)
 {
 	int ret;
 
-	if (!g_wind_gyro_enable)
+	/* 两个开关都要看:
+	 *   wind_gyro  —— gyro.c 自己的总闸
+	 *   gyro       —— 刷入器传的那个 (windcfg), 用户关掉时它才是 0
+	 * 以前只认 wind_gyro, 刷入器选"关闭"只改了 cfg_gyro, 用户以为关了其实
+	 * 没关; 反过来也容易让人以为驱动没开陀螺仪。两边一致才算开。 */
+	if (!g_wind_gyro_enable || !windcfg_gyro_on())
 	{
-		printk(KERN_INFO "gyro: 通道已关闭 (wind_gyro=0)\n");
+		printk(KERN_INFO "gyro: 通道已关闭 (wind_gyro=%d gyro=%d)\n",
+		       (int)g_wind_gyro_enable, (int)windcfg_gyro_on());
 		return -EOPNOTSUPP;
 	}
 	if (gyro_active)

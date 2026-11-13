@@ -355,10 +355,16 @@ int main(int argc, char **argv)
 		      old.hide_driver, old.hide_pid, old.hide_gpu,
 		      old.oppo_backdoor, old.force_load, old.gyro,
 		      old.proc_name[0] ? old.proc_name : "无");
+		if (!old.gyro)
+			k_warn("上次陀螺仪控制是关闭的; 关掉它自瞄就没有改写通道了");
 		printf(TAG " 使用上次配置 " K_DIM "[1-是/2-否]" K_RST " 请选择: ");
 		fflush(stdout);
 		if (read_line(line, sizeof(line)) == 0 && line[0] != '2') {
 			c = old;
+			if (!c.gyro) {
+				k_warn("陀螺仪控制当前是 [关] —— 自瞄不会有任何效果");
+				c.gyro = ask01("陀螺仪控制", 1);
+			}
 			goto do_load;
 		}
 	}
@@ -450,6 +456,7 @@ do_load:
 		ins[8]  = a_kp;
 		ins[9]  = NULL;
 
+		k_dim("参数: %s %s %s %s %s %s", a_hd, a_hp, a_hg, a_ob, a_fl, a_gy);
 		k_info("insmod 中 ...");
 		rc = run(ins);
 		if (rc != 0) {

@@ -1259,6 +1259,10 @@ int ptebp_clear_records(int32_t point_index)
  *      + 尾观察点两个事件, 任一命中都写回整段。
  * =================================================================== */
 #define WRPBP_VEC_BYTES 12
+/* 每个观察点最多占几个硬件断点寄存器 */
+#define WRPBP_EV_PER_SLOT 1
+/* 同时最多几个观察点 (寄存器一共 4 个) */
+#define WRPBP_MAX_POINTS  2
 
 struct wrpbp_slot
 {
@@ -1406,7 +1410,7 @@ static void wrpbp_apply_fregs(int slot)
 extern bool gyro_holds_breakpoints(void);
 
 /* 每秒最多写回这么多次, 超了就暂停该槽位的写回 */
-#define WRPBP_RATE_MAX 4000
+#define WRPBP_RATE_MAX 800
 static unsigned long wrpbp_rate_last[BP_SLOT_MAX];
 static atomic_t wrpbp_rate_cnt[BP_SLOT_MAX];
 static bool wrpbp_rate_warned[BP_SLOT_MAX];
@@ -1469,10 +1473,15 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 				}
 				if (atomic_inc_return(&wrpbp_rate_cnt[i]) >
 				    WRPBP_RATE_MAX) {
+					/* 超限就真的关掉这个槽的写回, 不只是打一行。
+					 * 观察点打在极热字段上时, 每次命中都改内存等于持续
+					 * 往目标进程灌数据, 异常一秒几万次, 机器卡住等看门狗。 */
+					wrpbp_vec[i].enabled = false;
+					wrpbp_vec[i].mask = 0;
 					if (!wrpbp_rate_warned[i]) {
 						wrpbp_rate_warned[i] = true;
-						pr_warn("wrpbp: slot %d 写入频率超限(%d/s), "
-							"已暂停写回地址 %llx\n",
+						pr_warn("wrpbp: slot %d 命中频率超限(%d/s), "
+							"已关闭该槽写回 地址=%llx\n",
 							i, WRPBP_RATE_MAX,
 							(unsigned long long)
 							wrpbp_slots[i].watch_addr);
@@ -1568,6 +1577,14 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 	if (!points || point_count == 0 || point_count > BP_SLOT_MAX)
 		return -EINVAL;
 
+	if (point_count > WRPBP_MAX_POINTS)
+	{
+		printk(KERN_ERR "wrpbp: 一次最多 %d 个观察点 (arm64 只有 4 个断点寄存器), "
+		       "本次请求 %u 个, 只装前 %d 个\n",
+		       WRPBP_MAX_POINTS, (unsigned)point_count, WRPBP_MAX_POINTS);
+		point_count = WRPBP_MAX_POINTS;
+	}
+
 	/* 陀螺仪占着调试寄存器时就别再装追踪点了。
 	 * arm64 只有 4 个, 陀螺仪 2 个 + 每个追踪点最多 3 个, 一起装必然失败;
 	 * 更糟的是两边互相踩, 异常一路打下来把机器拖死 -> 卡死重启。 */
@@ -1633,9 +1650,12 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 			}
 		}
 
-		/* 12 字节向量在 arm64 上最多 LEN_8, 一个观察点盖不住:
-		 * 从偏移 0 起按 8 -> 4 (必要时 4/4/4) 连续铺满 [0, WRPBP_VEC_BYTES) */
-		for (j = 0, off = 0; j < 3 && off < WRPBP_VEC_BYTES; j++)
+		/* arm64 只有 4 个硬件断点寄存器, 而且 GKI 自己/其它子系统也在用。
+		 * 以前一个点铺 8+4 两个事件, 四个槽就是 8 个事件 —— 必然有注册失败的
+		 * 残留, 失败那半个点留下的是"每次写入都进一次异常"的观察点,
+		 * 但没人认领, 表现就是整机越来越卡、最后看门狗重启。
+		 * 现在每个点只装 1 个事件(8 字节, 覆盖 x/y), 最多 2 个点。 */
+		for (j = 0, off = 0; j < WRPBP_EV_PER_SLOT && off < WRPBP_VEC_BYTES; j++)
 		{
 			struct perf_event_attr attr;
 			uint64_t addr;
