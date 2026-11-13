@@ -105,12 +105,14 @@ static bool gyro_enabled;
 static u32 gyro_rx, gyro_ry; /* 目标角速度 x/y, float 位模式 (rad/s); z 恒不动 */
 
 extern void gyro_sock_stats(long long *msgs, long long *rewrites);
+extern void gyro_sock_dump(void);
 extern bool gyro_sock_active(void);
 extern bool g_wind_unloading;
 
 /* 用户态一帧都没推的时候, 以前 gyro-diag 一行都不会出, 看起来像"驱动没反应"。
  * 改成独立心跳: 装上之后每 2 秒一条, 不管用户态推没推。 */
 static struct delayed_work gyro_diag_work;
+static unsigned int gyro_diag_dumps;
 
 static void gyro_diag_tick(struct work_struct *w)
 {
@@ -124,6 +126,12 @@ static void gyro_diag_tick(struct work_struct *w)
 		"x=%08x y=%08x active=%d\n",
 		(int)gyro_sock_active(), sm, sr,
 		gyro_rx, gyro_ry, (int)gyro_active);
+	/* 改写数还是 0 的时候, 前几次心跳顺带把"哪条路径在命中 / 类型分布"
+	 * 打出来 —— 这是区分"没接上"和"类型不对"的唯一依据。 */
+	if (!sr && gyro_diag_dumps < 4) {
+		gyro_diag_dumps++;
+		gyro_sock_dump();
+	}
 	if (gyro_active)
 		schedule_delayed_work(&gyro_diag_work, 2 * HZ);
 }
@@ -730,6 +738,7 @@ int gyro_install(pid_t pid)
 	if (ret == 0) {
 		gyro_active = true;
 		printk(KERN_INFO "gyro: socket 路线已启用 tgid=%d\n", pid);
+		gyro_diag_dumps = 0;
 		INIT_DELAYED_WORK(&gyro_diag_work, gyro_diag_tick);
 		schedule_delayed_work(&gyro_diag_work, 2 * HZ);
 		return 0;

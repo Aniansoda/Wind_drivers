@@ -101,6 +101,9 @@ static atomic64_t g_gyro_rewrites = ATOMIC64_INIT(0);
 
 static bool g_gyro_type_dumped;
 static unsigned int g_gyro_type_seen;
+static unsigned long g_gyro_kp_hits[GYRO_KP_MAX];
+static atomic64_t g_gyro_scanned = ATOMIC64_INIT(0);
+static unsigned int g_gyro_type_hist[64];
 
 static u32 g_gyro_x_bits;
 static u32 g_gyro_y_bits;
@@ -181,6 +184,9 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
 
 		if (iov_get_u32(iov, n, off + ASENSOR_TYPE_OFF, &type))
 			continue;
+		atomic64_inc(&g_gyro_scanned);
+		if (type < 64)
+			g_gyro_type_hist[type]++;
 		/* 只动陀螺仪记录; 加速度计/磁力计/压力原样放过 */
 		if (type != SENSOR_TYPE_GYRO && type != SENSOR_TYPE_GYRO_UNCAL) {
 			/* 一次改写都没发生时, 把看到的前几个类型打出来:
@@ -222,15 +228,22 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
  */
 
 
-/* 0 = msghdr 形状(recvmsg/recvfrom), 1 = 平铺缓冲(read) */
-static int gyro_kprobe_kind(struct kprobe *p)
+static int gyro_kprobe_idx(struct kprobe *p)
 {
 	int i;
 
 	for (i = 0; i < g_gyro_kp_cnt; i++)
 		if (p == &g_gyro_kps[i])
-			return g_gyro_kp_kind[i];
-	return 0;
+			return i;
+	return -1;
+}
+
+/* 0 = msghdr 形状(recvmsg/recvfrom), 1 = 平铺缓冲(read) */
+static int gyro_kprobe_kind(struct kprobe *p)
+{
+	int i = gyro_kprobe_idx(p);
+
+	return i >= 0 ? g_gyro_kp_kind[i] : 0;
 }
 
 static bool gyro_kp_wrapper_of(struct kprobe *p)
@@ -263,22 +276,11 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 	struct gyro_recv_ctx *ctx = gyro_ctx_get();
 	struct user_msghdr umh;
 	struct pt_regs *ur;
+	int idx;
 
 	ctx->valid = false;
 
 	if (!READ_ONCE(g_gyro_sock_on))
-		return 0;
-	/* tgid 只当参考, 不当闸门。
-	 * 用户态传进来的可能是游戏 pid 而不是 sensorservice 的, 严格比对就是
-	 * 一条事件都改不到, 表现是"装上了、msgs 不涨、自瞄没反应"。
-	 * 真正的判据是事件形状: 长度是 0x68 的整数倍, 且 +0x08 的类型是
-	 * GYRO / GYRO_UNCAL —— 只有传感器数据流满足。 */
-	if (g_gyro_tgid && current->tgid != g_gyro_tgid && !g_gyro_tgid_warned) {
-		g_gyro_tgid_warned = true;
-		pr_info("[wind] gyro-sock: 接收方 tgid=%d 与传入 %d 不同, 按事件形状放行\n",
-			current->tgid, g_gyro_tgid);
-	}
-	if (!READ_ONCE(g_gyro_x_bits) && !READ_ONCE(g_gyro_y_bits))
 		return 0;
 
 	ur = gyro_user_regs(p, regs);
@@ -286,7 +288,11 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 
 	if (gyro_kprobe_kind(p)) {
-		/* read(fd, buf, count): 平铺缓冲, 返回后按 ASensorEvent 逐条编 */
+		/* read(fd, buf, count): 平铺缓冲。
+		 * 形状闸门: 长度必须正好是 0x68 的整数倍 —— 传感器队列读的就是
+		 * ASensorEvent 数组。以前不判, system_server 每秒几千次普通 read
+		 * 全被当成"传感器消息"计数 (msgs 一分钟涨到十几万), 真正的
+		 * 陀螺仪事件被淹在噪声里。 */
 		ctx->flat = true;
 		ctx->flat_buf = (void __user *)ur->regs[1];
 		ctx->flat_len = (unsigned long)ur->regs[2];
@@ -294,8 +300,12 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 		ctx->iovlen = 0;
 		if (!ctx->flat_buf || ctx->flat_len < ASENSOR_EVENT_SIZE)
 			return 0;
+		if (ctx->flat_len % ASENSOR_EVENT_SIZE)
+			return 0;
+		idx = gyro_kprobe_idx(p);
+		if (idx >= 0)
+			g_gyro_kp_hits[idx]++;
 		ctx->valid = true;
-		atomic64_inc(&g_gyro_msgs);
 		return 0;
 	}
 
@@ -305,36 +315,42 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 	if (!umh.msg_iov || !umh.msg_iovlen || umh.msg_iovlen > GYRO_IOV_MAX)
 		return 0;
 
+	idx = gyro_kprobe_idx(p);
+	if (idx >= 0)
+		g_gyro_kp_hits[idx]++;
 	ctx->iov = umh.msg_iov;
 	ctx->iovlen = umh.msg_iovlen;
 	ctx->valid = true;
-	atomic64_inc(&g_gyro_msgs);
 	return 0;
 }
 
-/* 返回后数据已在用户 iovec 里 */
+/* 返回后数据已在用户缓冲里 */
 static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
 	struct gyro_recv_ctx *ctx = gyro_ctx_get();
 	struct iovec kiov[GYRO_IOV_MAX];
+	struct iovec one;
 	unsigned long total = 0;
 	unsigned int n, i;
+
+	(void)p;
+	(void)flags;
 
 	if (!ctx->valid)
 		return;
 	ctx->valid = false;
 
 	if (ctx->flat) {
-		struct iovec one;
+		/* x0 是 read() 的返回值, 即实际读到的字节数 */
 		unsigned long ret = (unsigned long)regs->regs[0];
 
-		/* x0 是 read() 的返回值, 即实际读到的字节数 */
-		if (!ret || ret > GYRO_MSG_MAX)
+		if (ret < ASENSOR_EVENT_SIZE || ret > ctx->flat_len)
 			return;
-		if (ret > ctx->flat_len)
-			ret = ctx->flat_len;
+		if (ret % ASENSOR_EVENT_SIZE)
+			return;
 		one.iov_base = ctx->flat_buf;
 		one.iov_len = ret;
+		atomic64_inc(&g_gyro_msgs);
 		gyro_rewrite_iov(&one, 1, ret);
 		return;
 	}
@@ -345,15 +361,34 @@ static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long
 	if (copy_from_user(kiov, ctx->iov, n * sizeof(struct iovec)))
 		return;
 
-	for (i = 0; i < n; i++) {
+	for (i = 0; i < n; i++)
 		total += kiov[i].iov_len;
-		if (total > GYRO_MSG_MAX)
-			return;
-	}
-	if (total < ASENSOR_EVENT_SIZE || (total % ASENSOR_EVENT_SIZE) != 0)
+	if (total < ASENSOR_EVENT_SIZE || total % ASENSOR_EVENT_SIZE)
 		return;
 
+	atomic64_inc(&g_gyro_msgs);
 	gyro_rewrite_iov(kiov, n, total);
+}
+
+/* 给 gyro 心跳用: 哪条路径在命中、扫过多少条记录、类型分布 */
+void gyro_sock_dump(void)
+{
+	int i, printed = 0;
+
+	pr_info("[wind] gyro-dump: scan=%lld msgs=%lld rewrites=%lld\n",
+		(long long)atomic64_read(&g_gyro_scanned),
+		(long long)atomic64_read(&g_gyro_msgs),
+		(long long)atomic64_read(&g_gyro_rewrites));
+	for (i = 0; i < g_gyro_kp_cnt; i++)
+		pr_info("[wind] gyro-dump: kp%d %s hits=%lu\n", i,
+			g_gyro_kps[i].symbol_name, g_gyro_kp_hits[i]);
+	for (i = 0; i < 64 && printed < 8; i++) {
+		if (!g_gyro_type_hist[i])
+			continue;
+		pr_info("[wind] gyro-dump: type=%d count=%u\n", i,
+			g_gyro_type_hist[i]);
+		printed++;
+	}
 }
 
 /* 传感器接收路径在不同 ROM / 内核上落点不同, 能挂的全挂上。
@@ -371,8 +406,23 @@ static const struct {
 	{ "ksys_recvmsg",         false, 0 },
 };
 
+static void gyro_sock_reset_stats(void)
+{
+	int i;
+
+	atomic64_set(&g_gyro_msgs, 0);
+	atomic64_set(&g_gyro_rewrites, 0);
+	atomic64_set(&g_gyro_scanned, 0);
+	for (i = 0; i < GYRO_KP_MAX; i++)
+		g_gyro_kp_hits[i] = 0;
+	for (i = 0; i < 64; i++)
+		g_gyro_type_hist[i] = 0;
+}
+
 int gyro_sock_install(pid_t system_server_tgid)
 {
+	/* 每次安装从 0 开始计, 这样一次测试的 msgs/rewrites 就是这次的数据 */
+	gyro_sock_reset_stats();
 	unsigned int i;
 	int ok = 0;
 
