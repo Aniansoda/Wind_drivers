@@ -1273,6 +1273,7 @@ struct wrpbp_slot
 	uint32_t ev_len[3];
 	bool wide[3];
 	bool active;
+	bool ro;            /* 目标地址所在 VMA 不可写: 只观察, 不回写内存 */
 };
 
 struct wrpbp_vecmod
@@ -1302,6 +1303,10 @@ static void wrpbp_apply_vec(int slot)
 	int ret = -EFAULT;
 
 	if (!mask)
+		return;
+
+	/* 只读 VMA: 写回去必然失败, 直接跳过内存通道(寄存器通道仍可用) */
+	if (sl->ro)
 		return;
 
 	if (wind_copy_from_user_nofault(buf, (void __user *)sl->watch_addr,
@@ -1502,32 +1507,55 @@ static void wrpbp_clear_slot(int i)
 		wrpbp_slots[i].ev[j] = NULL;
 	}
 	wrpbp_slots[i].active = false;
+	wrpbp_slots[i].ro = false;
 }
 
 /* watch_addr 必须整个落在目标进程一个可写 VMA 里。
  * 不校验的话, 用户传一个错的/过期的地址, apply_vec 就往别处写 12 字节,
  * 游戏跑一会儿踩到被写坏的数据就 SIGSEGV, 看起来像"读取完数据过一秒崩"。
  */
-static bool wrpbp_addr_writable(struct mm_struct *mm, uint64_t addr, u32 len)
+/* 返回 1 = 地址整段落在某个 VMA 里, 0 = 根本没映射。
+ * writable 带回该 VMA 是否可写 —— 不可写时只能观察不能回写,
+ * 但断点本身照样能观察(硬件比较不看页权限), 没必要整个拒掉。 */
+static int wrpbp_addr_probe(struct mm_struct *mm, uint64_t addr, u32 len,
+			    bool *writable, unsigned long *vstart,
+			    unsigned long *vend, unsigned long *vflags)
 {
 	struct vm_area_struct *vma;
-	bool ok = false;
+
+	*writable = false;
+	*vstart = *vend = *vflags = 0;
 
 	if (!mm || !len)
-		return false;
+		return 0;
 	if (addr < 0x1000ULL || addr >= 0x0001000000000000ULL)
-		return false;
+		return 0;
 	if (addr + len < addr)
-		return false;
+		return 0;
 
 	mmap_read_lock(mm);
 	vma = find_vma(mm, (unsigned long)addr);
 	if (vma && (unsigned long)addr >= vma->vm_start &&
-	    (unsigned long)addr + len <= vma->vm_end &&
-	    (vma->vm_flags & VM_WRITE))
-		ok = true;
+	    (unsigned long)addr + len <= vma->vm_end) {
+		*writable = !!(vma->vm_flags & VM_WRITE);
+		*vstart = vma->vm_start;
+		*vend = vma->vm_end;
+		*vflags = vma->vm_flags;
+		mmap_read_unlock(mm);
+		return 1;
+	}
 	mmap_read_unlock(mm);
-	return ok;
+	return 0;
+}
+
+static bool wrpbp_addr_writable(struct mm_struct *mm, uint64_t addr, u32 len)
+{
+	bool w = false;
+	unsigned long a, b, f;
+
+	if (!wrpbp_addr_probe(mm, addr, len, &w, &a, &b, &f))
+		return false;
+	return w;
 }
 
 int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
@@ -1572,14 +1600,37 @@ int wrpbp_set(struct driver_session *sess, const WRPBP_POINT_CONFIG *points,
 			ret = -EINVAL;
 			goto fail;
 		}
-		if (!wrpbp_addr_writable(sess->task->mm, points[i].watch_addr,
-					 WRPBP_VEC_BYTES))
 		{
-			printk(KERN_ERR "wrpbp: point %d addr=%llx 不在目标可写 VMA 内, "
-			       "拒绝安装\n", i,
-			       (unsigned long long)points[i].watch_addr);
-			ret = -EFAULT;
-			goto fail;
+			bool w = false, mapped;
+			unsigned long vs = 0, ve = 0, vf = 0;
+
+			mapped = wrpbp_addr_probe(sess->task->mm,
+						  points[i].watch_addr,
+						  WRPBP_VEC_BYTES, &w,
+						  &vs, &ve, &vf);
+			if (!mapped)
+			{
+				/* 没映射 = 地址是错的/过了版本就失效。
+				 * 把 pid 和 comm 一起打出来: 先确认会话绑的是不是
+				 * 那个游戏进程, 再确认地址本身。 */
+				printk(KERN_ERR "wrpbp: point %d addr=%llx 在 pid=%d(%s) "
+				       "里没有映射, 拒绝安装\n", i,
+				       (unsigned long long)points[i].watch_addr,
+				       sess->task->tgid, sess->task->comm);
+				ret = -EFAULT;
+				goto fail;
+			}
+			if (!w)
+			{
+				/* 硬件观察点比的是地址, 不看页权限, 只读照样能观察;
+				 * 只是不能往里写回。以前这里直接回 -EFAULT, 于是
+				 * 只读向量区的追踪点一个都装不上。 */
+				sl->ro = true;
+				printk(KERN_WARNING "wrpbp: point %d addr=%llx 落在只读 VMA "
+				       "[%lx-%lx) flags=%lx, 只观察不回写\n", i,
+				       (unsigned long long)points[i].watch_addr,
+				       vs, ve, vf);
+			}
 		}
 
 		/* 12 字节向量在 arm64 上最多 LEN_8, 一个观察点盖不住:

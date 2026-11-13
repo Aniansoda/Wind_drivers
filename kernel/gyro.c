@@ -669,7 +669,6 @@ MODULE_PARM_DESC(wind_gyro, "陀螺仪改写通道, 1=开(默认, Paradise 同�
 
 int gyro_install(pid_t pid)
 {
-	struct task_struct *task;
 	int ret;
 
 	if (!g_wind_gyro_enable)
@@ -697,29 +696,15 @@ int gyro_install(pid_t pid)
 		printk(KERN_INFO "gyro: socket 路线已启用 tgid=%d\n", pid);
 		return 0;
 	}
-	printk(KERN_INFO "gyro: socket 路线失败 %d, 回落到执行断点\n", ret);
 
-	task = gyro_get_task();
-	if (!task)
-	{
-		gyro_pid = 0;
-		return -ESRCH;
-	}
-
-	ret = gyro_bind(task);
-	if (ret)
-	{
-		gyro_pid = 0;
-		gyro_addr = 0;
-		return ret;
-	}
-
-	gyro_active = true;
-	atomic64_set(&gyro_hits, 0);
-	WRITE_ONCE(gyro_enabled, true);
-	printk(KERN_INFO "gyro: registered successfully (pid=%d addr=0x%lx wide=%d hits=%lld)\n",
-	       pid, gyro_addr, (int)gyro_bp_wide, (long long)atomic64_read(&gyro_hits));
-	return 0;
+	/* 只保留 Paradise 这条 (改 system_server 收到的 ASensorEvent)。
+	 * 不再回落到执行断点: 那条路要占 arm64 仅有的 4 个硬件断点寄存器,
+	 * 和子弹追踪的观察点直接抢, 一回落就是"自瞄没反应 + 追踪装不上"同时出现,
+	 * 而且断点异常风暴本身就会把机器拖死。
+	 * 这里原样返回 socket 的错误码, 用户态看 dmesg 就知道挂的是哪个符号。 */
+	printk(KERN_ERR "gyro: socket 路线失败 %d, 不再回落到执行断点\n", ret);
+	gyro_pid = 0;
+	return ret;
 }
 
 void gyro_remove(void)

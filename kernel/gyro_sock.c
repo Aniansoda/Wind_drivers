@@ -162,9 +162,27 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
 	}
 }
 
-/* __arm64_sys_recvmsg(const struct pt_regs *regs)
- * 用户参数在 regs->regs[0..2]: fd, msg, flags
- * 注意内核 pt_regs 里的 regs[0..2] 就是 syscall 的 x0..x2, 直接取。 */
+/* kprobe 落在 __arm64_sys_* 上时, 函数第一个参数是 struct pt_regs *,
+ * 真正的 fd/msg/flags 在它指向的用户现场里 —— 要再解一层。
+ * 以前直接拿 regs->regs[1] 当 msghdr 指针, 拿到的是内核栈上的 pt_regs 地址,
+ * copy_from_user 必然失败, 于是 msgs 计数一直不涨, 改写一次都没发生过。
+ * 落在 __sys_recvmsg / ksys_recvmsg 这类直接函数上时 x0=fd, x1=msghdr。
+ */
+static bool g_gyro_kp_wrapper;
+static const char *g_gyro_kp_sym;
+
+static struct pt_regs *gyro_user_regs(struct pt_regs *regs)
+{
+	if (g_gyro_kp_wrapper) {
+		struct pt_regs *ur = (struct pt_regs *)regs->regs[0];
+
+		if (!ur || !user_mode(ur))
+			return NULL;
+		return ur;
+	}
+	return regs;
+}
+
 static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
@@ -172,6 +190,7 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 		return 0;
 	struct gyro_recv_ctx *ctx = this_cpu_ptr(&gyro_ctx);
 	struct user_msghdr umh;
+	struct pt_regs *ur;
 
 	ctx->valid = false;
 
@@ -182,7 +201,10 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 	if (!READ_ONCE(g_gyro_x_bits) && !READ_ONCE(g_gyro_y_bits))
 		return 0;
 
-	if (copy_from_user(&umh, (void __user *)regs->regs[1], sizeof(umh)))
+	ur = gyro_user_regs(regs);
+	if (!ur)
+		return 0;
+	if (copy_from_user(&umh, (void __user *)ur->regs[1], sizeof(umh)))
 		return 0;
 	if (!umh.msg_iov || !umh.msg_iovlen || umh.msg_iovlen > GYRO_IOV_MAX)
 		return 0;
@@ -223,9 +245,23 @@ static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long
 	gyro_rewrite_iov(kiov, n, total);
 }
 
+/* 传感器接收路径在不同 ROM / 内核上落点不同, 全试一遍。
+ * wrapper=true 表示符号是 __arm64_sys_* 形态, 第一个参数是 pt_regs*。 */
+static const struct {
+	const char *sym;
+	bool wrapper;
+} g_gyro_cands[] = {
+	{ "__arm64_sys_recvmsg",  true  },
+	{ "__arm64_sys_recvfrom", true  },
+	{ "__sys_recvmsg",        false },
+	{ "ksys_recvmsg",         false },
+	{ "__se_sys_recvmsg",     false },
+};
+
 int gyro_sock_install(pid_t system_server_tgid)
 {
-	int ret;
+	int ret = -EOPNOTSUPP;
+	unsigned int i;
 
 	if (g_gyro_kp.addr) {
 		WRITE_ONCE(g_gyro_tgid, system_server_tgid);
@@ -233,31 +269,30 @@ int gyro_sock_install(pid_t system_server_tgid)
 		return 0;
 	}
 
-	memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
-	g_gyro_kp.symbol_name = "__arm64_sys_recvmsg";
-	g_gyro_kp.pre_handler = gyro_recv_pre;
-	g_gyro_kp.post_handler = gyro_recv_post;
-
-	ret = register_kprobe(&g_gyro_kp);
-	if (ret) {
-		pr_err("[wind] gyro-sock: __arm64_sys_recvmsg 挂不上 (%d)\n", ret);
+	for (i = 0; i < sizeof(g_gyro_cands) / sizeof(g_gyro_cands[0]); i++) {
 		memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
-		g_gyro_kp.symbol_name = "__arm64_sys_recvfrom";
+		g_gyro_kp.symbol_name = g_gyro_cands[i].sym;
 		g_gyro_kp.pre_handler = gyro_recv_pre;
 		g_gyro_kp.post_handler = gyro_recv_post;
+
 		ret = register_kprobe(&g_gyro_kp);
-	}
-	if (ret) {
-		pr_err("[wind] gyro-sock: 回落 __arm64_sys_recvfrom 也失败 (%d)\n", ret);
+		if (ret == 0) {
+			g_gyro_kp_wrapper = g_gyro_cands[i].wrapper;
+			g_gyro_kp_sym = g_gyro_cands[i].sym;
+			WRITE_ONCE(g_gyro_tgid, system_server_tgid);
+			WRITE_ONCE(g_gyro_sock_on, true);
+			pr_info("[wind] gyro-sock: 已挂 %s (wrapper=%d), tgid=%d\n",
+				g_gyro_kp_sym, (int)g_gyro_kp_wrapper,
+				(int)system_server_tgid);
+			return 0;
+		}
+		pr_info("[wind] gyro-sock: %s 挂不上 (%d)\n",
+			g_gyro_cands[i].sym, ret);
 		memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
-		return ret;
 	}
 
-	WRITE_ONCE(g_gyro_tgid, system_server_tgid);
-	WRITE_ONCE(g_gyro_sock_on, true);
-	pr_info("[wind] gyro-sock: 已挂 %s, tgid=%d\n",
-		g_gyro_kp.symbol_name, system_server_tgid);
-	return 0;
+	pr_err("[wind] gyro-sock: 所有接收路径符号都挂不上, 最后错误 %d\n", ret);
+	return ret;
 }
 
 void gyro_sock_remove(void)
@@ -267,9 +302,11 @@ void gyro_sock_remove(void)
 		unregister_kprobe(&g_gyro_kp);
 		memset(&g_gyro_kp, 0, sizeof(g_gyro_kp));
 	}
-	pr_info("[wind] gyro-sock: 已卸载, msgs=%lld rewrites=%lld\n",
+	pr_info("[wind] gyro-sock: 已卸载 (%s), msgs=%lld rewrites=%lld\n",
+		g_gyro_kp_sym ? g_gyro_kp_sym : "-",
 		(long long)atomic64_read(&g_gyro_msgs),
 		(long long)atomic64_read(&g_gyro_rewrites));
+	g_gyro_kp_sym = NULL;
 }
 
 void gyro_sock_set(u32 x_bits, u32 y_bits)

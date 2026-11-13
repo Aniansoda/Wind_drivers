@@ -505,6 +505,16 @@ static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
 
 	(void)kpr;
 	ret = cb_mem_abort_do(regs);
+	if (ret) {
+		/* 关键: 让 do_mem_abort 直接返回。
+		 * pre_handler 返回非 0 只是让 kprobe 跳过单步, 被探测函数照样
+		 * 从头执行 —— 它会拿同一组 far/esr 再处理一遍这个异常, 而我们刚
+		 * 把页切过, 于是「切页 -> 它报错 -> 再切 -> 再报错」无限循环,
+		 * 表现就是克隆页一初始化就卡死、看门狗重启。
+		 * 把 pc 指到 lr 等于本函数立刻 return, 异常返回到 el0_da,
+		 * CPU 用新页表重试那条指令。 */
+		regs->pc = regs->regs[30];
+	}
 	cb_tm_end(t0);
 	return ret;
 }
