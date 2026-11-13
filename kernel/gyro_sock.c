@@ -60,6 +60,7 @@ static DEFINE_PER_CPU(struct gyro_recv_ctx, gyro_ctx);
 static struct kprobe g_gyro_kp;
 static bool g_gyro_sock_on;
 static pid_t g_gyro_tgid;
+static bool g_gyro_tgid_warned;
 static atomic64_t g_gyro_msgs = ATOMIC64_INIT(0);
 static atomic64_t g_gyro_rewrites = ATOMIC64_INIT(0);
 
@@ -197,8 +198,16 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 
 	if (!READ_ONCE(g_gyro_sock_on))
 		return 0;
-	if (!g_gyro_tgid || current->tgid != g_gyro_tgid)
-		return 0;
+	/* tgid 只当参考, 不当闸门。
+	 * 用户态传进来的可能是游戏 pid 而不是 sensorservice 的, 严格比对就是
+	 * 一条事件都改不到, 表现是"装上了、msgs 不涨、自瞄没反应"。
+	 * 真正的判据是事件形状: 长度是 0x68 的整数倍, 且 +0x08 的类型是
+	 * GYRO / GYRO_UNCAL —— 只有传感器数据流满足。 */
+	if (g_gyro_tgid && current->tgid != g_gyro_tgid && !g_gyro_tgid_warned) {
+		g_gyro_tgid_warned = true;
+		pr_info("[wind] gyro-sock: 接收方 tgid=%d 与传入 %d 不同, 按事件形状放行\n",
+			current->tgid, g_gyro_tgid);
+	}
 	if (!READ_ONCE(g_gyro_x_bits) && !READ_ONCE(g_gyro_y_bits))
 		return 0;
 
