@@ -39,6 +39,9 @@
 #include <linux/mman.h>
 #include <asm/ptrace.h>
 #include "windcfg.h"	/* windcfg_gyro_on() */
+
+extern void gyro_sock_stats(long long *msgs, long long *rewrites);
+extern bool gyro_sock_active(void);
 #include <asm/page.h>
 #include <asm/memory.h>
 #include "sym.h"
@@ -571,7 +574,7 @@ static struct task_struct *gyro_get_task(void)
 }
 
 /* 解析符号 + 取基址 + 注册执行断点 (install / resume 共用) */
-static int gyro_bind(struct task_struct *task)
+static int __maybe_unused gyro_bind(struct task_struct *task)
 {
 	unsigned long offset = 0, base = 0;
 	struct perf_event_attr attr;
@@ -768,9 +771,14 @@ void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 	 * 这行放在下面 task 判空之前, 目标进程没了也要能看见最后状态。 */
 	if (time_after(jiffies, gyro_diag_next)) {
 		gyro_diag_next = jiffies + 2 * HZ;
-		printk(KERN_INFO "gyro-diag: mode=%d pending=%llx ready=%d bp=%d "
+		long long sm = 0, sr = 0;
+
+		gyro_sock_stats(&sm, &sr);
+		printk(KERN_INFO "gyro-diag: sock_active=%d sock_msgs=%lld sock_rewrites=%lld "
+				 "mode=%d pending=%llx ready=%d bp=%d "
 				 "single=%d wrp=%d exec_hits=%lld wrp_hits=%lld writes=%lld\n",
-		       gyro_mode, (unsigned long long)gyro_wrp_pending,
+			       (int)gyro_sock_active(), sm, sr,
+				       gyro_mode, (unsigned long long)gyro_wrp_pending,
 		       gyro_wrp_ready ? 1 : 0, gyro_bp ? 1 : 0,
 		       gyro_single_bp ? 1 : 0, gyro_wrp[0] ? 1 : 0,
 		       (long long)atomic64_read(&gyro_hits),
