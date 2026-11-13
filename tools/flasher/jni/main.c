@@ -295,7 +295,7 @@ static void write_proc_name(const char *name)
 static void dump_dmesg(void)
 {
 	char *argv[] = { "sh", "-c",
-		"dmesg | grep -E 'wind-cfg|wind-hide|ace|gyro-sock|kgsl|version magic|invalid module|Unknown symbol' | tail -16",
+		"dmesg | grep -E 'wind|gyro|wrpbp|clonebp|ace|kgsl|version magic|invalid module|Unknown symbol|BUG:|Unable to handle' | tail -24",
 		NULL };
 
 	printf(TAG " " K_DIM "内核日志:" K_RST "\n");
