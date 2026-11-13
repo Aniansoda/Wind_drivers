@@ -77,6 +77,9 @@ static bool g_gyro_tgid_warned;
 static atomic64_t g_gyro_msgs = ATOMIC64_INIT(0);
 static atomic64_t g_gyro_rewrites = ATOMIC64_INIT(0);
 
+static bool g_gyro_type_dumped;
+static unsigned int g_gyro_type_seen;
+
 static u32 g_gyro_x_bits;
 static u32 g_gyro_y_bits;
 
@@ -157,8 +160,20 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
 		if (iov_get_u32(iov, n, off + ASENSOR_TYPE_OFF, &type))
 			continue;
 		/* 只动陀螺仪记录; 加速度计/磁力计/压力原样放过 */
-		if (type != SENSOR_TYPE_GYRO && type != SENSOR_TYPE_GYRO_UNCAL)
+		if (type != SENSOR_TYPE_GYRO && type != SENSOR_TYPE_GYRO_UNCAL) {
+			/* 一次改写都没发生时, 把看到的前几个类型打出来:
+			 * rewrites 一直是 0 就靠这行判断是"没命中"还是"类型不是 4/16"。 */
+			if (!g_gyro_type_dumped &&
+			    atomic64_read(&g_gyro_rewrites) == 0 &&
+			    g_gyro_type_seen < 8) {
+				g_gyro_type_seen++;
+				pr_info("[wind] gyro-sock: 事件 type=%u off=%lu (期望 4 或 16)\n",
+					type, off);
+				if (g_gyro_type_seen >= 8)
+					g_gyro_type_dumped = true;
+			}
 			continue;
+		}
 
 		if (iov_get_u32(iov, n, off + ASENSOR_DATA_OFF, &raw[0]))
 			continue;
