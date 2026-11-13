@@ -23,6 +23,7 @@ extern bool g_wind_unloading;
 #include <linux/kallsyms.h>
 #include <linux/pid.h>
 #include <linux/pgtable.h>
+#include <asm/ptrace.h>	/* user_mode() */
 #include <linux/version.h>
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -254,6 +255,9 @@ static int cb_try_bailout(struct clonebp_page *cp);
  * 同样拒绝大页: 一个大 folio 映射到多条 PTE 时, mk_pte(single_page) 只能
  * 表示其中一页, 换页后原 folio 的其余部分语义就变了。
  * ============================================================ */
+/* 前置条件: 调用方必须已持有 mmap_lock (或处于异常/kprobe 上下文)。
+ * 这个函数内部不再取任何锁 —— 它同时被"持有读锁的 ioctl"和
+ * "持有写锁的 mprotect 钩子"调用, 一旦自己再 down_read 就是递归取锁。 */
 static bool cb_page_switchable(struct mm_struct *mm, struct clonebp_page *cp,
 			       const char **why)
 {
@@ -270,73 +274,52 @@ static bool cb_page_switchable(struct mm_struct *mm, struct clonebp_page *cp,
 		*why = "compound-page";
 		return false;
 	}
-
-#ifdef CONFIG_ARM64_CONT_PTE
-	{
-		pte_t *ptep;
-		pte_t pte;
-
-		/* cb_pte_get 要求调用方持有 mmap_lock */
-		mmap_read_lock(mm);
-		ptep = cb_pte_get(mm, cp->user_va, NULL);
-		if (!ptep) {
-			mmap_read_unlock(mm);
-			*why = "no-pte";
-			return false;
-		}
-		pte = READ_ONCE(*ptep);
-		mmap_read_unlock(mm);
-		if (pte_cont(pte)) {
-			unsigned long idx;
-
-			/* 折叠组必须按 CONT_PTES 对齐; 不在组首就无法安全展开 */
-			idx = (cp->user_va >> PAGE_SHIFT) & (CONT_PTES - 1);
-			if (idx != 0) {
-				*why = "cont-pte-mid";
-				return false;
-			}
-			/* 组首可以做展开: 把整组 PTE 拆成独立项。
-			 * 内核没导出 contpte 相关接口, 这里不去拆内核的,
-			 * 只拒绝 —— 保守但不会写坏相邻页。 */
-			*why = "cont-pte-unfold-unsupported";
-			return false;
-		}
-	}
-#endif
-
 	*why = NULL;
 	return true;
 }
 
-static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_shadow)
+/* 真正的换页。
+ * 绝对不能在内部取 mmap_lock:
+ *   - do_mem_abort / brk_handler 是异常入口, down_read 会睡眠 -> BUG
+ *   - do_mprotect_pkey 进入前已持有 mmap_lock 写锁, 再读锁 = 直接死锁
+ *   - access_remote_vm 的调用方已持有读锁, 递归读遇到排队写者同样死锁
+ * 这几种情况的表现都是"克隆页一初始化就卡死, 然后看门狗重启"。 */
+static int cb_switch_page_raw(struct mm_struct *mm, struct clonebp_page *cp,
+			      int to_shadow)
 {
 	pte_t *ptep;
-	pte_t pte;
+	pte_t pte, cur;
 	unsigned long flags;
+	const char *why = NULL;
 
 	if (!mm || !cp || !cp->inited)
 		return -EINVAL;
 	if (atomic_read(&cp->state) == to_shadow)
 		return 0;
-	{
-		/* 只在真正要换页时查: 同一状态直接返回, 不付这个代价 */
-		const char *why = NULL;
 
-		if (!cb_page_switchable(mm, cp, &why)) {
-			cb_stat_inc(CLONEBP_ST_CLONE_FAIL);
-			if (why && printk_ratelimit())
-				pr_warn("clonebp: 页 %llx 不可切换 (%s), 已拒绝\n",
-					(unsigned long long)cp->user_va, why);
-			return -EOPNOTSUPP;
-		}
+	if (!cb_page_switchable(mm, cp, &why)) {
+		cb_stat_inc(CLONEBP_ST_CLONE_FAIL);
+		if (why && printk_ratelimit())
+			pr_warn("clonebp: 页 %llx 不可切换 (%s), 已拒绝\n",
+				(unsigned long long)cp->user_va, why);
+		return -EOPNOTSUPP;
 	}
 
-	mmap_read_lock(mm);
 	ptep = cb_pte_get(mm, cp->user_va, NULL);
-	if (!ptep) {
-		mmap_read_unlock(mm);
+	if (!ptep)
 		return -EFAULT;
+
+	/* 折叠 PTE (contiguous) 状态下改一项会连带改掉相邻 15 页,
+	 * 只读检查不写, 命中就拒绝这页。 */
+	cur = READ_ONCE(*ptep);
+	if (pte_cont(cur)) {
+		cb_stat_inc(CLONEBP_ST_CLONE_FAIL);
+		if (printk_ratelimit())
+			pr_warn("clonebp: 页 %llx 是折叠 PTE, 拒绝切换\n",
+				(unsigned long long)cp->user_va);
+		return -EOPNOTSUPP;
 	}
+
 	local_irq_save(flags);
 	if (to_shadow == CLONEBP_STATE_SHADOW) {
 		/* 影子页: 用户不可读(无 PTE_USER), 可执行 */
@@ -351,17 +334,28 @@ static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_
 	}
 	WRITE_ONCE(*ptep, pte);
 	local_irq_restore(flags);
-	mmap_read_unlock(mm);
 
 	atomic_set(&cp->state, to_shadow);
-	/* 这里绝对不能清 cb_bailout_cnt。
-	 * 「原页->影子页->原页」每切一次都清零, 计数就永远停在 1,
-	 * cb_try_bailout 的阈值永远够不到, 异常环破不掉 ->
-	 * 该页读写交替的地方一路异常风暴, 表现就是卡死然后看门狗重启。
-	 * 计数只在 cb_try_bailout 里按时间窗衰减。 */
+	/* 这里绝对不能清 cb_bailout_cnt。计数只在 cb_try_bailout 里按时间窗衰减。 */
 	flush_tlb_page_range_local(mm, cp->user_va);
 	cb_stat_inc(CLONEBP_ST_TLB_FLUSH);
 	return 0;
+}
+
+/* ioctl / proc 路径用: 那里没持有 mmap_lock, 自己取一次再调 raw。 */
+static int cb_switch_page(struct mm_struct *mm, struct clonebp_page *cp, int to_shadow)
+{
+	int ret;
+
+	if (!mm || !cp || !cp->inited)
+		return -EINVAL;
+	if (atomic_read(&cp->state) == to_shadow)
+		return 0;
+
+	mmap_read_lock(mm);
+	ret = cb_switch_page_raw(mm, cp, to_shadow);
+	mmap_read_unlock(mm);
+	return ret;
 }
 
 /* ============================================================
@@ -413,7 +407,7 @@ static int cb_try_bailout(struct clonebp_page *cp)
 
 	if (atomic_inc_return(&cb_bailout_cnt[idx]) < (int)g_cb_tm.bailout_max)
 		return 0;
-	cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_BAILOUT);
+	cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_BAILOUT);
 	cb_stat_inc(CLONEBP_ST_BRK_HIT);
 	pr_warn("[clonebp] va=%lx 自读异常环, 已放宽为可读可执行\n",
 		(unsigned long)cp->user_va);
@@ -481,7 +475,7 @@ static int cb_mem_abort_do(struct pt_regs *regs)
 				return 0;
 			if (cb_try_bailout(cp))
 				return 1;
-			cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_SHADOW);
+			cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_SHADOW);
 			cb_stat_inc(CLONEBP_ST_IFAULT_IN);
 			return 1;
 		}
@@ -492,7 +486,7 @@ static int cb_mem_abort_do(struct pt_regs *regs)
 		if (cp && atomic_read(&cp->state) == CLONEBP_STATE_SHADOW) {
 			if (cb_try_bailout(cp))
 				return 1;
-			cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_ORIG);
+			cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_ORIG);
 			cb_stat_inc(CLONEBP_ST_DFAULT_IN);
 			return 1;
 		}
@@ -630,9 +624,25 @@ static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
 		return 0;
 	int ret;
 	u64 t0 = cb_tm_begin();
+	struct pt_regs *uregs;
 
 	(void)kpr;
-	ret = cb_brk_do(regs);
+	/* brk_handler(struct pt_regs *regs, unsigned int esr)
+	 * 这里的 regs 是"brk_handler 自己的现场", x0 才指向用户现场。
+	 * 以前直接把 regs 当用户现场改 regs->regs[]/regs->pc, 改的是
+	 * brk_handler 的栈帧 —— 用户态返回地址被写成 BRK 后面那条指令,
+	 * 一命中就跳飞, 表现就是"克隆页一初始化就重启"。
+	 */
+	uregs = (struct pt_regs *)regs->regs[0];
+	if (!uregs || !user_mode(uregs))
+		return 0;
+
+	ret = cb_brk_do(uregs);
+	if (ret) {
+		/* 用户态 PC 已推进到 BRK 之后; 再把 brk_handler 自己跳过,
+		 * 否则它会接着按 SIGTRAP 处理, 进程直接被杀。 */
+		regs->pc = regs->regs[30];
+	}
 	cb_tm_end(t0);
 	return ret;
 }
@@ -660,7 +670,7 @@ static int cb_mprotect_pre(struct kprobe *kpr, struct pt_regs *regs)
 		if (!cp || !cp->inited)
 			continue;
 		if (atomic_read(&cp->state) == CLONEBP_STATE_SHADOW)
-			cb_switch_page(g_cb_mm, cp, CLONEBP_STATE_ORIG);
+			cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_ORIG);
 	}
 	return 0;
 }
