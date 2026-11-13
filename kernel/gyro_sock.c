@@ -24,6 +24,7 @@ extern bool g_wind_unloading;
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/kprobes.h>
+#include <asm/ptrace.h>	/* user_mode() */
 #include <linux/sched.h>
 #include <linux/percpu.h>
 #include <linux/uaccess.h>
