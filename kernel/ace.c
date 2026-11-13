@@ -5,6 +5,7 @@ extern bool g_wind_unloading;
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/kprobes.h>
+#include <linux/smp.h>
 #include <linux/sched.h>
 #include <linux/percpu.h>
 #include <linux/mm.h>
@@ -220,7 +221,12 @@ struct ace_tp_slot {
 	unsigned int ptrace;
 };
 
-static DEFINE_PER_CPU(struct ace_tp_slot, ace_tp_slot);
+/* 不用模块 per-cpu: 模块的 .data..percpu 段要在装载时单独分配,
+ * Android GKI 上这一步经常直接失败 (wind: Could not allocate 72 bytes
+ * percpu data -> insmod rc=1), 整个驱动装不上。
+ * 改成 NR_CPUS 大小的普通数组 + 原始 CPU 号索引, 语义一样, 不占 per-cpu 段。 */
+static struct ace_tp_slot ace_tp_slots[NR_CPUS];
+#define ace_slot() (&ace_tp_slots[raw_smp_processor_id()])
 
 static noinline int ace_status_pre(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -228,7 +234,7 @@ static noinline int ace_status_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (READ_ONCE(g_wind_unloading))
 		return 0;
 	struct task_struct *task = (struct task_struct *)regs->regs[3];
-	struct ace_tp_slot *s = this_cpu_ptr(&ace_tp_slot);
+	struct ace_tp_slot *s = ace_slot();
 
 	(void)kp;
 	s->task = NULL;
@@ -249,7 +255,7 @@ static noinline int ace_status_pre(struct kprobe *kp, struct pt_regs *regs)
 
 static noinline int ace_status_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct ace_tp_slot *s = this_cpu_ptr(&ace_tp_slot);
+	struct ace_tp_slot *s = ace_slot();
 
 	(void)ri;
 	(void)regs;

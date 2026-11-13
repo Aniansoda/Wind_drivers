@@ -38,6 +38,7 @@
 #include <linux/uaccess.h>
 #include <linux/mman.h>
 #include <asm/ptrace.h>
+#include <linux/smp.h>
 #include "windcfg.h"	/* windcfg_gyro_on() */
 
 extern void gyro_sock_stats(long long *msgs, long long *rewrites);
@@ -118,7 +119,8 @@ static atomic64_t gyro_wrp_hits = ATOMIC64_INIT(0);
 static atomic64_t gyro_writes = ATOMIC64_INIT(0);
 static unsigned long gyro_wrp_last_seen;
 static unsigned long gyro_diag_next;
-static DEFINE_PER_CPU(int, gyro_wrp_busy);
+static int gyro_wrp_busy_cpu[NR_CPUS];
+#define gyro_wrp_busy_now() (gyro_wrp_busy_cpu[raw_smp_processor_id()])
 static const char *gyro_lib_used;
 static int gyro_mode;   /* 0=学到后自动转 WRP 1=只用执行断点 2=已转 WRP */
 module_param(gyro_mode, int, 0644);
@@ -336,7 +338,7 @@ static void gyro_wrp_handler(struct perf_event *bp, struct perf_sample_data *dat
 	/* 我们自己写回也会命中这个观察点: 内核上下文 + per-CPU busy 双闸 */
 	if (!user_mode(regs))
 		return;
-	if (this_cpu_read(gyro_wrp_busy))
+	if (gyro_wrp_busy_now())
 		return;
 
 	mm = current->mm;
@@ -349,10 +351,10 @@ static void gyro_wrp_handler(struct perf_event *bp, struct perf_sample_data *dat
 	v[0] = gyro_rx;
 	v[1] = gyro_ry;
 	/* 观察窗口就是 x/y 那 8 字节: 写回长度 8, z 所在 0x20 一个字节都不碰 */
-	this_cpu_inc(gyro_wrp_busy);
+	gyro_wrp_busy_now()++;
 	if (gyro_write_mem(mm, (uintptr_t)gyro_wrp_addr[0], v, sizeof(v)))
 		atomic64_inc(&gyro_writes);
-	this_cpu_dec(gyro_wrp_busy);
+	gyro_wrp_busy_now()--;
 
 	if (atomic64_read(&gyro_wrp_hits) <= 3)
 		printk(KERN_INFO "gyro-wrp: hit #%lld addr=%llx x=%08x y=%08x\n",

@@ -18,6 +18,7 @@
  * 这比判 socket 类型更准 —— 同一条流里的加速度计/磁力计记录原样放过。
  */
 #include <linux/kernel.h>
+#include <linux/string.h>
 
 /* 由 entry.c 定义: 卸载中标志 */
 extern bool g_wind_unloading;
@@ -59,7 +60,28 @@ struct gyro_recv_ctx {
 	bool flat;
 };
 
-static DEFINE_PER_CPU(struct gyro_recv_ctx, gyro_ctx);
+/* 不用模块 per-cpu: 模块 .data..percpu 段在 Android GKI 上分配失败会让整个
+ * insmod 失败 (Could not allocate 72 bytes percpu data)。
+ * 这里改成按线程号散列的一张小表, pre 和 post 拿到同一个槽 —— 比 per-cpu
+ * 更准: 系统调用中途被迁移到别的 CPU 也不会丢上下文。 */
+#define GYRO_CTX_SLOTS 32
+struct gyro_ctx_slot {
+	pid_t tid;
+	struct gyro_recv_ctx c;
+};
+static struct gyro_ctx_slot g_gyro_ctx_tab[GYRO_CTX_SLOTS];
+
+static struct gyro_recv_ctx *gyro_ctx_get(void)
+{
+	pid_t tid = task_pid_nr(current);
+	struct gyro_ctx_slot *s = &g_gyro_ctx_tab[(unsigned int)tid % GYRO_CTX_SLOTS];
+
+	if (READ_ONCE(s->tid) != tid) {
+		s->tid = tid;
+		memset(&s->c, 0, sizeof(s->c));
+	}
+	return &s->c;
+}
 
 /* 传感器读口在不同 ROM 上落点不同: 可能是 recvmsg / recvfrom / read。
  * 以前只挂第一个注册成功的符号, 挂上 recvmsg 就不再试别的 —— 如果
@@ -238,7 +260,7 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
 	if (READ_ONCE(g_wind_unloading))
 		return 0;
-	struct gyro_recv_ctx *ctx = this_cpu_ptr(&gyro_ctx);
+	struct gyro_recv_ctx *ctx = gyro_ctx_get();
 	struct user_msghdr umh;
 	struct pt_regs *ur;
 
@@ -293,7 +315,7 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 /* 返回后数据已在用户 iovec 里 */
 static void gyro_recv_post(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
 {
-	struct gyro_recv_ctx *ctx = this_cpu_ptr(&gyro_ctx);
+	struct gyro_recv_ctx *ctx = gyro_ctx_get();
 	struct iovec kiov[GYRO_IOV_MAX];
 	unsigned long total = 0;
 	unsigned int n, i;

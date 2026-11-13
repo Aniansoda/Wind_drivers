@@ -37,6 +37,7 @@ extern bool g_wind_unloading;
 #include <linux/percpu.h>
 #include <linux/ptrace.h>
 #include <linux/kprobes.h>
+#include <linux/smp.h>
 #include <linux/skbuff.h>
 #include <linux/ip.h>
 #include <linux/in.h>
@@ -1295,7 +1296,9 @@ static HWBP_RECORD wrpbp_recs[BP_SLOT_MAX][BP_REC_PER_SLOT];
 static u32 wrpbp_head[BP_SLOT_MAX];
 static u32 wrpbp_count[BP_SLOT_MAX];
 static pid_t wrpbp_tgid;
-static DEFINE_PER_CPU(int, wrpbp_busy);
+/* 同上: 不占模块 per-cpu 段 */
+static int wrpbp_busy_cpu[NR_CPUS];
+#define wrpbp_busy_now() (wrpbp_busy_cpu[raw_smp_processor_id()])
 
 /* 命中后把目标向量写回: 只走 nofault uaccess, 断点上下文里不能睡眠 */
 static void wrpbp_apply_vec(int slot)
@@ -1429,7 +1432,7 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 	/* 内核上下文里的写基本就是我们自己的写回, 直接放过, 不递归 */
 	if (!user_mode(regs))
 		return;
-	if (this_cpu_read(wrpbp_busy))
+	if (wrpbp_busy_now())
 		return;
 
 	for (i = 0; i < BP_SLOT_MAX; i++)
@@ -1489,10 +1492,10 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 				}
 				else
 				{
-					this_cpu_inc(wrpbp_busy);
+					wrpbp_busy_now()++;
 					wrpbp_apply_vec(i);
 					wrpbp_apply_fregs(i);
-					this_cpu_dec(wrpbp_busy);
+					wrpbp_busy_now()--;
 				}
 			}
 			return;
