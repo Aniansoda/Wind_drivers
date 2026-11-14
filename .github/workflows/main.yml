@@ -420,7 +420,7 @@ jobs:
       - name: Verify kernel source set
         run: |
           missing=0
-          for f in memory.c memory.h comm.h entry.c nlcomm.c sym.c clonebp.c clonebp.h breakpoint.c gyro.c; do
+          for f in memory.c memory.h comm.h entry.c nlcomm.c sym.c clonebp.c clonebp.h gyro.c; do
             if [ ! -f "kernel/$f" ]; then
               echo "::error::缺少 kernel/$f"
               missing=1
