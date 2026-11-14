@@ -618,6 +618,12 @@ static int __init driver_entry(void)
 	 * 放在 sym_init 之后 —— 它要用 kallsyms 和 ace/kgsl 的入口。 */
 	windcfg_init();
 
+	/* clonebp 的 g_cb_points 必须无条件初始化: transport 默认 3 时
+	 * 不走 transport==0 分支, 若只在分支里 init, g_cb_points 保持 NULL,
+	 * clonebp_set -> cb_alloc_point 解引用 NULL -> OOPS/看门狗重启。 */
+	if (clonebp_module_init() != 0)
+		pr_err("[wind] clonebp init failed\n");
+
 	/* 通道建立只由 transport 决定, 与 install_hook / hook_level 无关。
 	 * 以前这里把 install_hook=0 也当成"什么都不建", 结果用户按建议关 hook 做对照,
 	 * 连 netlink 通道一起没了, 用户态永远连不上。 */
@@ -625,9 +631,7 @@ static int __init driver_entry(void)
 		printk(KERN_INFO "wind: transport=0, 只做符号解析, 不建通道\n");
 		if (ace_init() != 0)
 			pr_warn("[wind] ace init failed\n");
-		if (clonebp_module_init() != 0)
-		pr_err("[wind] clonebp init failed\n");
-	return 0;
+		return 0;
 	}
 	if (!install_hook || hook_level <= 0)
 		printk(KERN_INFO "wind: install_hook=%d hook_level=%d → 只跳过 hook, 通道照建\n",
