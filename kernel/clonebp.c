@@ -755,6 +755,34 @@ static struct kprobe cb_remote_kp = {
 };
 static int cb_kp_remote_reg;
 
+
+/* mm_release(struct task_struct *tsk, struct mm_struct *mm)
+ * 进程退出/exec 时 mm 生命周期结束。若此时 g_cb_mm 还指着这个 mm,
+ * 不清理则 g_cb_mm 悬空指向即将被 mmput 释放的 mm_struct,
+ * 后续任何异常路径 cb_switch_page_raw 访问 g_cb_mm->pgd = use-after-free
+ * -> 内核崩溃 / 看门狗重启。 */
+static int cb_mm_release_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	struct mm_struct *mm;
+
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
+
+	(void)p;
+	mm = (struct mm_struct *)regs->regs[1];
+	if (!mm)
+		return 0;
+	/* 只清理目标进程自己的 mm, 其它进程的 mm_release 不碰 */
+	clonebp_release_mm(mm);
+	return 0;
+}
+
+static struct kprobe cb_mm_release_kp = {
+	.symbol_name = "mm_release",
+	.pre_handler = cb_mm_release_pre,
+};
+static int cb_kp_mmrel_reg;
+
 static struct kprobe cb_mem_abort_kp = {
 	.symbol_name = "do_mem_abort",
 	.pre_handler = cb_mem_abort_pre,
@@ -809,11 +837,23 @@ static int cb_install_hooks(void)
 		else
 			cb_kp_remote_reg = 1;
 	}
+	if (!cb_kp_mmrel_reg) {
+		ret = register_kprobe(&cb_mm_release_kp);
+		if (ret < 0)
+			pr_warn("[clonebp] mm_release 挂不上 %d, "
+				"目标进程退出后 g_cb_mm 可能悬空\n", ret);
+		else
+			cb_kp_mmrel_reg = 1;
+	}
 	return 0;
 }
 
 static void cb_remove_hooks(void)
 {
+	if (cb_kp_mmrel_reg) {
+		unregister_kprobe(&cb_mm_release_kp);
+		cb_kp_mmrel_reg = 0;
+	}
 	if (cb_kp_remote_reg) {
 		unregister_kprobe(&cb_remote_kp);
 		cb_kp_remote_reg = 0;
@@ -987,8 +1027,16 @@ int clonebp_set(struct task_struct *task, const void __user *uconf, uint32_t cou
 		if (g_cb_pages[i].inited)
 			cb_switch_page(mm, &g_cb_pages[i], 0);
 	}
+	/* 全部点创建失败: 回滚 g_cb_mm 并释放 get_task_mm 的引用,
+	 * 否则残留单目标绑定 + mm 引用泄漏 */
+	if (ok == 0) {
+		g_cb_mm = NULL;
+		mutex_unlock(&g_cb_lock);
+		mmput(mm);
+		return -EFAULT;
+	}
 	mutex_unlock(&g_cb_lock);
-	return ok > 0 ? ok : -EFAULT;
+	return ok;
 }
 
 static void cb_page_release(struct clonebp_page *cp)
@@ -1035,6 +1083,9 @@ int clonebp_remove_all(struct mm_struct *mm)
 	g_cb_mm = NULL;
 	mutex_unlock(&g_cb_lock);
 	cb_remove_hooks();
+	/* 释放 clonebp_set 里 get_task_mm 拿到的 mm 引用 (补泄漏) */
+	if (mm)
+		mmput(mm);
 	return 0;
 }
 
@@ -1126,8 +1177,36 @@ void clonebp_fork_resume(struct mm_struct *mm)
 
 void clonebp_release_mm(struct mm_struct *mm)
 {
-	if (g_cb_mm == mm)
-		clonebp_remove_all(mm);
+	int i;
+
+	if (!mm || READ_ONCE(g_cb_mm) != mm)
+		return;
+
+	/* mm_release 的 kprobe pre_handler 里跑, 异常上下文(preempt_disable)
+	 * 不可睡眠: mutex_lock / mmap_read_lock / unregister_kprobe /
+	 * mmput(might_sleep) 都不能用。只做原子清理:
+	 *   1) 影子页切回原始页(此时页表还在, cb_pte_get 遍历安全)
+	 *   2) 释放影子/原始页(cb_page_release 纯原子)
+	 *   3) g_cb_mm=NULL 让所有异常路径早退
+	 *   4) mmput_async 释放 clonebp_set 里 get_task_mm 的引用
+	 *      (atomic_dec, 减到 0 才 queue_work, 异常上下文安全)
+	 * hook 留着: g_cb_mm=NULL 后异常路径早退, 下次 clonebp_set
+	 * 复用已挂 hook, 或 module_exit 统一摘。 */
+	for (i = 0; i < CLONEBP_MAX_POINTS; ++i) {
+		if (g_cb_points[i].page) {
+			cb_switch_page_raw(mm, g_cb_points[i].page, CLONEBP_STATE_ORIG);
+			cb_page_release(g_cb_points[i].page);
+		}
+		memset(&g_cb_points[i], 0, sizeof(g_cb_points[i]));
+	}
+	g_cb_point_cnt = 0;
+	for (i = 0; i < CB_MAX_PAGES_TOTAL; ++i) {
+		if (g_cb_pages[i].inited)
+			cb_page_release(&g_cb_pages[i]);
+	}
+	g_cb_page_cnt = 0;
+	WRITE_ONCE(g_cb_mm, NULL);
+	mmput_async(mm);
 }
 
 int clonebp_module_init(void)
