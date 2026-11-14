@@ -169,6 +169,20 @@ void wind_kprobe_unregister_symbol(struct kprobe *kp)
 	kfree(kp);
 }
 
+/* kallsyms_lookup_name: 解析任意符号地址（含 NOKPROBE 保护的符号）。
+ * export 被 GKI 移除, 但符号本身非 static 非 NOKPROBE, register_kprobe
+ * 能解析它的地址; 拿到地址后直接调用它解析 do_mem_abort 等 NOKPROBE 符号,
+ * 供 ftrace hook 用（ftrace 不受 NOKPROBE 限制）。 */
+typedef unsigned long (*kallsyms_lookup_name_fn)(const char *name);
+static kallsyms_lookup_name_fn g_kallsyms_lookup_name = NULL;
+
+unsigned long wind_kallsyms_lookup_name(const char *name)
+{
+	if (!g_kallsyms_lookup_name || !name)
+		return 0;
+	return g_kallsyms_lookup_name(name);
+}
+
 /*
  * 重写 ptep_get: 模拟内核 ptep_get 逻辑 —— 先 READ_ONCE 读原始 PTE,
  * 若为 contpte (VALID|CONT 位) 且 contpte_ptep_get 已解析, 走 2 参数
@@ -464,6 +478,7 @@ int wind_sym_init(void)
 	g_alloc_skb = (alloc_skb_fn)wind_kprobe_resolve("__alloc_skb");
 	g_kthread_use_mm = (kthread_use_mm_fn)wind_kprobe_resolve("kthread_use_mm");
 	g_kthread_unuse_mm = (kthread_unuse_mm_fn)wind_kprobe_resolve("kthread_unuse_mm");
+	g_kallsyms_lookup_name = (kallsyms_lookup_name_fn)wind_kprobe_resolve("kallsyms_lookup_name");
 
 	pr_info("wind: sym misc=%px/%px nl=%px/%px/%px/%px skb=%px\n",
 		(void *)g_misc_register, (void *)g_misc_deregister,
@@ -475,6 +490,8 @@ int wind_sym_init(void)
 		(void *)g_kthread_use_mm, (void *)g_kthread_unuse_mm);
 	if (!g_kthread_use_mm || !g_kthread_unuse_mm)
 		pr_warn("wind: kthread_use_mm 未解析到, 影子页跳板不可用\n");
+	if (!g_kallsyms_lookup_name)
+		pr_warn("wind: kallsyms_lookup_name 未解析到, ftrace hook do_mem_abort 不可用\n");
 
 	pr_info("wind: sym vmap=%px/%px/%px/%px filp=%px kread=%px fpath=%px hwbp=%px/%px/%px nofault=%px/%px misc=%px/%px\n",
 		(void *)g_free_vm_area, (void *)g_vunmap, (void *)g_get_vm_area_caller, (void *)g_ioremap_page_range,

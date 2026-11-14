@@ -119,6 +119,13 @@ struct kprobe *wind_kprobe_register_symbol(const char *name,
 					  void (*post)(struct kprobe *, struct pt_regs *, unsigned long));
 void wind_kprobe_unregister_symbol(struct kprobe *kp);
 
+/* 解析任意符号地址（含 NOKPROBE 保护的符号）。
+ * kallsyms_lookup_name 的 export 被 GKI 移除, 但其符号本身非 static 非
+ * NOKPROBE, 可先用 register_kprobe 解析它的地址, 再调用它解析目标符号。
+ * 用于 ftrace hook do_mem_abort(NOKPROBE, kprobe 解析不到)。
+ * 返回 0 表示解析失败。 */
+unsigned long wind_kallsyms_lookup_name(const char *name);
+
 int wind_sym_init(void);
 void wind_sym_exit(void);
 

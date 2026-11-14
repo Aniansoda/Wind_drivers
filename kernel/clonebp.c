@@ -21,6 +21,7 @@ extern bool g_wind_unloading;
 #include <linux/delay.h>
 #include <linux/kprobes.h>
 #include <linux/kallsyms.h>
+#include <linux/ftrace.h>
 #include <linux/pid.h>
 #include <linux/pgtable.h>
 #include <asm/ptrace.h>	/* user_mode() */
@@ -501,32 +502,84 @@ static int cb_mem_abort_do(struct pt_regs *regs)
 	return 0;
 }
 
-static int cb_mem_abort_pre(struct kprobe *kpr, struct pt_regs *regs)
+/* do_mem_abort 被 NOKPROBE 保护, kprobe 无法 hook, 改用 ftrace。
+ * ftrace 回调在函数入口(fentry), 拿到的 pt_regs 语义与 kprobe pre_handler
+ * 一致: regs->regs[0]=x0=far, regs->regs[1]=x1=esr, regs->pc=函数地址,
+ * regs->regs[30]=lr。FTRACE_OPS_FL_IPMODIFY 允许改 regs->pc 让
+ * do_mem_abort 直接返回。
+ *
+ * ftrace 回调签名跨版本不同:
+ *   5.10        回调直接收 struct pt_regs *regs
+ *   5.11/5.12   仍收 struct pt_regs *regs (内部已封 ftrace_regs 但签名未改)
+ *   5.13+       回调收 struct ftrace_regs *fregs, 用 ftrace_get_regs() 拿 regs
+ * 分界取 5.13 保守, 兼容 CI 全量内核(5.10.198/5.15.149/6.1/6.6/6.12/6.18)。 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
+static void cb_mem_abort_ftrace(unsigned long ip, unsigned long parent_ip,
+				struct ftrace_ops *op, struct ftrace_regs *fregs)
 {
-	/* 模块正在卸载: 立刻退出, 不要碰到即将被释放的状态 */
-	if (READ_ONCE(g_wind_unloading))
-		return 0;
+	struct pt_regs *regs;
 	int ret;
-	u64 t0 = cb_tm_begin();
+	u64 t0;
 
-	(void)kpr;
+	if (READ_ONCE(g_wind_unloading))
+		return;
+
+	(void)ip; (void)parent_ip; (void)op;
+	regs = ftrace_get_regs(fregs);
+	if (!regs)
+		return;
+
+	t0 = cb_tm_begin();
 	ret = cb_mem_abort_do(regs);
 	if (ret) {
 		/* 关键: 让 do_mem_abort 直接返回。
-		 * pre_handler 返回非 0 只是让 kprobe 跳过单步, 被探测函数照样
-		 * 从头执行 —— 它会拿同一组 far/esr 再处理一遍这个异常, 而我们刚
-		 * 把页切过, 于是「切页 -> 它报错 -> 再切 -> 再报错」无限循环,
+		 * 不改 pc 的话它会拿同一组 far/esr 再处理一遍这个异常, 而我们
+		 * 刚把页切过, 于是「切页 -> 它报错 -> 再切 -> 再报错」无限循环,
 		 * 表现就是克隆页一初始化就卡死、看门狗重启。
 		 * 把 pc 指到 lr 等于本函数立刻 return, 异常返回到 el0_da,
 		 * CPU 用新页表重试那条指令。 */
 		regs->pc = regs->regs[30];
 	}
 	cb_tm_end(t0);
-	return ret;
 }
+#else
+static void cb_mem_abort_ftrace(unsigned long ip, unsigned long parent_ip,
+				struct ftrace_ops *op, struct pt_regs *regs)
+{
+	int ret;
+	u64 t0;
+
+	if (READ_ONCE(g_wind_unloading))
+		return;
+
+	(void)ip; (void)parent_ip; (void)op;
+	if (!regs)
+		return;
+
+	t0 = cb_tm_begin();
+	ret = cb_mem_abort_do(regs);
+	if (ret) {
+		regs->pc = regs->regs[30];
+	}
+	cb_tm_end(t0);
+}
+#endif
+
+static struct ftrace_ops cb_mem_abort_ops = {
+	.func = cb_mem_abort_ftrace,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+	/* IPMODIFY 5.11 引入(随 livepatch), 声明回调会改 regs->pc;
+	 * 5.10 没有该 flag, 直接改 SAVE_REGS 拿到的 regs->pc 同样生效。 */
+	.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY,
+#else
+	.flags = FTRACE_OPS_FL_SAVE_REGS,
+#endif
+};
+static unsigned long g_cb_mem_abort_addr;
+static int cb_ftrace_mem_reg;
 
 
-/* brk_handler pre_handler: 影子页 BRK 命中 -> 记录/改写 -> 跳过 SIGTRAP */
+/* do_el0_brk64 pre_handler: 影子页 BRK 命中 -> 记录/改写 -> 跳过 SIGTRAP */
 static int cb_brk_do(struct pt_regs *regs)
 {
 	struct clonebp_point *pt;
@@ -643,19 +696,21 @@ static int cb_brk_pre(struct kprobe *kpr, struct pt_regs *regs)
 	struct pt_regs *uregs;
 
 	(void)kpr;
-	/* brk_handler(struct pt_regs *regs, unsigned int esr)
-	 * 这里的 regs 是"brk_handler 自己的现场", x0 才指向用户现场。
+	/* do_el0_brk64(unsigned long esr, struct pt_regs *regs)
+	 * 新版 arm64 的 EL0 BRK 入口签名是 (esr, regs) —— x0=esr, x1=用户
+	 * 现场。旧 brk_handler(regs, esr) 是 x0=用户现场。换符号后取 x1。
+	 * 这里的 regs 是 do_el0_brk64 自己的现场, x1 才指向用户现场。
 	 * 以前直接把 regs 当用户现场改 regs->regs[]/regs->pc, 改的是
-	 * brk_handler 的栈帧 —— 用户态返回地址被写成 BRK 后面那条指令,
+	 * handler 的栈帧 —— 用户态返回地址被写成 BRK 后面那条指令,
 	 * 一命中就跳飞, 表现就是"克隆页一初始化就重启"。
 	 */
-	uregs = (struct pt_regs *)regs->regs[0];
+	uregs = (struct pt_regs *)regs->regs[1];
 	if (!uregs || !user_mode(uregs))
 		return 0;
 
 	ret = cb_brk_do(uregs);
 	if (ret) {
-		/* 用户态 PC 已推进到 BRK 之后; 再把 brk_handler 自己跳过,
+		/* 用户态 PC 已推进到 BRK 之后; 再把 do_el0_brk64 自己跳过,
 		 * 否则它会接着按 SIGTRAP 处理, 进程直接被杀。 */
 		regs->pc = regs->regs[30];
 	}
@@ -783,19 +838,14 @@ static struct kprobe cb_mm_release_kp = {
 };
 static int cb_kp_mmrel_reg;
 
-static struct kprobe cb_mem_abort_kp = {
-	.symbol_name = "do_mem_abort",
-	.pre_handler = cb_mem_abort_pre,
-};
 static struct kprobe cb_brk_kp = {
-	.symbol_name = "brk_handler",
+	.symbol_name = "do_el0_brk64",
 	.pre_handler = cb_brk_pre,
 };
 static struct kprobe cb_mprotect_kp = {
 	.symbol_name = "do_mprotect_pkey",
 	.pre_handler = cb_mprotect_pre,
 };
-static int cb_kp_mem_reg;
 static int cb_kp_brk_reg;
 static int cb_kp_mprot_reg;
 
@@ -803,20 +853,26 @@ static int cb_install_hooks(void)
 {
 	int ret;
 
-	if (!cb_kp_mem_reg) {
-		ret = register_kprobe(&cb_mem_abort_kp);
+	if (!cb_ftrace_mem_reg) {
+		g_cb_mem_abort_addr = wind_kallsyms_lookup_name("do_mem_abort");
+		if (!g_cb_mem_abort_addr) {
+			pr_err("[clonebp] do_mem_abort 地址解析失败, 影子页不可用\n");
+			return -ENODEV;
+		}
+		ftrace_set_filter_ip(&cb_mem_abort_ops, g_cb_mem_abort_addr, 0, 0);
+		ret = register_ftrace_function(&cb_mem_abort_ops);
 		if (ret < 0) {
-			pr_err("[clonebp] register do_mem_abort failed %d\n", ret);
+			pr_err("[clonebp] register do_mem_abort ftrace failed %d\n", ret);
 			return ret;
 		}
-		cb_kp_mem_reg = 1;
+		cb_ftrace_mem_reg = 1;
 	}
 	if (!cb_kp_brk_reg) {
 		ret = register_kprobe(&cb_brk_kp);
 		if (ret < 0) {
-			pr_err("[clonebp] register brk_handler failed %d\n", ret);
-			unregister_kprobe(&cb_mem_abort_kp);
-			cb_kp_mem_reg = 0;
+			pr_err("[clonebp] register do_el0_brk64 failed %d\n", ret);
+			unregister_ftrace_function(&cb_mem_abort_ops);
+			cb_ftrace_mem_reg = 0;
 			return ret;
 		}
 		cb_kp_brk_reg = 1;
@@ -866,9 +922,9 @@ static void cb_remove_hooks(void)
 		unregister_kprobe(&cb_brk_kp);
 		cb_kp_brk_reg = 0;
 	}
-	if (cb_kp_mem_reg) {
-		unregister_kprobe(&cb_mem_abort_kp);
-		cb_kp_mem_reg = 0;
+	if (cb_ftrace_mem_reg) {
+		unregister_ftrace_function(&cb_mem_abort_ops);
+		cb_ftrace_mem_reg = 0;
 	}
 }
 
