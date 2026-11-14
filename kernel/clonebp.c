@@ -1188,8 +1188,12 @@ void clonebp_release_mm(struct mm_struct *mm)
 	 *   1) 影子页切回原始页(此时页表还在, cb_pte_get 遍历安全)
 	 *   2) 释放影子/原始页(cb_page_release 纯原子)
 	 *   3) g_cb_mm=NULL 让所有异常路径早退
-	 *   4) mmput_async 释放 clonebp_set 里 get_task_mm 的引用
-	 *      (atomic_dec, 减到 0 才 queue_work, 异常上下文安全)
+	 *   4) 释放 clonebp_set 里 get_task_mm 加的 mm_users 引用。
+	 *      mmput_async 在真机未导出(insmod Unknown symbol err -2),
+	 *      这里等价用 atomic_dec: mm_release 在 exit_mm 末尾 mmput
+	 *      之前调用, 进程自己的 mm_users 引用还在(mm_users>=2), 减 1
+	 *      后不归零, 不会进 __mmput(不 sleep), mm_struct 由进程自己的
+	 *      mmput 释放。mmget/mmput 本就直接操作 mm->mm_users, 合法。
 	 * hook 留着: g_cb_mm=NULL 后异常路径早退, 下次 clonebp_set
 	 * 复用已挂 hook, 或 module_exit 统一摘。 */
 	for (i = 0; i < CLONEBP_MAX_POINTS; ++i) {
@@ -1206,7 +1210,7 @@ void clonebp_release_mm(struct mm_struct *mm)
 	}
 	g_cb_page_cnt = 0;
 	WRITE_ONCE(g_cb_mm, NULL);
-	mmput_async(mm);
+	atomic_dec(&mm->mm_users);
 }
 
 int clonebp_module_init(void)
