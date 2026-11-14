@@ -34,8 +34,14 @@ extern bool g_wind_unloading;
 #include <asm/fpsimd.h>
 #include "sym.h"   /* wind_fpsimd_preserve_current_state */
 
-/* 定义在 breakpoint.c, 两边共用同一个开关 */
-extern bool g_wind_fp_writeback;
+/* 浮点写回总开关, 默认开。insmod wind.ko wind_fp_writeback=0 可整体关掉,
+ * 用来区分"崩在浮点写回"还是"崩在别处"。
+ * (原定义在 breakpoint.c, 任务②删除断点功能后迁到 clonebp.c)
+ */
+bool g_wind_fp_writeback = true;
+module_param_named(wind_fp_writeback, g_wind_fp_writeback, bool, 0644);
+MODULE_PARM_DESC(wind_fp_writeback,
+		 "浮点寄存器写回总开关, 0=只用内存改写 (默认 1)");
 
 #include "clonebp.h"
 

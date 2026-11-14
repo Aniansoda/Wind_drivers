@@ -94,6 +94,7 @@ static bool g_gyro_kp_wrapper[GYRO_KP_MAX];
 static int g_gyro_kp_cnt;
 static int g_gyro_kp_cur;                            /* 注册回调用 */
 static bool g_gyro_sock_on;
+static bool g_gyro_sock_enabled;                     /* 由 gyro_set_enabled 控制 */
 static pid_t g_gyro_tgid;
 static bool g_gyro_tgid_warned;
 static atomic64_t g_gyro_msgs = ATOMIC64_INIT(0);
@@ -238,7 +239,7 @@ static int gyro_kprobe_idx(struct kprobe *p)
 	return -1;
 }
 
-/* 0 = msghdr 形状(recvmsg/recvfrom), 1 = 平铺缓冲(read) */
+/* 0 = msghdr 形状(recvmsg), 1 = 平铺缓冲(read/recvfrom) */
 static int gyro_kprobe_kind(struct kprobe *p)
 {
 	int i = gyro_kprobe_idx(p);
@@ -281,6 +282,9 @@ static int gyro_recv_pre(struct kprobe *p, struct pt_regs *regs)
 	ctx->valid = false;
 
 	if (!READ_ONCE(g_gyro_sock_on))
+		return 0;
+	/* 热开关: gyro_set_enabled(false) / gyro_stop 之后不再改写 */
+	if (!READ_ONCE(g_gyro_sock_enabled))
 		return 0;
 
 	ur = gyro_user_regs(p, regs);
@@ -393,14 +397,17 @@ void gyro_sock_dump(void)
 
 /* 传感器接收路径在不同 ROM / 内核上落点不同, 能挂的全挂上。
  * wrapper=true: 符号是 __arm64_sys_* 形态, 第一个参数是 pt_regs*。
- * kind=1: 平铺缓冲(read), 其余是 msghdr。 */
+ * kind=1: 平铺缓冲(read/recvfrom), 其余是 msghdr(recvmsg)。
+ * recvfrom(fd,buf,len,flags,...) 的 buf 是平铺缓冲, 不是 msghdr ——
+ * 游戏侧 SensorEventQueue 用 recv()(bionic 里 recv 就是 recvfrom) 读传感器
+ * 事件, 之前把 recvfrom 当 msghdr 解析, 形同漏挂, rewrites 一直是 0。 */
 static const struct {
 	const char *sym;
 	bool wrapper;
 	unsigned char kind;
 } g_gyro_cands[] = {
 	{ "__arm64_sys_recvmsg",  true,  0 },
-	{ "__arm64_sys_recvfrom", true,  0 },
+	{ "__arm64_sys_recvfrom", true,  1 },
 	{ "__arm64_sys_read",     true,  1 },
 	{ "__sys_recvmsg",        false, 0 },
 	{ "ksys_recvmsg",         false, 0 },
@@ -475,6 +482,7 @@ void gyro_sock_remove(void)
 	int i;
 
 	WRITE_ONCE(g_gyro_sock_on, false);
+	WRITE_ONCE(g_gyro_sock_enabled, false);
 	for (i = 0; i < g_gyro_kp_cnt; i++) {
 		unregister_kprobe(&g_gyro_kps[i]);
 		memset(&g_gyro_kps[i], 0, sizeof(g_gyro_kps[i]));
@@ -489,6 +497,11 @@ void gyro_sock_set(u32 x_bits, u32 y_bits)
 {
 	WRITE_ONCE(g_gyro_x_bits, x_bits);
 	WRITE_ONCE(g_gyro_y_bits, y_bits);
+}
+
+void gyro_sock_set_enabled(bool enabled)
+{
+	WRITE_ONCE(g_gyro_sock_enabled, enabled);
 }
 
 void gyro_sock_stats(long long *msgs, long long *rewrites)

@@ -4,7 +4,7 @@
 
 Android / Linux ARM64 커널 공간 메모리 읽기·쓰기 및 디버깅 프레임워크
 단일 모듈 `wind.ko`, 11개 서브시스템, 하나의 오퍼코드 체계, 세 가지 통신 경로
-제로 CRC 방식, 다섯 브레이크포인트 계열 동시 공존, 화이트리스트 밖 심볼은 전부 실행 시 해석
+제로 CRC 방식, 화이트리스트 밖 심볼은 전부 실행 시 해석
 
 ---
 
@@ -44,20 +44,14 @@ Android / Linux ARM64 커널 공간 메모리 읽기·쓰기 및 디버깅 프�
 
 | 코드 | 이전 | 현재 |
 |---|---|---|
-| `0x26..0x2B` | ETM/PTM 분기 추적 | **WRP 데이터 관측점** `wrpbp` |
 | `0x38..0x3D` | 예약 | 폐지, 정의하지 않음 |
-| `0x50..0x56` | — | **ACE 탐지 회피 위장**, 10 feature bit / 11 kprobe |
-| `0x0C / 0x0D` | ETM 잔재 | **BRK 소프트 브레이크** 구 인터페이스 `brk_set` / `brk_clear` 복원 |
+| `0x50..0x55` | — | **ACE 탐지 회피 위장**, 10 feature bit / 11 kprobe |
 | `0x33` | — | `OP_STATS` 캐시 통계 |
-| `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
-| `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
-| `0x3E / 0x3F` | — | `BP_DIAG` / `BP_ALL_OFF` |
 | 자이로 | 실행 브레이크포인트 상주 | 실행 브레이크포인트로 위치 파악 후 **WRP 정상 상태로 전환**, X/Y만 기록, Z는 창에 넣지 않음 |
 | 심볼 | 직접 참조 | 화이트리스트 밖 32개를 `register_kprobe` 로 실행 시 해석 |
 | 호환 | 코드 곳곳에 `#ifdef` | `compat.h` 로 일원화, 5.10 → 6.18 한 소스로 |
 
 ETM 경로는 삭제했다. Coresight 는 SoC 가 클록과 funnel 을 열어야 하고 기기 커버리지가 낮으며 데이터 자체를 관측하지 못한다
-`0x26..0x2B` 여섯 코드는 WRP 에 배정했다. 구조체 크기는 기존 `ETMBP_POINT_CONFIG` 와 같은 24바이트라 구 바이너리가 어긋나지 않는다
 
 ---
 
@@ -159,66 +153,6 @@ insmod wind.ko transport=0            # 통신 경로 없이 적재만, 진단�
 | 0x0E | `OP_KGSL_HIDE` | kgsl 쪽에서 pid 은닉 |
 | 0x0F | `OP_KGSL_HOOK` | kgsl hook 설치 |
 
-### 하드웨어 브레이크포인트 BRP/WRP
-
-| 코드 | 이름 | 기능 |
-|---|---|---|
-| 0x0C | `OP_BRK_SET` | 구버전 단일 하드웨어 브레이크포인트 |
-| 0x0D | `OP_BRK_CLEAR` | 구버전 단일 포인트 해제 |
-| 0x14 | `OP_HWBP_SET` | 브레이크포인트·관측점 그룹 설정, 16 슬롯 |
-| 0x15 | `OP_HWBP_REMOVE` | 전부 해제하고 debug 레지스터 반환 |
-| 0x16 | `OP_HWBP_GET_CONFIG` | 현재 설정과 여유 BRP/WRP 수 |
-| 0x17 | `OP_HWBP_GET_RECORDS` | 집계된 트리거 PC 분할 읽기 |
-| 0x18 | `OP_HWBP_SET_RECORD` | 기록과 2비트 레지스터 마스크 되쓰기 |
-| 0x19 | `OP_HWBP_CLEAR_RECORDS` | 기록 삭제, `-1` 은 전체 |
-| 0x34 | `OP_HWBP_SET_REGS` | 트리거 시 `s3`/`s4`/`s5` 기록, `.inst` 원시 인코딩 |
-| 0x37 | `OP_HWBP_REFRESH` | 주소 이동 후 재등록 |
-
-### PTE 섀도 페이지 실행 브레이크포인트
-
-| 코드 | 이름 | 기능 |
-|---|---|---|
-| 0x1A | `OP_PTEBP_SET` | PTE 속성 반전으로 fault 유발, 16 슬롯, debug 레지스터 미사용 |
-| 0x1B | `OP_PTEBP_REMOVE` | 전부 해제하고 PTE 복원 |
-| 0x1C | `OP_PTEBP_GET_CONFIG` | 현재 설정 |
-| 0x1D | `OP_PTEBP_GET_RECORDS` | 트리거 기록 분할 읽기 |
-| 0x1E | `OP_PTEBP_SET_RECORD` | 기록 되쓰기 |
-| 0x1F | `OP_PTEBP_CLEAR_RECORDS` | 기록 삭제, `-1` 은 전체 |
-| 0x35 | `OP_PTEBP_SET_REGS` | 트리거 시 섀도 트램펄린을 통해 레지스터 기록 |
-| 0x36 | `OP_PTEBP_REFRESH` | 섀도 페이지와 PTE 재정렬 |
-
-### BRK 소프트웨어 브레이크포인트
-
-| 코드 | 이름 | 기능 |
-|---|---|---|
-| 0x20 | `OP_BRKBP_SET` | 대상 명령을 `BRK` 로 변경, 16 슬롯 |
-| 0x21 | `OP_BRKBP_REMOVE` | 전부 해제하고 원래 명령 바이트 복원 |
-| 0x22 | `OP_BRKBP_GET_CONFIG` | 현재 설정 |
-| 0x23 | `OP_BRKBP_GET_RECORDS` | 트리거 기록 분할 읽기 |
-| 0x24 | `OP_BRKBP_SET_RECORD` | 기록 되쓰기 |
-| 0x25 | `OP_BRKBP_CLEAR_RECORDS` | 기록 삭제, `-1` 은 전체 |
-
-### WRP 데이터 관측점
-
-| 코드 | 이름 | 기능 |
-|---|---|---|
-| 0x26 | `OP_WRPBP_SET` | 대상 VA 에 쓰기 관측점 설치, `LEN_8` 창 |
-| 0x27 | `OP_WRPBP_REMOVE` | 해제하고 WRP 레지스터 반환 |
-| 0x28 | `OP_WRPBP_GET_CONFIG` | 현재 창 설정 |
-| 0x29 | `OP_WRPBP_GET_RECORDS` | 트리거 기록 분할 읽기 |
-| 0x2A | `OP_WRPBP_SET_VEC` | 2비트 마스크로 벡터 되쓰기, X/Y 개별 지정 |
-| 0x2B | `OP_WRPBP_CLEAR_RECORDS` | 기록 삭제, `-1` 은 전체 |
-
-### UDP 브레이크포인트
-
-| 코드 | 이름 | 기능 |
-|---|---|---|
-| 0x2E | `OP_UDPBP_SET` | UDP 슬롯 설치·갱신, 8 슬롯 |
-| 0x2F | `OP_UDPBP_REMOVE` | 슬롯 해제, `-1` 은 전체 |
-| 0x30 | `OP_UDPBP_GET_CONFIG` | 슬롯 표 |
-| 0x31 | `OP_UDPBP_GET_RECORDS` | 분할 읽기, 슬롯당 256건 |
-| 0x32 | `OP_UDPBP_CLEAR_RECORDS` | 기록 삭제, `-1` 은 전체 |
-
 ### 자이로
 
 | 코드 | 이름 | 기능 |
@@ -229,13 +163,6 @@ insmod wind.ko transport=0            # 통신 경로 없이 적재만, 진단�
 | 0x13 | `OP_GYRO_ENABLE` | 기록 동작 켜기·끄기 |
 | 0x2C | `OP_GYRO_STOP` | 기록 일시 정지, hook 유지 |
 | 0x2D | `OP_GYRO_RESUME` | 기록 재개, 포인트가 사라졌으면 자동 재바인딩 |
-
-### 진단과 전체 스위치
-
-| 코드 | 이름 | 기능 |
-|---|---|---|
-| 0x3E | `OP_BP_DIAG` | 다섯 계열의 슬롯과 트리거 수를 한 번에 읽기 |
-| 0x3F | `OP_BP_ALL_OFF` | 모든 계열 일괄 해제, 추적 방식 전환 전에 호출 |
 
 `0x38..0x3D` 는 폐지. 클라이언트에서 자리를 잡지 말 것
 
@@ -248,7 +175,6 @@ insmod wind.ko transport=0            # 통신 경로 없이 적재만, 진단�
 | 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | 모듈 자체 로그 전환, 기본 꺼짐 |
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 노드 인수 / 제거만 |
 | 0x54 | `OP_ACE_SET_FEATURES` | 비트마스크 | 10 개 스위치 기록, 하위 10 비트 |
-| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP 부동소수점 레지스터 쓰기 (S0..S31) |
 
 자세한 내용은 `README.md` 의 「8 ACE 反检测伪装」 참조
 
@@ -313,60 +239,6 @@ kprobe 를 쓰는 이유 Android GKI 5.x 이상은 kCFI 와 읽기 전용 rodata
 kprobe 는 브레이크포인트 기구로 콜백을 등록할 뿐 코드를 쓰지 않으므로 구조적으로 CFI 를 피한다
 
 심볼 지연 등록 `hide_*` 최초 호출 시 후보 목록(`filldir64` → `filldir`)으로 등록하므로 심볼이 보이지 않아도 적재는 실패하지 않는다
-
-### 5 다섯 브레이크포인트 계열
-
-"슬롯 + 링 버퍼 기록 + 분할 되읽기" 골격을 공유하고 `0x3E` 진단과 `0x3F` 전체 스위치도 공용
-실행 브레이크포인트끼리는 상호 배타다. arm64 의 BRP 는 4개, WRP 는 2개뿐이다
-
-| 계열 | 기구 | 자원 | 기록에서 얻는 것 | 용도 |
-|---|---|---|---|---|
-| `hwbp` | BRP 실행 / WRP 관측, perf 이벤트 | BRP 4 + WRP 2 | 트리거 PC 와 레지스터 | 함수 진입, 읽기·쓰기 지점 |
-| `ptebp` | PTE 속성 반전 + 32바이트 섀도 트램펄린 | debug 레지스터 미사용 | 트리거 지점과 제어 가능 레지스터 | 십여 지점 동시 관측 |
-| `wrpbp` | WRP 데이터 관측점, `LEN_8` 창 | WRP 2 | 쓰기 시각과 벡터 | 단일 필드 기록 감시 |
-| `brkbp` | 명령을 `BRK` 로 변경, kprobe 예외 처리 | 하드웨어 미사용 | 트리거 PC 와 범용 레지스터 | 기록형 관측 |
-| `udpbp` | UDP 경로에 kprobe | 하드웨어 미사용 | 패킷 내용 미리보기 | 통신 리듬 관측 |
-
-**hwbp** arm64 실행 브레이크포인트는 `HW_BREAKPOINT_LEN_4` 만 지원
-트리거 시 설정대로 PC 를 기록하고 분할해 되읽으며 2비트 레지스터 마스크로 되쓸 수 있다
-`OP_HWBP_SET_REGS` 는 트리거 콜백에서 `s3`/`s4`/`s5` 를 직접 쓴다
-
-**ptebp** PTE 속성 비트를 반전해 fault 를 만든다. 16 슬롯, 슬롯당 최대 8 페이지
-debug 레지스터를 쓰지 않아 `hwbp` 와 공존한다
-원래 명령은 트램펄린에서 실행되고, 트램펄린은 대상 `mm` 안에 RWX 페이지로 개설한다
-PTE 비트 영역(`PTE_UXN` / `PTE_PXN` / `PTE_RDONLY` / `PTE_VALID` / `PTE_AF`)을 직접 읽고 쓸 수 있으며 변경 후 TLB 를 갱신한다
-
-**wrpbp** `arch_install_hw_breakpoint` 의 `LEN_8` 데이터 창
-트리거 시 `perf_event` 의 값을 기록으로 옮기고 `OP_WRPBP_SET_VEC` 가 2비트 마스크로 되쓴다
-자이로 정상 상태가 이 계층에 올라가 있다
-
-**brkbp** 명령을 `BRK` 로 바꾸고 예외 핸들러로 받는다. 16 슬롯
-트리거 시 커널 공간에서 `wind_read_process_va` / `wind_write_process_va` 로 인자를 읽고 반환값을 고치며 `__user` 를 거치지 않는다
-현재는 기록만 하고 레지스터 되쓰기는 하지 않는다
-
-**udpbp** 커널 UDP 경로에 kprobe
-
-```
-TX  udp_send_skb  ->  ip_send_skb  ->  ip_local_out   해석되는 첫 번째 사용
-RX  __udp4_lib_rcv
-```
-
-TX 는 `udp_send_skb` 를 우선한다. GKI 의 LTO 빌드가 `ip_local_out` 을 인라인하기 때문
-pid, 포트, 방향으로 거르고 트리거는 링 버퍼로. 분할 읽기로 가져온다
-8 슬롯, 슬롯당 256건, 건당 32바이트 미리보기
-IPv4 만 지원. IPv6 의 `__udp6_lib_rcv` 는 연결되지 않았다
-
-**구버전 brk** `OP_BRK_SET` / `OP_BRK_CLEAR` 는 `register_user_hw_breakpoint` 로 단일 실행 포인트를 구현하며 호환을 위해 남겨 둔다
-
-**FP 레지스터 기록** 커널은 `-mgeneral-regs-only` 로 빌드되어 clang 통합 어셈블러가 `stp q3,q4,[x9]` 같은 니모닉을 거부한다
-`hwbp_fp_reg_direct` 는 `.inst` 로 원시 인코딩을 쓰고 베이스 레지스터는 `x9` 고정
-
-| 명령 | 인코딩 |
-|---|---|
-| `stp q3, q4, [x9]` | `0xad001123` |
-| `str q5, [x9]` | `0x3d800125` |
-| `ldp q3, q4, [x9]` | `0xad401123` |
-| `ldr q5, [x9]` | `0x3dc00125` |
 
 ### 6 자이로
 
@@ -505,7 +377,7 @@ nofault     copy_from_user_nofault  copy_to_user_nofault
 
 | 파일 | 역할 |
 |---|---|
-| `user/Wind-对接头文件.h` | `c_wind` 한 클래스에 전 기능: 읽기·쓰기 / 배치 / 프레임 캐시 / 스냅샷 / 은닉 / kgsl / 자이로 / 다섯 브레이크포인트 계열 |
+| `user/Wind-对接头文件.h` | `c_wind` 한 클래스에 전 기능: 읽기·쓰기 / 배치 / 프레임 캐시 / 스냅샷 / 은닉 / kgsl / 자이로 |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink 클라이언트 예제 |
 | `user/Wind-Drivers-*.sh` | 커널별 자동 압축 해제 설치본(5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18) |
 | `user/Wind-Drivers-6.6.ko` | 6.6 용 빌드 결과물 |
@@ -532,11 +404,6 @@ d.snap_stop();
 `sizeof(c_wind)` 는 약 48KB, 그중 47KB 가 프레임 캐시 표(2048 슬롯)
 지역 인스턴스는 힙에 두는 편이 좋다
 
-추적 방식을 바꾸기 전에 `bp_all_off()` 를 부른다. 이전 계열이 BRP/WRP 를 잡고 있으면 새 계열이 들어가지 않는다
-
-```cpp
-d.bp_all_off();        // 0x3F, 다섯 계열 일괄 해제
-```
 
 ---
 
@@ -598,7 +465,6 @@ Wind_driver/
 │   ├── memory.c            읽기·쓰기, 페이지 테이블 순회, 매핑 캐시, mmap
 │   ├── process.c           모듈 베이스, 프로세스 관련
 │   ├── hide.c              파일·프로세스 은닉(kprobe)
-│   ├── breakpoint.c        다섯 계열 + UDP + 섀도 페이지
 │   ├── gyro.c              자이로 hook(실행 bp → WRP 정상 상태)
 │   ├── kgsl.c              GPU kgsl hook
 │   ├── ace.c               ACE 탐지 회피 위장 (kprobe 10 개)
@@ -606,7 +472,7 @@ Wind_driver/
 │   ├── sym.c               화이트리스트 밖 32개 심볼 실행 시 해석
 │   ├── comm.h              오퍼코드와 프로토콜 구조체
 │   ├── compat.h            커널 호환 계층(5.10 → 6.18)
-│   ├── memory.h / breakpoint.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
+│   ├── memory.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
 │   ├── Kconfig
 │   └── Makefile
 ├── user/                   클라이언트 헤더, 예제, 설치본
@@ -637,7 +503,6 @@ Wind_driver/
 | 오래된 값이 읽힘 | `MODE_SAFE` 로 전환, GPU / ION 버퍼인지 확인 |
 | 은닉이 동작하지 않음 | `CONFIG_KALLSYMS_ALL` 여부, `filldir64` 가시성 |
 | 자이로가 동작하지 않음 | 대상이 센서를 읽는 프로세스인지, `sendObjects` 해석 여부, `dmesg` 에 WRP armed 여부 |
-| 브레이크포인트가 걸리지 않음 | 먼저 `bp_all_off`, 다음 `OP_BP_DIAG` 로 BRP/WRP 여유 확인 |
 | 섀도 페이지 트리거 후 대상이 죽음 | `KH_PTE_PA_MASK` / `KH_PHYS_TO_PTE` 와 실기 PA 비트 폭 일치 여부 |
 
 로그 키워드
@@ -649,8 +514,6 @@ wind: netlink
 wind: sym use_mm
 filldir64
 gyro
-hwbp / ptebp / wrpbp / brkbp / udpbp
-bp: all off
 ```
 
 ---
@@ -661,12 +524,6 @@ bp: all off
 - `/dev/null` fops 경로는 일부 기기에서 멈춤·재부팅 기록이 있어 기본 비활성
 - 제로 CRC 는 심볼 CRC 만 건너뛰고 vermagic 꼬리, CFI, 구조체 배치는 건너뛰지 않는다
 - 제로 CRC 는 커널 계열을 넘지 못한다. 6.1 ko 를 6.12 에 두면 `bad vermagic` 으로 거부된다
-- `brkbp` 는 기록만 하고 레지스터 되쓰기는 없다
-- `hwbp` / `ptebp` 는 아직 TID 한정이 없어 트리거가 프로세스 전역이다
-- arm64 실행 브레이크포인트는 `LEN_4` 만 지원하며 명령은 4바이트 정렬이어야 한다
-- BRP 4개, WRP 2개는 하드웨어 상한이라 다섯 계열을 동시에 쓰면 서로 잡아먹는다
-- `ptebp` 는 슬롯당 최대 8 페이지를 덮으며 페이지가 바뀌면 `OP_PTEBP_REFRESH` 가 필요하다
-- UDP 브레이크포인트는 IPv4 만 지원하고 IPv6 경로는 연결되지 않았다
 - 6.12.58 이전 산출물은 `tools/device/` 의 config 와 CRC 표에 의존하므로 기기를 바꾸면 다시 수집해야 한다
 
 ---

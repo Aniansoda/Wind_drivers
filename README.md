@@ -4,7 +4,7 @@
 
 Android / Linux ARM64 内核态内存读写与调试框架
 单模块 `wind.ko`，十一个子系统，一套操作码，三条通讯通道
-零 CRC 路线，五个断点家族并存，全部白名单外符号运行时解析
+零 CRC 路线，全部白名单外符号运行时解析
 
 ---
 
@@ -46,20 +46,14 @@ Android / Linux ARM64 内核态内存读写与调试框架
 
 | 码位 | 旧 | 现 |
 |---|---|---|
-| `0x26..0x2B` | ETM/PTM 分支追踪 | **WRP 数据观察点** `wrpbp` |
 | `0x38..0x3D` | 预留 | 已撤销，不再定义 |
 | `0x33` | — | `OP_STATS` 缓存统计 |
-| `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
-| `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
-| `0x3E / 0x3F` | — | `BP_DIAG` / `BP_ALL_OFF` |
 | 陀螺仪 | 单个执行断点常驻 | 执行断点定位 → **转 WRP 稳态**，X/Y 改写，Z 不进窗口 |
 | 符号 | 直接引用 | 32 个白名单外符号全部 `register_kprobe` 运行时解析 |
 | 兼容 | `#ifdef` 散在代码里 | 统一 `compat.h`，5.10 → 6.18 一份源码 |
-| `0x50..0x56` | — | **ACE 反检测伪装**，10 个 feature bit / 11 个 kprobe |
-| `0x0C / 0x0D` | ETM 遗留空位 | 恢复 **BRK 软断点**老接口 `brk_set` / `brk_clear` |
+| `0x50..0x55` | — | **ACE 反检测伪装**，10 个 feature bit / 11 个 kprobe |
 
 ETM 那条路已删除：Coresight 需要目标 SoC 打开时钟与 funnel，机型覆盖率不够，且观测不到数据本身
-`0x26..0x2B` 六个码位改给 WRP，结构体大小与旧 `ETMBP_POINT_CONFIG` 同为 24 字节，老二进制不会错位
 
 ---
 
@@ -161,66 +155,6 @@ insmod wind.ko transport=0            # 只加载，不装通道，用于排查
 | 0x0E | `OP_KGSL_HIDE` | 在 kgsl 侧隐藏指定 pid |
 | 0x0F | `OP_KGSL_HOOK` | 安装 kgsl hook |
 
-### 硬件断点 BRP/WRP
-
-| 码 | 名称 | 功能 |
-|---|---|---|
-| 0x0C | `OP_BRK_SET` | 旧版单点硬件断点，兼容接口 |
-| 0x0D | `OP_BRK_CLEAR` | 清除旧版单点断点 |
-| 0x14 | `OP_HWBP_SET` | 设置断点/观察点组，16 槽 |
-| 0x15 | `OP_HWBP_REMOVE` | 清除全部并归还 debug 寄存器 |
-| 0x16 | `OP_HWBP_GET_CONFIG` | 读当前配置与可用 BRP/WRP 数量 |
-| 0x17 | `OP_HWBP_GET_RECORDS` | 分段读触发 PC 聚合记录 |
-| 0x18 | `OP_HWBP_SET_RECORD` | 写回记录与 2-bit 寄存器改写掩码 |
-| 0x19 | `OP_HWBP_CLEAR_RECORDS` | 清记录，`-1` 清全部 |
-| 0x34 | `OP_HWBP_SET_REGS` | 命中时改写寄存器（`s3`/`s4`/`s5`），`.inst` 原始编码 |
-| 0x37 | `OP_HWBP_REFRESH` | 重新登记断点，用于 exec 后地址漂移 |
-
-### PTE 影子页执行断点
-
-| 码 | 名称 | 功能 |
-|---|---|---|
-| 0x1A | `OP_PTEBP_SET` | 改目标进程 PTE 属性触发 fault，16 槽，不占 debug 寄存器 |
-| 0x1B | `OP_PTEBP_REMOVE` | 清除全部并恢复 PTE |
-| 0x1C | `OP_PTEBP_GET_CONFIG` | 读当前配置 |
-| 0x1D | `OP_PTEBP_GET_RECORDS` | 分段读命中记录 |
-| 0x1E | `OP_PTEBP_SET_RECORD` | 写回记录 |
-| 0x1F | `OP_PTEBP_CLEAR_RECORDS` | 清记录，`-1` 清全部 |
-| 0x35 | `OP_PTEBP_SET_REGS` | 命中时改写寄存器，走影子页跳板 |
-| 0x36 | `OP_PTEBP_REFRESH` | 影子页与 PTE 重新对齐 |
-
-### BRK 软断点
-
-| 码 | 名称 | 功能 |
-|---|---|---|
-| 0x20 | `OP_BRKBP_SET` | 把目标指令改写为 `BRK`，16 槽 |
-| 0x21 | `OP_BRKBP_REMOVE` | 清除全部并还原原始指令字节 |
-| 0x22 | `OP_BRKBP_GET_CONFIG` | 读当前配置 |
-| 0x23 | `OP_BRKBP_GET_RECORDS` | 分段读命中记录 |
-| 0x24 | `OP_BRKBP_SET_RECORD` | 写回记录 |
-| 0x25 | `OP_BRKBP_CLEAR_RECORDS` | 清记录，`-1` 清全部 |
-
-### WRP 数据观察点
-
-| 码 | 名称 | 功能 |
-|---|---|---|
-| 0x26 | `OP_WRPBP_SET` | 在目标 VA 上装写观察点，`LEN_8` 窗口 |
-| 0x27 | `OP_WRPBP_REMOVE` | 拆除并归还 WRP 寄存器 |
-| 0x28 | `OP_WRPBP_GET_CONFIG` | 读当前窗口配置 |
-| 0x29 | `OP_WRPBP_GET_RECORDS` | 分段读命中记录 |
-| 0x2A | `OP_WRPBP_SET_VEC` | 写回向量与 2-bit 掩码（X/Y 分别取位） |
-| 0x2B | `OP_WRPBP_CLEAR_RECORDS` | 清记录，`-1` 清全部 |
-
-### UDP 断点
-
-| 码 | 名称 | 功能 |
-|---|---|---|
-| 0x2E | `OP_UDPBP_SET` | 装/更新一个 UDP 断点槽，8 槽 |
-| 0x2F | `OP_UDPBP_REMOVE` | 拆槽，`-1` 拆全部 |
-| 0x30 | `OP_UDPBP_GET_CONFIG` | 读槽位表 |
-| 0x31 | `OP_UDPBP_GET_RECORDS` | 分段读命中记录，每槽 256 条 |
-| 0x32 | `OP_UDPBP_CLEAR_RECORDS` | 清记录，`-1` 清全部 |
-
 ### 陀螺仪
 
 | 码 | 名称 | 功能 |
@@ -232,13 +166,6 @@ insmod wind.ko transport=0            # 只加载，不装通道，用于排查
 | 0x2C | `OP_GYRO_STOP` | 暂停篡改，保留 hook |
 | 0x2D | `OP_GYRO_RESUME` | 恢复篡改，断点丢失时自动重绑 |
 
-### 诊断与总闸
-
-| 码 | 名称 | 功能 |
-|---|---|---|
-| 0x3E | `OP_BP_DIAG` | 一次性读五个断点家族的槽位与命中计数 |
-| 0x3F | `OP_BP_ALL_OFF` | 一把关掉全部断点，切换追踪方式前先调它 |
-
 ### ACE 反检测伪装
 
 | 码 | 名称 | 参数 | 功能 |
@@ -249,7 +176,6 @@ insmod wind.ko transport=0            # 只加载，不装通道，用于排查
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 节点接管 / 仅摘除 |
 | 0x54 | `OP_ACE_SET_FEATURES` | 位掩码 | 写 10 个伪装开关，低 10 位有效 |
 | 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 读当前开关掩码 |
-| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP 浮点寄存器写回（S0..S31） |
 
 `0x38..0x3D` 已撤销，不要在客户端里占位
 
@@ -315,60 +241,6 @@ kprobe 走内核断点机制注册回调，不写代码段，天然绕过 CFI
 
 符号延迟注册 首次 `hide_*` 时才按候选表（`filldir64` → `filldir`）注册，符号不可见也不会导致加载失败
 
-### 5 五个断点家族
-
-同一套「槽位 + 记录环形缓冲 + 分段读回」骨架，共用 `0x3E` 诊断与 `0x3F` 总闸
-执行断点之间互斥要自己排，因为 arm64 的 BRP 只有 4 个、WRP 只有 2 个
-
-| 家族 | 机制 | 占用 | 记录里能拿到 | 用途 |
-|---|---|---|---|---|
-| `hwbp` | BRP 执行断点 / WRP 观察点，perf 事件 | 4 BRP + 2 WRP | 触发 PC 与寄存器 | 函数入口、读写点 |
-| `ptebp` | PTE 属性位 + 影子页 32 字节跳板 | 不占 debug 寄存器 | 命中点与可控寄存器 | 想同时盯十几个点 |
-| `wrpbp` | WRP 数据观察点，`LEN_8` 窗口 | 2 WRP | 写入时刻与向量 | 盯单个字段的改写 |
-| `brkbp` | 指令改 `BRK` + kprobe 异常接管 | 不占硬件 | 命中 PC 与通用寄存器 | 记录型观测 |
-| `udpbp` | kprobe UDP 收发路径 | 不占硬件 | 包内容预览 | 观测网络节奏 |
-
-**硬件断点 `hwbp`** arm64 上执行断点只支持 `HW_BREAKPOINT_LEN_4`
-命中后按配置记录触发 PC，分段读回，可写回记录并带 2-bit 寄存器改写掩码
-`OP_HWBP_SET_REGS` 在命中回调里直接写 `s3`/`s4`/`s5`
-
-**PTE 影子页断点 `ptebp`** 改目标进程 PTE 属性位触发 fault，16 槽，每槽最多覆盖 8 页
-不占用 debug 寄存器，因此可与 `hwbp` 同时使用
-原指令被搬到跳板里执行，跳板在目标 `mm` 里现开一页 RWX
-支持直接读写 PTE 位域（`PTE_UXN` / `PTE_PXN` / `PTE_RDONLY` / `PTE_VALID` / `PTE_AF`），改完刷 TLB
-
-**WRP 观察点 `wrpbp`** `arch_install_hw_breakpoint` 的 `LEN_8` 数据窗口
-命中时读 `perf_event` 里的值写进记录，`OP_WRPBP_SET_VEC` 带 2-bit 掩码回写
-陀螺仪的稳态就架在这一层
-
-**BRK 软断点 `brkbp`** 把目标指令改写为 `BRK`，通过异常 handler 接管，16 槽
-命中时用内核态跨进程读写 `wind_read_process_va` / `wind_write_process_va` 取参数与改返回值，不经过 `__user`
-当前只做记录，不做寄存器回写
-
-**UDP 断点 `udpbp`** 在内核 UDP 收发路径上打 kprobe
-
-```
-TX  udp_send_skb  →  ip_send_skb  →  ip_local_out   按顺序取第一个能解析到的
-RX  __udp4_lib_rcv
-```
-
-TX 首选 `udp_send_skb`，因为 GKI 的 LTO 构建会把 `ip_local_out` 内联
-按 pid、端口、方向过滤，命中写入记录环形缓冲，可分段读回
-8 槽，每槽 256 条记录，单条预览 32 字节
-仅 IPv4，IPv6 的 `__udp6_lib_rcv` 未接
-
-**旧版 brk** `OP_BRK_SET` / `OP_BRK_CLEAR` 用 `register_user_hw_breakpoint` 实现单点执行断点，保留兼容
-
-**FP 寄存器改写** 内核用 `-mgeneral-regs-only` 编译，clang 集成汇编器拒收 `stp q3,q4,[x9]` 这类助记符
-`hwbp_fp_reg_direct` 改用 `.inst` 写原始编码，基址固定 `x9`
-
-| 指令 | 编码 |
-|---|---|
-| `stp q3, q4, [x9]` | `0xad001123` |
-| `str q5, [x9]` | `0x3d800125` |
-| `ldp q3, q4, [x9]` | `0xad401123` |
-| `ldr q5, [x9]` | `0x3dc00125` |
-
 ### 6 陀螺仪
 
 控制方式不是用户态 `/dev/uinput` 注入，而是内核态 hook 系统库的 BitTube 出口
@@ -413,7 +285,7 @@ WRP 递归安全 自己的 `copy_to_user_nofault` 会再次触发观察点
 ### 7 影子页与内核写保护
 
 **影子页 PTE 操作** `wind_shadow_pte_set` / `wind_shadow_pte_get`
-遍历目标 `mm` 页表定位 PTE，按 `(old & ~mask) | (val & mask)` 改写并刷 TLB，用于无痕断点与页权限微调
+遍历目标 `mm` 页表定位 PTE，按 `(old & ~mask) | (val & mask)` 改写并刷 TLB，用于页权限微调
 物理地址字段用 `KH_PTE_PA_MASK` 取，新 PTE 用 `KH_PHYS_TO_PTE` 拼
 52 位 PA 的机器上物理地址高 2 位在 PTE 的 `[9:8]`，直接 `| page_to_phys()` 会写坏页表项
 
@@ -537,7 +409,7 @@ nofault   copy_from_user_nofault  copy_to_user_nofault
 
 | 文件 | 作用 |
 |---|---|
-| `user/Wind-对接头文件.h` | 一个 `c_wind` 类包含全部能力：读写 / 批量 / 帧缓存 / 快照 / 隐藏 / kgsl / 陀螺仪 / 五套断点 / 克隆页断点 / ACE 伪装 |
+| `user/Wind-对接头文件.h` | 一个 `c_wind` 类包含全部能力：读写 / 批量 / 帧缓存 / 快照 / 隐藏 / kgsl / 陀螺仪 / 克隆页断点 / ACE 伪装 |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink 通道客户端示例 |
 | `user/Wind-Drivers-*.sh` | 各内核版本自解压安装包（5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18） |
 | `user/Wind-Drivers-6.6.ko` | 6.6 预编译模块 |
@@ -564,11 +436,6 @@ d.snap_stop();
 `sizeof(c_wind)` 约 48 KB，其中 47 KB 是帧缓存表（2048 槽）
 局部实例建议 `new` 到堆上
 
-切换追踪方式前先 `bp_all_off()`，否则上一套断点占着 BRP/WRP，新的一套装不上
-
-```cpp
-d.bp_all_off();        // 0x3F，一把关掉五个家族
-```
 
 ---
 
@@ -630,7 +497,6 @@ Wind_driver/
 │   ├── memory.c            内存读写、页表翻译、页映射缓存、mmap
 │   ├── process.c           模块基址、进程相关
 │   ├── hide.c              文件与进程隐藏（kprobe）
-│   ├── breakpoint.c        五套断点框架 + UDP 断点 + 影子页
 │   ├── gyro.c              陀螺仪 hook（exec bp → WRP 稳态）
 │   ├── kgsl.c              GPU kgsl hook
 │   ├── ace.c               ACE 反检测伪装（10 个 kprobe）
@@ -638,7 +504,7 @@ Wind_driver/
 │   ├── sym.c               32 个白名单外符号的运行时解析
 │   ├── comm.h              操作码与协议结构
 │   ├── compat.h            内核版本兼容层（5.10 → 6.18）
-│   ├── memory.h / breakpoint.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
+│   ├── memory.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
 │   ├── Kconfig
 │   └── Makefile
 ├── user/                   用户态对接头文件、客户端、安装包
@@ -666,7 +532,6 @@ Wind_driver/
 | 读到的数据是旧值 | 切 `MODE_SAFE`，检查目标是否为 GPU / ION 缓冲 |
 | 隐藏无效 | `CONFIG_KALLSYMS_ALL` 是否开启，`filldir64` 是否可见 |
 | 陀螺仪不动 | 目标进程是否为读 sensor 的那个，`sendObjects` 是否解析到，`dmesg` 里 WRP 是否 armed |
-| 断点装不上 | 先 `bp_all_off`，再看 `OP_BP_DIAG` 里 BRP/WRP 余量 |
 | 影子页命中后目标跑飞 | 检查 `KH_PTE_PA_MASK` / `KH_PHYS_TO_PTE` 与真机 PA 位宽是否匹配 |
 
 关键日志关键字
@@ -678,7 +543,6 @@ wind: netlink
 wind: sym use_mm
 filldir64
 gyro
-hwbp / ptebp / wrpbp / brkbp / udpbp
 bp: all off
 ```
 
@@ -690,12 +554,6 @@ bp: all off
 - `/dev/null` fops 通道在部分机型上有卡死重启记录，默认不启用
 - 零 CRC 路线只跳过符号 CRC，不跳过 vermagic 尾巴比对，也不跳过 CFI 与结构体布局校验
 - 零 CRC 不跨内核系列生效，6.1 的 ko 不能装到 6.12，尾巴不一致会被 `bad vermagic` 拒掉
-- `brkbp` 当前只做记录，不做寄存器回写
-- `hwbp` / `ptebp` 尚未按 TID 限定，命中是进程级的
-- arm64 执行断点只支持 `LEN_4`，指令必须 4 字节对齐
-- BRP 4 个、WRP 2 个是硬件上限，五套断点同时开会互相挤占
-- `ptebp` 每槽最多覆盖 8 页，翻页后要 `OP_PTEBP_REFRESH`
-- UDP 断点只覆盖 IPv4，IPv6 收发路径未接
 - 6.12.58 之前的产物依赖 `tools/device/` 里的设备 config 与 CRC 表，换机型需重新采集
 
 ---

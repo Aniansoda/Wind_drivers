@@ -4,7 +4,7 @@
 
 Kernel-mode memory access and debugging framework for Android / Linux ARM64
 Single module `wind.ko`, eleven subsystems, one opcode space, three transports
-Zero-CRC route, five coexisting breakpoint families, every out-of-whitelist symbol resolved at runtime
+Zero-CRC route, every out-of-whitelist symbol resolved at runtime
 
 ---
 
@@ -44,20 +44,14 @@ Source `kernel/` 8067 lines across 19 `.c` / `.h` files
 
 | Opcode | Before | Now |
 |---|---|---|
-| `0x26..0x2B` | ETM/PTM branch tracing | **WRP data watchpoint** `wrpbp` |
 | `0x38..0x3D` | reserved | removed, no longer defined |
 | `0x33` | — | `OP_STATS` cache statistics |
-| `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
-| `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
-| `0x3E / 0x3F` | — | `BP_DIAG` / `BP_ALL_OFF` |
-| `0x50..0x56` | — | **ACE anti-detection camouflage**, 10 feature bits / 11 kprobes |
-| `0x0C / 0x0D` | ETM leftovers | restored **BRK software breakpoints** `brk_set` / `brk_clear` |
+| `0x50..0x55` | — | **ACE anti-detection camouflage**, 10 feature bits / 11 kprobes |
 | Gyro | one resident execution breakpoint | execution breakpoint to locate, then **switch to steady WRP**, X/Y rewritten, Z never in window |
 | Symbols | direct references | 32 out-of-whitelist symbols resolved at runtime via `register_kprobe` |
 | Compat | `#ifdef` scattered in code | one `compat.h`, single source tree for 5.10 → 6.18 |
 
 ETM is gone: Coresight needs the target SoC to enable its clocks and funnel, device coverage was poor, and it cannot observe the data itself
-`0x26..0x2B` went to WRP; the config struct is still 24 bytes, same as the old `ETMBP_POINT_CONFIG`, so old binaries do not mis-stride
 
 ---
 
@@ -159,66 +153,6 @@ No collision with the common `0x800` demo drivers
 | 0x0E | `OP_KGSL_HIDE` | hide pid on the kgsl side |
 | 0x0F | `OP_KGSL_HOOK` | install the kgsl hook |
 
-### Hardware breakpoints BRP/WRP
-
-| Op | Name | Function |
-|---|---|---|
-| 0x0C | `OP_BRK_SET` | legacy single-point breakpoint |
-| 0x0D | `OP_BRK_CLEAR` | clear the legacy point |
-| 0x14 | `OP_HWBP_SET` | set breakpoint/watchpoint group, 16 slots |
-| 0x15 | `OP_HWBP_REMOVE` | clear all, release debug registers |
-| 0x16 | `OP_HWBP_GET_CONFIG` | current config and free BRP/WRP count |
-| 0x17 | `OP_HWBP_GET_RECORDS` | paged read of aggregated hit PCs |
-| 0x18 | `OP_HWBP_SET_RECORD` | write back records with a 2-bit register mask |
-| 0x19 | `OP_HWBP_CLEAR_RECORDS` | clear records, `-1` for all |
-| 0x34 | `OP_HWBP_SET_REGS` | rewrite registers on hit (`s3`/`s4`/`s5`), raw `.inst` encodings |
-| 0x37 | `OP_HWBP_REFRESH` | re-register points after address drift |
-
-### PTE shadow-page execution breakpoints
-
-| Op | Name | Function |
-|---|---|---|
-| 0x1A | `OP_PTEBP_SET` | flip PTE attributes to fault, 16 slots, no debug registers |
-| 0x1B | `OP_PTEBP_REMOVE` | clear all and restore PTEs |
-| 0x1C | `OP_PTEBP_GET_CONFIG` | current config |
-| 0x1D | `OP_PTEBP_GET_RECORDS` | paged read of hits |
-| 0x1E | `OP_PTEBP_SET_RECORD` | write back records |
-| 0x1F | `OP_PTEBP_CLEAR_RECORDS` | clear records, `-1` for all |
-| 0x35 | `OP_PTEBP_SET_REGS` | rewrite registers on hit through the shadow trampoline |
-| 0x36 | `OP_PTEBP_REFRESH` | realign shadow page and PTE |
-
-### BRK software breakpoints
-
-| Op | Name | Function |
-|---|---|---|
-| 0x20 | `OP_BRKBP_SET` | patch the instruction to `BRK`, 16 slots |
-| 0x21 | `OP_BRKBP_REMOVE` | clear all and restore original bytes |
-| 0x22 | `OP_BRKBP_GET_CONFIG` | current config |
-| 0x23 | `OP_BRKBP_GET_RECORDS` | paged read of hits |
-| 0x24 | `OP_BRKBP_SET_RECORD` | write back records |
-| 0x25 | `OP_BRKBP_CLEAR_RECORDS` | clear records, `-1` for all |
-
-### WRP data watchpoints
-
-| Op | Name | Function |
-|---|---|---|
-| 0x26 | `OP_WRPBP_SET` | install a write watchpoint on a target VA, `LEN_8` window |
-| 0x27 | `OP_WRPBP_REMOVE` | remove and release WRP registers |
-| 0x28 | `OP_WRPBP_GET_CONFIG` | current window config |
-| 0x29 | `OP_WRPBP_GET_RECORDS` | paged read of hits |
-| 0x2A | `OP_WRPBP_SET_VEC` | write back vector with 2-bit mask, X/Y selectable |
-| 0x2B | `OP_WRPBP_CLEAR_RECORDS` | clear records, `-1` for all |
-
-### UDP breakpoints
-
-| Op | Name | Function |
-|---|---|---|
-| 0x2E | `OP_UDPBP_SET` | install or update one UDP slot, 8 slots |
-| 0x2F | `OP_UDPBP_REMOVE` | drop a slot, `-1` for all |
-| 0x30 | `OP_UDPBP_GET_CONFIG` | slot table |
-| 0x31 | `OP_UDPBP_GET_RECORDS` | paged read, 256 records per slot |
-| 0x32 | `OP_UDPBP_CLEAR_RECORDS` | clear records, `-1` for all |
-
 ### Gyroscope
 
 | Op | Name | Function |
@@ -230,13 +164,6 @@ No collision with the common `0x800` demo drivers
 | 0x2C | `OP_GYRO_STOP` | pause tampering, keep the hook |
 | 0x2D | `OP_GYRO_RESUME` | resume, re-bind if the point was lost |
 
-### Diagnostics and master switch
-
-| Op | Name | Function |
-|---|---|---|
-| 0x3E | `OP_BP_DIAG` | one-shot state of all five breakpoint families |
-| 0x3F | `OP_BP_ALL_OFF` | tear down every family before switching tracking mode |
-
 ### ACE anti-detection camouflage
 
 | Opcode | Name | Argument | Purpose |
@@ -246,7 +173,6 @@ No collision with the common `0x800` demo drivers
 | 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | Toggle the module's own logging, off by default |
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` nodes: rebuild fakes / detach only |
 | 0x54 | `OP_ACE_SET_FEATURES` | bitmask | Write the 10 camouflage switches, low 10 bits |
-| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP float register write-back (S0..S31) |
 
 `0x38..0x3D` are removed; do not reserve them client-side
 
@@ -310,60 +236,6 @@ Why kprobe Android GKI 5.x+ ships kCFI and read-only rodata; patching a function
 kprobe registers a callback through the breakpoint machinery, never writes the text, so CFI is bypassed by construction
 
 Lazy symbol registration `hide_*` registers on first use through the candidate list (`filldir64` → `filldir`), so an invisible symbol cannot fail the load
-
-### 5 Five breakpoint families
-
-Shared skeleton: slots + ring-buffer records + paged read-back, with `0x3E` diagnostics and `0x3F` master switch
-Execution breakpoints exclude each other by nature: arm64 has 4 BRP and 2 WRP
-
-| Family | Mechanism | Resources | What a record holds | Use |
-|---|---|---|---|---|
-| `hwbp` | BRP exec / WRP watch via perf events | 4 BRP + 2 WRP | hit PC and registers | function entries, read/write points |
-| `ptebp` | PTE attribute flip + 32-byte shadow trampoline | no debug registers | hit point and controllable registers | watching a dozen points at once |
-| `wrpbp` | WRP data watchpoint, `LEN_8` window | 2 WRP | write moment and vector | watching one field |
-| `brkbp` | instruction patched to `BRK`, kprobe exception handling | no hardware | hit PC and general registers | records only |
-| `udpbp` | kprobe on UDP paths | no hardware | payload preview | observing network rhythm |
-
-**hwbp** arm64 exec breakpoints accept `HW_BREAKPOINT_LEN_4` only
-Hits record the PC per configuration, paged back to user space, and can be written with a 2-bit register mask
-`OP_HWBP_SET_REGS` writes `s3`/`s4`/`s5` directly from the hit callback
-
-**ptebp** flips PTE attribute bits to fault, 16 slots, up to 8 pages per slot
-No debug registers, so it coexists with `hwbp`
-The original instruction runs from a trampoline, a RWX page opened inside the target `mm`
-PTE bit fields (`PTE_UXN` / `PTE_PXN` / `PTE_RDONLY` / `PTE_VALID` / `PTE_AF`) are writable through the shadow-page helpers, with a TLB flush after each change
-
-**wrpbp** the `LEN_8` data window of `arch_install_hw_breakpoint`
-The handler reads the value out of `perf_event` into the record; `OP_WRPBP_SET_VEC` writes back with a 2-bit mask
-This is the layer the gyro steady state stands on
-
-**brkbp** patches the instruction to `BRK`, handled by the exception hook, 16 slots
-Arguments and return values are read and written cross-process in kernel context via `wind_read_process_va` / `wind_write_process_va`, never through `__user`
-Records only for now, no register write-back
-
-**udpbp** kprobes on the kernel UDP paths
-
-```
-TX  udp_send_skb  ->  ip_send_skb  ->  ip_local_out   first one that resolves wins
-RX  __udp4_lib_rcv
-```
-
-TX prefers `udp_send_skb` because GKI LTO inlines `ip_local_out`
-Filtered by pid, port and direction; hits go into a ring buffer, paged back
-8 slots, 256 records per slot, 32-byte preview per record
-IPv4 only, `__udp6_lib_rcv` is not hooked
-
-**Legacy brk** `OP_BRK_SET` / `OP_BRK_CLEAR` implement a single exec point via `register_user_hw_breakpoint`, kept for compatibility
-
-**FP register rewrite** the kernel builds with `-mgeneral-regs-only`, and clang's integrated assembler rejects mnemonics such as `stp q3,q4,[x9]`
-`hwbp_fp_reg_direct` uses `.inst` with raw encodings, base register fixed to `x9`
-
-| Instruction | Encoding |
-|---|---|
-| `stp q3, q4, [x9]` | `0xad001123` |
-| `str q5, [x9]` | `0x3d800125` |
-| `ldp q3, q4, [x9]` | `0xad401123` |
-| `ldr q5, [x9]` | `0x3dc00125` |
 
 ### 6 Gyroscope
 
@@ -533,7 +405,7 @@ The related capability degrades but loading still succeeds
 
 | File | Purpose |
 |---|---|
-| `user/Wind-对接头文件.h` | one `c_wind` class with every capability: read / write / batch / frame cache / snapshot / hiding / kgsl / gyro / five breakpoint families / clone-page breakpoints / ACE camouflage |
+| `user/Wind-对接头文件.h` | one `c_wind` class with every capability: read / write / batch / frame cache / snapshot / hiding / kgsl / gyro / clone-page breakpoints / ACE camouflage |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink client sample |
 | `user/Wind-Drivers-*.sh` | self-extracting installers (5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18) |
 | `user/Wind-Drivers-6.6.ko` | prebuilt 6.6 module |
@@ -559,12 +431,6 @@ d.snap_stop();
 
 `sizeof(c_wind)` is about 48 KB, of which 47 KB is the frame cache (2048 slots)
 Allocate local instances on the heap
-
-Call `bp_all_off()` before switching tracking mode, otherwise the previous family still holds BRP/WRP
-
-```cpp
-d.bp_all_off();        // 0x3F, tears down all five families
-```
 
 ---
 
@@ -626,7 +492,6 @@ Wind_driver/
 │   ├── memory.c            read/write, page-table walk, page map cache, mmap
 │   ├── process.c           module base, process helpers
 │   ├── hide.c              file and process hiding (kprobe)
-│   ├── breakpoint.c        five breakpoint families + UDP + shadow page
 │   ├── gyro.c              gyro hook (exec bp -> WRP steady state)
 │   ├── kgsl.c              GPU kgsl hook
 │   ├── ace.c               ACE anti-detection camouflage (10 kprobes)
@@ -634,7 +499,7 @@ Wind_driver/
 │   ├── sym.c               runtime resolution for 32 out-of-whitelist symbols
 │   ├── comm.h              opcodes and protocol structs
 │   ├── compat.h            kernel compat layer (5.10 -> 6.18)
-│   ├── memory.h / breakpoint.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
+│   ├── memory.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
 │   ├── Kconfig
 │   └── Makefile
 ├── user/                   client header, samples, installers
@@ -663,7 +528,6 @@ Wind_driver/
 | Reads return stale data | switch to `MODE_SAFE`, check for GPU / ION buffers |
 | Hiding does nothing | is `CONFIG_KALLSYMS_ALL` on, is `filldir64` visible |
 | Gyro does nothing | is the target the process reading sensors, did `sendObjects` resolve, is the WRP armed in `dmesg` |
-| Breakpoints refuse to install | call `bp_all_off` first, then check BRP/WRP headroom in `OP_BP_DIAG` |
 | Target crashes after a shadow-page hit | check `KH_PTE_PA_MASK` / `KH_PHYS_TO_PTE` against the device PA width |
 
 Log keywords
@@ -675,8 +539,6 @@ wind: netlink
 wind: sym use_mm
 filldir64
 gyro
-hwbp / ptebp / wrpbp / brkbp / udpbp
-bp: all off
 ```
 
 ---
@@ -687,12 +549,6 @@ bp: all off
 - The `/dev/null` fops transport has freeze-reboot reports on some devices; off by default
 - The zero-CRC route skips symbol CRCs only, not the vermagic tail, not CFI, not struct layout
 - Zero CRC does not cross kernel series; a 6.1 ko on 6.12 is rejected with `bad vermagic`
-- `brkbp` records only, no register write-back
-- `hwbp` / `ptebp` are not TID-scoped yet, hits are process wide
-- arm64 exec breakpoints accept `LEN_4` only, instructions must be 4-byte aligned
-- 4 BRP and 2 WRP are hardware limits; all five families at once will contend
-- `ptebp` covers up to 8 pages per slot; call `OP_PTEBP_REFRESH` after a page flip
-- UDP breakpoints are IPv4 only, IPv6 paths are not hooked
 - Artifacts before 6.12.58 depend on the device config and CRC table in `tools/device/`; a different model needs a fresh harvest
 
 ---

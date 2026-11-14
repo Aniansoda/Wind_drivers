@@ -38,16 +38,6 @@
 #define MMAP_PID_SHIFT 32
 #define MMAP_OFF_MASK  0xFFFFFFFFULL
 
-#define UDPBP_MAX_SLOTS   8
-#define UDPBP_PATCH_MAX   64
-#define UDPBP_PREVIEW_MAX 32
-#define UDPBP_RECORD_MAX  256
-
-#define WIND_BP_MAX_POINTS     16
-
-#define WIND_BP_RECORDS_MAX    4096
-#define WIND_WRPBP_RECORDS_MAX 256
-
 enum OPERATIONS
 {
 	OP_BIND          = WIND_OP_BASE + 0x01,
@@ -61,8 +51,6 @@ enum OPERATIONS
 	OP_HIDE_FILE     = WIND_OP_BASE + 0x09,
 	OP_HIDE_PROCESS  = WIND_OP_BASE + 0x0A,
 	OP_UNHIDE_ALL    = WIND_OP_BASE + 0x0B,
-	OP_BRK_SET       = WIND_OP_BASE + 0x0C, /* arg = BRK_REQUEST*，老接口，等价 BRKBP 单点安装 */
-	OP_BRK_CLEAR     = WIND_OP_BASE + 0x0D, /* arg = BRK_REQUEST*，按 addr 摘除对应点 */
 	OP_KGSL_HIDE     = WIND_OP_BASE + 0x0E,
 	OP_KGSL_HOOK     = WIND_OP_BASE + 0x0F,
 	OP_GYRO_INSTALL  = WIND_OP_BASE + 0x10,
@@ -70,56 +58,10 @@ enum OPERATIONS
 	OP_GYRO_SET      = WIND_OP_BASE + 0x12,
 	OP_GYRO_ENABLE   = WIND_OP_BASE + 0x13,
 
-	OP_HWBP_SET           = WIND_OP_BASE + 0x14,
-	OP_HWBP_REMOVE        = WIND_OP_BASE + 0x15,
-	OP_HWBP_GET_CONFIG    = WIND_OP_BASE + 0x16,
-	OP_HWBP_GET_RECORDS   = WIND_OP_BASE + 0x17,
-	OP_HWBP_SET_RECORD    = WIND_OP_BASE + 0x18,
-	OP_HWBP_CLEAR_RECORDS = WIND_OP_BASE + 0x19,
-
-	OP_PTEBP_SET           = WIND_OP_BASE + 0x1A,
-	OP_PTEBP_REMOVE        = WIND_OP_BASE + 0x1B,
-	OP_PTEBP_GET_CONFIG    = WIND_OP_BASE + 0x1C,
-	OP_PTEBP_GET_RECORDS   = WIND_OP_BASE + 0x1D,
-	OP_PTEBP_SET_RECORD    = WIND_OP_BASE + 0x1E,
-	OP_PTEBP_CLEAR_RECORDS = WIND_OP_BASE + 0x1F,
-
-	OP_BRKBP_SET           = WIND_OP_BASE + 0x20,
-	OP_BRKBP_REMOVE        = WIND_OP_BASE + 0x21,
-	OP_BRKBP_GET_CONFIG    = WIND_OP_BASE + 0x22,
-	OP_BRKBP_GET_RECORDS   = WIND_OP_BASE + 0x23,
-	OP_BRKBP_SET_RECORD    = WIND_OP_BASE + 0x24,
-	OP_BRKBP_CLEAR_RECORDS = WIND_OP_BASE + 0x25,
-
-	OP_WRPBP_SET           = WIND_OP_BASE + 0x26,
-	OP_WRPBP_REMOVE        = WIND_OP_BASE + 0x27,
-	OP_WRPBP_GET_CONFIG    = WIND_OP_BASE + 0x28,
-	OP_WRPBP_GET_RECORDS   = WIND_OP_BASE + 0x29,
-	OP_WRPBP_SET_VEC       = WIND_OP_BASE + 0x2A,
-	OP_WRPBP_CLEAR_RECORDS = WIND_OP_BASE + 0x2B,
-
 	OP_GYRO_STOP   = WIND_OP_BASE + 0x2C,
 	OP_GYRO_RESUME = WIND_OP_BASE + 0x2D,
 
-	OP_UDPBP_SET           = WIND_OP_BASE + 0x2E,
-	OP_UDPBP_REMOVE        = WIND_OP_BASE + 0x2F,
-	OP_UDPBP_GET_CONFIG    = WIND_OP_BASE + 0x30,
-	OP_UDPBP_GET_RECORDS   = WIND_OP_BASE + 0x31,
-	OP_UDPBP_CLEAR_RECORDS = WIND_OP_BASE + 0x32,
-
 	OP_STATS = WIND_OP_BASE + 0x33,
-
-	OP_HWBP_SET_REGS = WIND_OP_BASE + 0x34,
-
-	OP_PTEBP_SET_REGS = WIND_OP_BASE + 0x35,
-
-	OP_PTEBP_REFRESH = WIND_OP_BASE + 0x36,
-
-	OP_HWBP_REFRESH = WIND_OP_BASE + 0x37,
-
-	OP_BP_DIAG = WIND_OP_BASE + 0x3E,
-
-	OP_BP_ALL_OFF = WIND_OP_BASE + 0x3F,
 
 	OP_CLONEBP_SET          = WIND_OP_BASE + 0x40,
 	OP_CLONEBP_REMOVE       = WIND_OP_BASE + 0x41,
@@ -136,42 +78,12 @@ enum OPERATIONS
 	OP_ACE_INTE             = WIND_OP_BASE + 0x53,
 	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54,
 	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55,
-	OP_WRPBP_SET_FREGS      = WIND_OP_BASE + 0x56, /* WRP 浮点寄存器写回 */
 };
 
 enum READ_MODE
 {
 	MODE_FAST = 0,
 	MODE_SAFE = 1,
-};
-
-enum BP_TYPE
-{
-	BP_TYPE_EXEC  = 1,
-	BP_TYPE_READ  = 2,
-	BP_TYPE_WRITE = 3,
-	BP_TYPE_RW    = 4,
-};
-
-enum BP_LEN
-{
-	BP_LEN_1 = 1,
-	BP_LEN_2 = 2,
-	BP_LEN_4 = 4,
-	BP_LEN_8 = 8,
-};
-
-enum UDPBP_DIR
-{
-	UDPBP_DIR_TX   = 0,
-	UDPBP_DIR_RX   = 1,
-	UDPBP_DIR_BOTH = 2,
-};
-
-enum UDPBP_ACTION
-{
-	UDPBP_ACT_LOG     = 0,
-	UDPBP_ACT_REWRITE = 1,
 };
 
 typedef struct _WIND_NL_MSG
@@ -216,321 +128,10 @@ typedef struct _MODE_REQUEST
 	uint32_t mode;
 } MODE_REQUEST, *PMODE_REQUEST;
 
-/* ---- 老接口 BRK 软断点（0x0C/0x0D）----
- * 只保留单点安装/摘除，等价 BRKBP 家族的单点形式。
- * 新代码优先用 brkbp_* 系列；这两个为兼容旧工具保留。
- */
-typedef struct _BRK_REQUEST
-{
-	pid_t pid;
-	uintptr_t addr;
-	uint32_t type;	/* HW_BREAKPOINT_X / _R / _W / _RW */
-} BRK_REQUEST, *PBRK_REQUEST;
-
-typedef struct _HWBP_POINT_CONFIG
-{
-	uint64_t addr;
-	uint32_t type;
-	uint32_t length;
-} HWBP_POINT_CONFIG, *PHWBP_POINT_CONFIG;
-
-typedef struct _HWBP_CONFIG
-{
-	uint32_t num_brps;
-	uint32_t num_wrps;
-	uint32_t active_count;
-	uint32_t reserved;
-} HWBP_CONFIG, *PHWBP_CONFIG;
-
-typedef struct _HWBP_RECORD
-{
-	uint64_t trigger_pc;
-	uint64_t hit_addr;
-	uint32_t op_mask;
-	uint32_t reserved;
-} HWBP_RECORD, *PHWBP_RECORD;
-
-typedef struct _HWBP_SET_REQUEST
-{
-	uint32_t point_count;
-	uint32_t reserved;
-	HWBP_POINT_CONFIG points[];
-} HWBP_SET_REQUEST, *PHWBP_SET_REQUEST;
-
-typedef struct _HWBP_RECORDS_REQUEST
-{
-	uint32_t point_index;
-	uint32_t start_index;
-	uint32_t capacity;
-	uint32_t reserved;
-	HWBP_RECORD *records;
-	uint32_t *count_out;
-} HWBP_RECORDS_REQUEST, *PHWBP_RECORDS_REQUEST;
-
-typedef struct _HWBP_RECORD_REQUEST
-{
-	uint32_t point_index;
-	uint32_t record_index;
-	uint32_t reserved;
-	HWBP_RECORD record;
-} HWBP_RECORD_REQUEST, *PHWBP_RECORD_REQUEST;
-
-typedef struct _HWBP_CLEAR_REQUEST
-{
-	int32_t point_index;
-	uint32_t reserved;
-} HWBP_CLEAR_REQUEST, *PHWBP_CLEAR_REQUEST;
-
-typedef struct _HWBP_REG_REQUEST
-{
-	int32_t  point_index;
-	uint32_t enable;
-	uint32_t rx, ry, rz;
-	uint32_t reserved;
-} HWBP_REG_REQUEST, *PHWBP_REG_REQUEST;
-
-typedef struct _PTEBP_POINT_CONFIG
-{
-	uint64_t addr;
-	uint32_t type;
-	uint32_t length;
-} PTEBP_POINT_CONFIG, *PPTEBP_POINT_CONFIG;
-
-typedef struct _PTEBP_CONFIG
-{
-	uint32_t active_count;
-	uint32_t reserved;
-} PTEBP_CONFIG, *PPTEBP_CONFIG;
-
-typedef struct _PTEBP_RECORD
-{
-	uint64_t trigger_pc;
-	uint64_t hit_addr;
-	uint32_t op_mask;
-	uint32_t reserved;
-} PTEBP_RECORD, *PPTEBP_RECORD;
-
-typedef struct _PTEBP_SET_REQUEST
-{
-	uint32_t point_count;
-	uint32_t reserved;
-	PTEBP_POINT_CONFIG points[];
-} PTEBP_SET_REQUEST, *PPTEBP_SET_REQUEST;
-
-typedef struct _PTEBP_RECORDS_REQUEST
-{
-	uint32_t point_index;
-	uint32_t start_index;
-	uint32_t capacity;
-	uint32_t reserved;
-	PTEBP_RECORD *records;
-	uint32_t *count_out;
-} PTEBP_RECORDS_REQUEST, *PPTEBP_RECORDS_REQUEST;
-
-typedef struct _PTEBP_RECORD_REQUEST
-{
-	uint32_t point_index;
-	uint32_t record_index;
-	uint32_t reserved;
-	PTEBP_RECORD record;
-} PTEBP_RECORD_REQUEST, *PPTEBP_RECORD_REQUEST;
-
-typedef struct _PTEBP_CLEAR_REQUEST
-{
-	int32_t point_index;
-	uint32_t reserved;
-} PTEBP_CLEAR_REQUEST, *PPTEBP_CLEAR_REQUEST;
-
-typedef struct _BRKBP_POINT_CONFIG
-{
-	uint64_t addr;
-	uint32_t type;
-	uint32_t length;
-} BRKBP_POINT_CONFIG, *PBRKBP_POINT_CONFIG;
-
-typedef struct _BRKBP_CONFIG
-{
-	uint32_t active_count;
-	uint32_t reserved;
-} BRKBP_CONFIG, *PBRKBP_CONFIG;
-
-typedef struct _BRKBP_RECORD
-{
-	uint64_t trigger_pc;
-	uint64_t hit_addr;
-	uint32_t op_mask;
-	uint32_t reserved;
-} BRKBP_RECORD, *PBRKBP_RECORD;
-
-typedef struct _BRKBP_SET_REQUEST
-{
-	uint32_t point_count;
-	uint32_t reserved;
-	BRKBP_POINT_CONFIG points[];
-} BRKBP_SET_REQUEST, *PBRKBP_SET_REQUEST;
-
-typedef struct _BRKBP_RECORDS_REQUEST
-{
-	uint32_t point_index;
-	uint32_t start_index;
-	uint32_t capacity;
-	uint32_t reserved;
-	BRKBP_RECORD *records;
-	uint32_t *count_out;
-} BRKBP_RECORDS_REQUEST, *PBRKBP_RECORDS_REQUEST;
-
-typedef struct _BRKBP_RECORD_REQUEST
-{
-	uint32_t point_index;
-	uint32_t record_index;
-	uint32_t reserved;
-	BRKBP_RECORD record;
-} BRKBP_RECORD_REQUEST, *PBRKBP_RECORD_REQUEST;
-
-typedef struct _BRKBP_CLEAR_REQUEST
-{
-	int32_t point_index;
-	uint32_t reserved;
-} BRKBP_CLEAR_REQUEST, *PBRKBP_CLEAR_REQUEST;
-
-#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
-
-typedef struct _WRPBP_POINT_CONFIG
-{
-	uint64_t watch_addr;
-	uint32_t watch_len;
-	uint32_t type;
-	uint32_t components;
-	uint32_t reserved;
-
-	/* 浮点寄存器通道: 内存改写对"先搬进 S 寄存器再算"的代码无效。
-	 * freg_base = 起始 S 号, freg_mask = bit0..bit7 -> freg_base+0..7。
-	 * 具体值走 OP_WRPBP_SET_FREGS 持续更新。 */
-	uint32_t freg_base;
-	uint32_t freg_mask;
-} WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
-
-typedef struct _WRPBP_SET_REQUEST
-{
-	uint32_t point_count;
-	uint32_t reserved;
-	WRPBP_POINT_CONFIG points[];
-} WRPBP_SET_REQUEST, *PWRPBP_SET_REQUEST;
-
-typedef struct _WRPBP_VEC_REQUEST
-{
-	int32_t  point_index;
-	uint32_t enable;
-	uint32_t x, y, z;
-	uint32_t mask;
-} WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
-
-/* OP_WRPBP_SET_FREGS: 单列一个 op, 因为 WRPBP_VEC_REQUEST 很多调用方
- * 只传 24 字节(HWBP_REG_REQUEST 布局), 加长会读到栈上的垃圾。
- */
-typedef struct _WRPBP_FREG_REQUEST
-{
-	int32_t  point_index;              /* -1 = 所有点 */
-	uint32_t freg_base;                /* 起始 S 号 0..31 */
-	uint32_t freg_mask;                /* bit0..bit7 */
-	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
-} WRPBP_FREG_REQUEST, *PWRPBP_FREG_REQUEST;
-
-typedef struct _WRPBP_CONFIG
-{
-	uint32_t active_count;
-	uint32_t watch_addr_lo;
-	uint32_t watch_addr_hi;
-	uint32_t reserved;
-} WRPBP_CONFIG, *PWRPBP_CONFIG;
-
-typedef struct _WIND_BP_DIAG
-{
-	uint64_t last_hit_pc;
-	uint32_t hwbp_armed;
-	uint32_t hwbp_hits;
-	uint32_t hwbp_writes;
-	uint32_t hwbp_write_fails;
-	uint32_t ptebp_armed;
-	uint32_t ptebp_reloads;
-	uint32_t ptebp_heal_ok;
-	uint32_t ptebp_heal_fail;
-	uint32_t clonebp_active;
-	uint32_t clonebp_pages;
-	uint32_t clonebp_brk_hits;
-	uint32_t clonebp_tlb_flush;
-	uint32_t wrpbp_armed;
-	uint32_t wrpbp_hits;
-	uint32_t wrpbp_writes;
-	uint32_t wrpbp_skips;
-	uint32_t wrpbp_fails;
-	uint32_t last_rx;
-	uint32_t last_ry;
-	uint32_t last_rz;
-	uint32_t reserved;
-} WIND_BP_DIAG, *PWIND_BP_DIAG;
-
 typedef struct _GYRO_REQUEST
 {
 	uint32_t rx, ry, rz;
 } GYRO_REQUEST, *PGYRO_REQUEST;
-
-typedef struct _UDPBP_POINT_CONFIG
-{
-	uint32_t pid;
-	uint16_t port;
-	uint16_t dir;
-	uint16_t action;
-	uint16_t patch_len;
-	uint8_t  patch[UDPBP_PATCH_MAX];
-} UDPBP_POINT_CONFIG, *PUDPBP_POINT_CONFIG;
-
-typedef struct _UDPBP_RECORD
-{
-	uint64_t ts_ns;
-	uint32_t pid;
-	uint32_t saddr;
-	uint32_t daddr;
-	uint16_t sport;
-	uint16_t dport;
-	uint16_t dir;
-	uint16_t action;
-	uint32_t len;
-	uint32_t preview_len;
-	uint8_t  preview[UDPBP_PREVIEW_MAX];
-	uint32_t reserved;
-} UDPBP_RECORD, *PUDPBP_RECORD;
-
-typedef struct _UDPBP_CONFIG
-{
-	uint32_t slot_count;
-	uint32_t reserved;
-	UDPBP_POINT_CONFIG slots[UDPBP_MAX_SLOTS];
-} UDPBP_CONFIG, *PUDPBP_CONFIG;
-
-typedef struct _UDPBP_SET_REQUEST
-{
-	int32_t slot_index;
-	uint32_t reserved;
-	int32_t *slot_out;
-	UDPBP_POINT_CONFIG point;
-} UDPBP_SET_REQUEST, *PUDPBP_SET_REQUEST;
-
-typedef struct _UDPBP_RECORDS_REQUEST
-{
-	int32_t slot_index;
-	uint32_t start_index;
-	uint32_t capacity;
-	uint32_t reserved;
-	UDPBP_RECORD *records;
-	uint32_t *count_out;
-} UDPBP_RECORDS_REQUEST, *PUDPBP_RECORDS_REQUEST;
-
-typedef struct _UDPBP_CLEAR_REQUEST
-{
-	int32_t slot_index;
-	uint32_t reserved;
-} UDPBP_CLEAR_REQUEST, *PUDPBP_CLEAR_REQUEST;
 
 typedef struct _WIND_MAP_STATS
 {
@@ -548,6 +149,7 @@ typedef struct _WIND_MAP_STATS
 #define CLONEBP_MAX_PAGES    64
 #define CLONEBP_PATCH_MAX    16
 #define CLONEBP_REG_MAX      8
+#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
 #define CLONEBP_BRK_IMM_BASE 0x1000
 
 #define CLONEBP_MODE_LOG     0
@@ -713,8 +315,6 @@ public:
 
 	int clonebp_set_timing(CLONEBP_TIMING_CONFIG *io) { return io ? xfer(OP_CLONEBP_TIMING, (uintptr_t)io) : -1; }
 
-	int brk_set(const BRK_REQUEST *req) { return req ? xfer(OP_BRK_SET, (uintptr_t)req) : -1; }
-	int brk_clear(const BRK_REQUEST *req) { return req ? xfer(OP_BRK_CLEAR, (uintptr_t)req) : -1; }
 
 	int ace_set(uint32_t tgid) { return xfer(OP_ACE_SET, (uintptr_t)tgid); }
 	int ace_get_stat(ACE_STAT *out) { return out ? xfer(OP_ACE_GET_STAT, (uintptr_t)out) : -1; }
@@ -823,77 +423,6 @@ private:
 		}
 		return ioctl(fd, op, arg);
 	}
-
-	long bp_set_raw(unsigned int op, const void *points, uint32_t count, size_t point_size)
-	{
-		uint8_t *buf;
-		size_t total;
-		long ret;
-
-		if (count == 0 || count > 16 || !points)
-			return -1;
-		total = 8 + (size_t)count * point_size;
-		buf = (uint8_t *)malloc(total);
-		if (!buf)
-			return -1;
-		memcpy(buf, &count, 4);
-		uint32_t zero = 0;
-		memcpy(buf + 4, &zero, 4);
-		memcpy(buf + 8, points, (size_t)count * point_size);
-		ret = xfer_impl(op, (uintptr_t)buf);
-		free(buf);
-		return ret;
-	}
-
-	struct bp_records_req
-	{
-		uint32_t point_index;
-		uint32_t start_index;
-		uint32_t capacity;
-		uint32_t reserved;
-		void *records;
-		uint32_t *count_out;
-	};
-
-	long bp_get_records_raw(unsigned int op, uint32_t point_index, uint32_t start,
-	                        void *recs, uint32_t cap, uint32_t *count_out)
-	{
-		struct bp_records_req req;
-
-		if (!recs || cap == 0)
-			return -1;
-		memset(&req, 0, sizeof(req));
-		req.point_index = point_index;
-		req.start_index = start;
-		req.capacity = cap;
-		req.records = recs;
-		req.count_out = count_out;
-		return xfer_impl(op, (uintptr_t)&req);
-	}
-
-	long bp_set_record_raw(unsigned int op, uint32_t point_index, uint32_t record_index,
-	                       const void *record, size_t record_size)
-	{
-		uint8_t buf[16 + 24];
-
-		if (!record || record_size > 24)
-			return -1;
-		memset(buf, 0, sizeof(buf));
-		memcpy(buf, &point_index, 4);
-		memcpy(buf + 4, &record_index, 4);
-		memcpy(buf + 16, record, record_size);
-		return xfer_impl(op, (uintptr_t)buf);
-	}
-
-	long bp_clear_records_raw(unsigned int op, int32_t point_index)
-	{
-		int32_t buf[2];
-
-		buf[0] = point_index;
-		buf[1] = 0;
-		return xfer_impl(op, (uintptr_t)buf);
-	}
-
 public:
 	template <typename T>
 	long xfer(unsigned int op, T arg)
@@ -1279,207 +808,6 @@ public:
 	int gyro_stop() { return (int)xfer_impl(OP_GYRO_STOP, 0); }
 	int gyro_resume() { return (int)xfer_impl(OP_GYRO_RESUME, 0); }
 
-	int hwbp_set(const HWBP_POINT_CONFIG *pts, uint32_t count)
-	{
-		return (int)bp_set_raw(OP_HWBP_SET, pts, count, sizeof(HWBP_POINT_CONFIG));
-	}
-
-	int hwbp_exec(uint64_t addr)
-	{
-		HWBP_POINT_CONFIG p = {addr, BP_TYPE_EXEC, BP_LEN_4};
-
-		return hwbp_set(&p, 1);
-	}
-
-	int hwbp_watch(uint64_t addr, uint32_t type, uint32_t len)
-	{
-		HWBP_POINT_CONFIG p = {addr, type, len};
-
-		return hwbp_set(&p, 1);
-	}
-
-	int hwbp_remove() { return (int)xfer_impl(OP_HWBP_REMOVE, 0); }
-
-	int hwbp_get_config(HWBP_CONFIG *out)
-	{
-		return out ? (int)xfer_impl(OP_HWBP_GET_CONFIG, (uintptr_t)out) : -1;
-	}
-
-	int hwbp_get_records(uint32_t point_index, uint32_t start, HWBP_RECORD *recs,
-	                     uint32_t cap, uint32_t *count_out)
-	{
-		return (int)bp_get_records_raw(OP_HWBP_GET_RECORDS, point_index, start,
-		                               recs, cap, count_out);
-	}
-
-	int hwbp_set_record(uint32_t point_index, uint32_t record_index, const HWBP_RECORD &rec)
-	{
-		return (int)bp_set_record_raw(OP_HWBP_SET_RECORD, point_index, record_index,
-		                              &rec, sizeof(rec));
-	}
-
-	int hwbp_clear_records(int32_t point_index)
-	{
-		return (int)bp_clear_records_raw(OP_HWBP_CLEAR_RECORDS, point_index);
-	}
-
-	int ptebp_set(const PTEBP_POINT_CONFIG *pts, uint32_t count)
-	{
-		return (int)bp_set_raw(OP_PTEBP_SET, pts, count, sizeof(PTEBP_POINT_CONFIG));
-	}
-
-	int ptebp_exec(uint64_t addr)
-	{
-		PTEBP_POINT_CONFIG p = {addr, BP_TYPE_EXEC, BP_LEN_4};
-
-		return ptebp_set(&p, 1);
-	}
-
-	int ptebp_remove() { return (int)xfer_impl(OP_PTEBP_REMOVE, 0); }
-
-	int ptebp_get_config(PTEBP_CONFIG *out)
-	{
-		return out ? (int)xfer_impl(OP_PTEBP_GET_CONFIG, (uintptr_t)out) : -1;
-	}
-
-	int ptebp_get_records(uint32_t point_index, uint32_t start, PTEBP_RECORD *recs,
-	                      uint32_t cap, uint32_t *count_out)
-	{
-		return (int)bp_get_records_raw(OP_PTEBP_GET_RECORDS, point_index, start,
-		                               recs, cap, count_out);
-	}
-
-	int ptebp_set_record(uint32_t point_index, uint32_t record_index, const PTEBP_RECORD &rec)
-	{
-		return (int)bp_set_record_raw(OP_PTEBP_SET_RECORD, point_index, record_index,
-		                              &rec, sizeof(rec));
-	}
-
-	int ptebp_clear_records(int32_t point_index)
-	{
-		return (int)bp_clear_records_raw(OP_PTEBP_CLEAR_RECORDS, point_index);
-	}
-
-	int brkbp_set(const BRKBP_POINT_CONFIG *pts, uint32_t count)
-	{
-		return (int)bp_set_raw(OP_BRKBP_SET, pts, count, sizeof(BRKBP_POINT_CONFIG));
-	}
-
-	int brkbp_exec(uint64_t addr)
-	{
-		BRKBP_POINT_CONFIG p = {addr, BP_TYPE_EXEC, BP_LEN_4};
-
-		return brkbp_set(&p, 1);
-	}
-
-	int brkbp_remove() { return (int)xfer_impl(OP_BRKBP_REMOVE, 0); }
-
-	int brkbp_get_config(BRKBP_CONFIG *out)
-	{
-		return out ? (int)xfer_impl(OP_BRKBP_GET_CONFIG, (uintptr_t)out) : -1;
-	}
-
-	int brkbp_get_records(uint32_t point_index, uint32_t start, BRKBP_RECORD *recs,
-	                      uint32_t cap, uint32_t *count_out)
-	{
-		return (int)bp_get_records_raw(OP_BRKBP_GET_RECORDS, point_index, start,
-		                               recs, cap, count_out);
-	}
-
-	int brkbp_set_record(uint32_t point_index, uint32_t record_index, const BRKBP_RECORD &rec)
-	{
-		return (int)bp_set_record_raw(OP_BRKBP_SET_RECORD, point_index, record_index,
-		                              &rec, sizeof(rec));
-	}
-
-	int brkbp_clear_records(int32_t point_index)
-	{
-		return (int)bp_clear_records_raw(OP_BRKBP_CLEAR_RECORDS, point_index);
-	}
-
-	int udpbp_set(const UDPBP_POINT_CONFIG &point, int32_t *slot_out = NULL)
-	{
-		UDPBP_SET_REQUEST req;
-
-		memset(&req, 0, sizeof(req));
-		req.slot_index = -1;
-		req.slot_out = slot_out;
-		req.point = point;
-		return (int)xfer_impl(OP_UDPBP_SET, (uintptr_t)&req);
-	}
-
-	int udpbp_update(int32_t slot, const UDPBP_POINT_CONFIG &point)
-	{
-		UDPBP_SET_REQUEST req;
-
-		memset(&req, 0, sizeof(req));
-		req.slot_index = slot;
-		req.point = point;
-		return (int)xfer_impl(OP_UDPBP_SET, (uintptr_t)&req);
-	}
-
-	int udpbp_remove(int32_t slot) { return (int)xfer_impl(OP_UDPBP_REMOVE, (uintptr_t)(intptr_t)slot); }
-
-	int udpbp_get_config(UDPBP_CONFIG *cfg)
-	{
-		return cfg ? (int)xfer_impl(OP_UDPBP_GET_CONFIG, (uintptr_t)cfg) : -1;
-	}
-
-	int udpbp_get_records(int32_t slot, uint32_t start, UDPBP_RECORD *recs,
-	                      uint32_t cap, uint32_t *count_out)
-	{
-		UDPBP_RECORDS_REQUEST req;
-
-		if (!recs || cap == 0)
-			return -1;
-		memset(&req, 0, sizeof(req));
-		req.slot_index = slot;
-		req.start_index = start;
-		req.capacity = cap;
-		req.records = recs;
-		req.count_out = count_out;
-		return (int)xfer_impl(OP_UDPBP_GET_RECORDS, (uintptr_t)&req);
-	}
-
-	int udpbp_clear_records(int32_t slot)
-	{
-		UDPBP_CLEAR_REQUEST req;
-
-		req.slot_index = slot;
-		req.reserved = 0;
-		return (int)xfer_impl(OP_UDPBP_CLEAR_RECORDS, (uintptr_t)&req);
-	}
-
-	int udpbp_log_port(uint16_t port, uint16_t dir, uint32_t target_pid = 0,
-	                   int32_t *slot_out = NULL)
-	{
-		UDPBP_POINT_CONFIG p;
-
-		memset(&p, 0, sizeof(p));
-		p.pid = target_pid;
-		p.port = port;
-		p.dir = dir;
-		p.action = UDPBP_ACT_LOG;
-		return udpbp_set(p, slot_out);
-	}
-
-	int udpbp_rewrite_port(uint16_t port, uint16_t dir, uint32_t target_pid,
-	                       const void *patch, uint16_t len, int32_t *slot_out = NULL)
-	{
-		UDPBP_POINT_CONFIG p;
-
-		if (!patch || len == 0 || len > UDPBP_PATCH_MAX)
-			return -1;
-		memset(&p, 0, sizeof(p));
-		p.pid = target_pid;
-		p.port = port;
-		p.dir = dir;
-		p.action = UDPBP_ACT_REWRITE;
-		p.patch_len = len;
-		memcpy(p.patch, patch, len);
-		return udpbp_set(p, slot_out);
-	}
-
 	class Frame
 	{
 	public:
@@ -1638,80 +966,6 @@ private:
 	Frame frame_;
 	Snapshot<uint64_t> snap_;
 
-public:
-
-	int hwbp_refresh() { return xfer(OP_HWBP_REFRESH, 0); }
-
-	int hwbp_set_regs(int32_t point_index, bool enable, float x, float y, float z, uint32_t mask = 0x7)
-	{
-		HWBP_REG_REQUEST r;
-		memset(&r, 0, sizeof(r));
-		r.point_index = point_index;
-		r.enable = enable ? 1u : 0u;
-		memcpy(&r.rx, &x, 4);
-		memcpy(&r.ry, &y, 4);
-		memcpy(&r.rz, &z, 4);
-		r.reserved = mask;
-
-		return xfer(OP_HWBP_SET_REGS, (uintptr_t)&r);
-	}
-
-	int ptebp_set_regs(int32_t point_index, bool enable, float x, float y, float z, uint32_t mask = 0x7)
-	{
-		HWBP_REG_REQUEST r;
-		memset(&r, 0, sizeof(r));
-		r.point_index = point_index;
-		r.enable = enable ? 1u : 0u;
-		memcpy(&r.rx, &x, 4);
-		memcpy(&r.ry, &y, 4);
-		memcpy(&r.rz, &z, 4);
-		r.reserved = mask;
-
-		return xfer(OP_PTEBP_SET_REGS, (uintptr_t)&r);
-	}
-	int ptebp_refresh() { return xfer(OP_PTEBP_REFRESH, 0); }
-
-	int wrpbp_set(const WRPBP_POINT_CONFIG *pts, uint32_t count)
-	{
-		if (!pts || count == 0)
-			return -1;
-		return bp_set_raw(OP_WRPBP_SET, pts, count, sizeof(WRPBP_POINT_CONFIG));
-	}
-	int wrpbp_remove() { return xfer(OP_WRPBP_REMOVE, 0); }
-	int wrpbp_get_config(WRPBP_CONFIG *out)
-	{
-		return out ? xfer(OP_WRPBP_GET_CONFIG, (uintptr_t)out) : -1;
-	}
-	int wrpbp_get_records(uint32_t point_index, uint32_t start, HWBP_RECORD *recs,
-	                      uint32_t cap, uint32_t *count_out)
-	{
-		return bp_get_records_raw(OP_WRPBP_GET_RECORDS, point_index, start,
-		                          recs, cap, count_out);
-	}
-	int wrpbp_clear_records(int32_t point_index)
-	{
-		return bp_clear_records_raw(OP_WRPBP_CLEAR_RECORDS, point_index);
-	}
-
-	int wrpbp_set_vec(int32_t point_index, bool enable, float x, float y, float z, uint32_t mask = 0x7)
-	{
-		WRPBP_VEC_REQUEST r;
-		memset(&r, 0, sizeof(r));
-		r.point_index = point_index;
-		r.enable = enable ? 1u : 0u;
-		memcpy(&r.x, &x, 4);
-		memcpy(&r.y, &y, 4);
-		memcpy(&r.z, &z, 4);
-		r.mask = mask;
-
-		return xfer(OP_WRPBP_SET_VEC, (uintptr_t)&r);
-	}
-
-	int bp_all_off() { return xfer(OP_BP_ALL_OFF, 0); }
-	int bp_diag(WIND_BP_DIAG *out)
-	{
-		return out ? xfer(OP_BP_DIAG, (uintptr_t)out) : -1;
-	}
 };
 
 #ifdef WIND_ENABLE_LEGACY_GLOBAL_DRIVER

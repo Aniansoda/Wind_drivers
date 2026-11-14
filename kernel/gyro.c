@@ -851,6 +851,7 @@ void gyro_set_velocity(u32 rx, u32 ry, u32 rz)
 void gyro_set_enabled(bool enabled)
 {
 	WRITE_ONCE(gyro_enabled, enabled);
+	gyro_sock_set_enabled(enabled);
 }
 
 /* 停止: 只关篡改, hook 保留 (热开关, 无重新解析开销) */
@@ -859,7 +860,7 @@ int gyro_stop(void)
 	if (!gyro_active)
 		return -ENODEV;
 
-	WRITE_ONCE(gyro_enabled, false);
+	gyro_set_enabled(false);
 	printk(KERN_INFO "gyro: stopped (hook kept)\n");
 	return 0;
 }
@@ -889,7 +890,7 @@ int gyro_resume(void)
 	if (gyro_wrp_ready)
 		gyro_wrp_last_seen = jiffies;
 
-	WRITE_ONCE(gyro_enabled, true);
+	gyro_set_enabled(true);
 	printk(KERN_INFO "gyro: resumed (pid=%d addr=0x%lx)\n", gyro_pid, gyro_addr);
 	return 0;
 }

@@ -4,7 +4,7 @@
 
 Android / Linux ARM64 向けカーネル空間メモリアクセス・デバッグ基盤
 単一モジュール `wind.ko`、11 サブシステム、1 系統のオペコード、3 つの通信路
-ゼロ CRC 方式、5 系統のブレークポイントが同時共存、ホワイトリスト外シンボルはすべて実行時解決
+ゼロ CRC 方式、ホワイトリスト外シンボルはすべて実行時解決
 
 ---
 
@@ -44,20 +44,14 @@ Android / Linux ARM64 向けカーネル空間メモリアクセス・デバッ�
 
 | コード | 旧 | 現 |
 |---|---|---|
-| `0x26..0x2B` | ETM/PTM 分岐追跡 | **WRP データ監視点** `wrpbp` |
 | `0x38..0x3D` | 予約 | 廃止、定義しない |
-| `0x50..0x56` | — | **ACE 検出回避カモフラージュ**、10 feature bit / 11 kprobe |
-| `0x0C / 0x0D` | ETM の残骸 | **BRK ソフトブレーク**旧インタフェース `brk_set` / `brk_clear` を復活 |
+| `0x50..0x55` | — | **ACE 検出回避カモフラージュ**、10 feature bit / 11 kprobe |
 | `0x33` | — | `OP_STATS` キャッシュ統計 |
-| `0x34 / 0x37` | — | `HWBP_SET_REGS` / `HWBP_REFRESH` |
-| `0x35 / 0x36` | — | `PTEBP_SET_REGS` / `PTEBP_REFRESH` |
-| `0x3E / 0x3F` | — | `BP_DIAG` / `BP_ALL_OFF` |
 | ジャイロ | 実行ブレークポイント常駐 | 実行ブレークポイントで位置特定 → **WRP 定常状態へ移行**、X/Y のみ書換、Z は窓に入れない |
 | シンボル | 直接参照 | ホワイトリスト外 32 個を `register_kprobe` で実行時解決 |
 | 互換 | コード各处に `#ifdef` | `compat.h` に集約、5.10 → 6.18 を 1 ソースで |
 
 ETM は削除した。Coresight は SoC 側でクロックと funnel を開く必要があり、機種のカバー率が低く、データ自体も観測できない
-`0x26..0x2B` は WRP に割当。構造体サイズは旧 `ETMBP_POINT_CONFIG` と同じ 24 バイトなので既存バイナリでも位置ずれしない
 
 ---
 
@@ -159,66 +153,6 @@ insmod wind.ko transport=0            # 通信路なしで読み込みのみ、�
 | 0x0E | `OP_KGSL_HIDE` | kgsl 側で pid を隠す |
 | 0x0F | `OP_KGSL_HOOK` | kgsl hook を設置 |
 
-### ハードウェアブレークポイント BRP/WRP
-
-| コード | 名前 | 機能 |
-|---|---|---|
-| 0x0C | `OP_BRK_SET` | 旧版の単点ハードウェアブレークポイント |
-| 0x0D | `OP_BRK_CLEAR` | 旧版の単点を解除 |
-| 0x14 | `OP_HWBP_SET` | ブレークポイント／監視点グループ設定、16 スロット |
-| 0x15 | `OP_HWBP_REMOVE` | 全解除し debug レジスタを返却 |
-| 0x16 | `OP_HWBP_GET_CONFIG` | 現在の設定と空き BRP/WRP 数 |
-| 0x17 | `OP_HWBP_GET_RECORDS` | 集約したヒット PC を分割読み |
-| 0x18 | `OP_HWBP_SET_RECORD` | 記録と 2-bit レジスタ書換マスクを書き戻す |
-| 0x19 | `OP_HWBP_CLEAR_RECORDS` | 記録消去、`-1` で全消去 |
-| 0x34 | `OP_HWBP_SET_REGS` | ヒット時に `s3`/`s4`/`s5` を書換、`.inst` の生エンコード |
-| 0x37 | `OP_HWBP_REFRESH` | アドレス移動後に再登録 |
-
-### PTE シャドウページ実行ブレークポイント
-
-| コード | 名前 | 機能 |
-|---|---|---|
-| 0x1A | `OP_PTEBP_SET` | PTE 属性を反転して fault を起こす、16 スロット、debug レジスタ不使用 |
-| 0x1B | `OP_PTEBP_REMOVE` | 全解除し PTE を復元 |
-| 0x1C | `OP_PTEBP_GET_CONFIG` | 現在の設定 |
-| 0x1D | `OP_PTEBP_GET_RECORDS` | ヒット記録を分割読み |
-| 0x1E | `OP_PTEBP_SET_RECORD` | 記録を書き戻す |
-| 0x1F | `OP_PTEBP_CLEAR_RECORDS` | 記録消去、`-1` で全消去 |
-| 0x35 | `OP_PTEBP_SET_REGS` | ヒット時にシャドウトランポリン経由でレジスタ書換 |
-| 0x36 | `OP_PTEBP_REFRESH` | シャドウページと PTE を再整合 |
-
-### BRK ソフトウェアブレークポイント
-
-| コード | 名前 | 機能 |
-|---|---|---|
-| 0x20 | `OP_BRKBP_SET` | 命令を `BRK` に書換、16 スロット |
-| 0x21 | `OP_BRKBP_REMOVE` | 全解除し元の命令バイトを復元 |
-| 0x22 | `OP_BRKBP_GET_CONFIG` | 現在の設定 |
-| 0x23 | `OP_BRKBP_GET_RECORDS` | ヒット記録を分割読み |
-| 0x24 | `OP_BRKBP_SET_RECORD` | 記録を書き戻す |
-| 0x25 | `OP_BRKBP_CLEAR_RECORDS` | 記録消去、`-1` で全消去 |
-
-### WRP データ監視点
-
-| コード | 名前 | 機能 |
-|---|---|---|
-| 0x26 | `OP_WRPBP_SET` | 対象 VA に書込み監視点を設置、`LEN_8` 窓 |
-| 0x27 | `OP_WRPBP_REMOVE` | 解除し WRP レジスタを返却 |
-| 0x28 | `OP_WRPBP_GET_CONFIG` | 現在の窓設定 |
-| 0x29 | `OP_WRPBP_GET_RECORDS` | ヒット記録を分割読み |
-| 0x2A | `OP_WRPBP_SET_VEC` | 2-bit マスク付きでベクタを書き戻す（X/Y を個別に） |
-| 0x2B | `OP_WRPBP_CLEAR_RECORDS` | 記録消去、`-1` で全消去 |
-
-### UDP ブレークポイント
-
-| コード | 名前 | 機能 |
-|---|---|---|
-| 0x2E | `OP_UDPBP_SET` | UDP スロットを設置・更新、8 スロット |
-| 0x2F | `OP_UDPBP_REMOVE` | スロット解除、`-1` で全解除 |
-| 0x30 | `OP_UDPBP_GET_CONFIG` | スロット表 |
-| 0x31 | `OP_UDPBP_GET_RECORDS` | 分割読み、1 スロット 256 件 |
-| 0x32 | `OP_UDPBP_CLEAR_RECORDS` | 記録消去、`-1` で全消去 |
-
 ### ジャイロ
 
 | コード | 名前 | 機能 |
@@ -229,13 +163,6 @@ insmod wind.ko transport=0            # 通信路なしで読み込みのみ、�
 | 0x13 | `OP_GYRO_ENABLE` | 書換の有効・無効 |
 | 0x2C | `OP_GYRO_STOP` | 書換を停止、hook は維持 |
 | 0x2D | `OP_GYRO_RESUME` | 書換を再開、点が失われていれば再バインド |
-
-### 診断と全体スイッチ
-
-| コード | 名前 | 機能 |
-|---|---|---|
-| 0x3E | `OP_BP_DIAG` | 5 系統のスロットとヒット数を一括取得 |
-| 0x3F | `OP_BP_ALL_OFF` | 全系統を一括解除、追跡方式の切替前に呼ぶ |
 
 `0x38..0x3D` は廃止。クライアント側で予約しないこと
 
@@ -248,7 +175,6 @@ insmod wind.ko transport=0            # 通信路なしで読み込みのみ、�
 | 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | モジュール自身のログ切替、既定はオフ |
 | 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` ノードの接収 / 摘除のみ |
 | 0x54 | `OP_ACE_SET_FEATURES` | ビットマスク | 10 個のスイッチを書く、下位 10 ビット |
-| 0x56 | `OP_WRPBP_SET_FREGS` | `WRPBP_FREG_REQUEST*` | WRP 浮動小数点レジスタ書き戻し (S0..S31) |
 
 詳細は `README.md` の「8 ACE 反检测伪装」を参照
 
@@ -313,60 +239,6 @@ kprobe を使う理由 Android GKI 5.x 以降は kCFI と読み取り専用 roda
 kprobe はブレークポイント機構でコールバックを登録するだけでテキストを書かないため、構造上 CFI を踏まない
 
 シンボルの遅延登録 `hide_*` の初回呼び出し時に候補表（`filldir64` → `filldir`）で登録するので、シンボルが見えなくても読み込みは失敗しない
-
-### 5 5 系統のブレークポイント
-
-「スロット + リングバッファ記録 + 分割読み戻し」の骨格を共有し、`0x3E` 診断と `0x3F` 全体スイッチも共通
-実行ブレークポイント同士は排他。arm64 の BRP は 4 本、WRP は 2 本しかない
-
-| 系統 | 仕組み | 消費 | 記録から得られるもの | 用途 |
-|---|---|---|---|---|
-| `hwbp` | BRP 実行／WRP 監視、perf イベント | BRP 4 + WRP 2 | ヒット PC とレジスタ | 関数入口、読み書き点 |
-| `ptebp` | PTE 属性反転 + 32 バイトシャドウトランポリン | debug レジスタ不使用 | ヒット点と制御可能レジスタ | 十数点を同時に監視 |
-| `wrpbp` | WRP データ監視点、`LEN_8` 窓 | WRP 2 | 書込み時刻とベクタ | 単一フィールドの書換監視 |
-| `brkbp` | 命令を `BRK` に書換、kprobe 例外処理 | ハード不使用 | ヒット PC と汎用レジスタ | 記録型の観測 |
-| `udpbp` | UDP 経路への kprobe | ハード不使用 | パケット内容のプレビュー | 通信リズムの観測 |
-
-**hwbp** arm64 の実行ブレークポイントは `HW_BREAKPOINT_LEN_4` のみ
-ヒット時に設定どおり PC を記録し分割で読み戻す。2-bit レジスタマスク付きで書き戻し可能
-`OP_HWBP_SET_REGS` はヒットコールバックから `s3`/`s4`/`s5` を直接書く
-
-**ptebp** PTE 属性ビットを反転して fault を起こす。16 スロット、1 スロット最大 8 ページ
-debug レジスタを使わないため `hwbp` と共存できる
-元命令はトランポリンで実行し、トランポリンは対象 `mm` 内に RWX 1 ページとして開く
-PTE ビット域（`PTE_UXN` / `PTE_PXN` / `PTE_RDONLY` / `PTE_VALID` / `PTE_AF`）を直接読み書きでき、変更後は TLB を更新
-
-**wrpbp** `arch_install_hw_breakpoint` の `LEN_8` データ窓
-ヒット時に `perf_event` の値を記録へ写し、`OP_WRPBP_SET_VEC` が 2-bit マスク付きで書き戻す
-ジャイロの定常状態はこの層に載っている
-
-**brkbp** 命令を `BRK` に書換え、例外ハンドラで受ける。16 スロット
-ヒット時にカーネル空間から `wind_read_process_va` / `wind_write_process_va` で引数取得と戻り値書換を行い、`__user` を経由しない
-現状は記録のみで、レジスタ書き戻しは未実装
-
-**udpbp** カーネル UDP 経路への kprobe
-
-```
-TX  udp_send_skb  ->  ip_send_skb  ->  ip_local_out   解決できた最初のものを使う
-RX  __udp4_lib_rcv
-```
-
-TX は `udp_send_skb` を優先する。GKI の LTO ビルドが `ip_local_out` をインライン化するため
-pid、ポート、方向で絞り込み、ヒットはリングバッファへ。分割読みで取得
-8 スロット、1 スロット 256 件、1 件 32 バイトのプレビュー
-IPv4 のみ。IPv6 の `__udp6_lib_rcv` は未接続
-
-**旧版 brk** `OP_BRK_SET` / `OP_BRK_CLEAR` は `register_user_hw_breakpoint` による単点実行ブレークポイント。互換のため残置
-
-**FP レジスタ書換** カーネルは `-mgeneral-regs-only` でビルドされ、clang の統合アセンブラは `stp q3,q4,[x9]` のようなニーモニックを拒否する
-`hwbp_fp_reg_direct` は `.inst` で生エンコードを書き、基底レジスタは `x9` 固定
-
-| 命令 | エンコード |
-|---|---|
-| `stp q3, q4, [x9]` | `0xad001123` |
-| `str q5, [x9]` | `0x3d800125` |
-| `ldp q3, q4, [x9]` | `0xad401123` |
-| `ldr q5, [x9]` | `0x3dc00125` |
 
 ### 6 ジャイロ
 
@@ -505,7 +377,7 @@ nofault     copy_from_user_nofault  copy_to_user_nofault
 
 | ファイル | 役割 |
 |---|---|
-| `user/Wind-对接头文件.h` | `c_wind` 1 クラスに全機能：読み書き／バッチ／フレームキャッシュ／スナップショット／隠蔽／kgsl／ジャイロ／5 系統ブレークポイント |
+| `user/Wind-对接头文件.h` | `c_wind` 1 クラスに全機能：読み書き／バッチ／フレームキャッシュ／スナップショット／隠蔽／kgsl／ジャイロ |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink クライアント例 |
 | `user/Wind-Drivers-*.sh` | 各カーネル版の自己解凍インストーラ（5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18） |
 | `user/Wind-Drivers-6.6.ko` | 6.6 用ビルド済みモジュール |
@@ -532,11 +404,6 @@ d.snap_stop();
 `sizeof(c_wind)` は約 48 KB。うち 47 KB はフレームキャッシュ表（2048 スロット）
 ローカル実体はヒープに確保する
 
-追跡方式を切り替える前に `bp_all_off()` を呼ぶ。前の系統が BRP/WRP を握ったままだと新しい系統が入らない
-
-```cpp
-d.bp_all_off();        // 0x3F、5 系統を一括解除
-```
 
 ---
 
@@ -598,7 +465,6 @@ Wind_driver/
 │   ├── memory.c            読み書き、ページ表走査、ページマップキャッシュ、mmap
 │   ├── process.c           モジュール基底、プロセス関連
 │   ├── hide.c              ファイル・プロセス隠蔽（kprobe）
-│   ├── breakpoint.c        5 系統ブレークポイント + UDP + シャドウページ
 │   ├── gyro.c              ジャイロ hook（実行 bp → WRP 定常）
 │   ├── kgsl.c              GPU kgsl hook
 │   ├── ace.c               ACE 検出回避カモフラージュ（kprobe 10 個）
@@ -606,7 +472,7 @@ Wind_driver/
 │   ├── sym.c               ホワイトリスト外 32 シンボルの実行時解決
 │   ├── comm.h              オペコードとプロトコル構造体
 │   ├── compat.h            カーネル互換層（5.10 → 6.18）
-│   ├── memory.h / breakpoint.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
+│   ├── memory.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
 │   ├── Kconfig
 │   └── Makefile
 ├── user/                   クライアントヘッダ、サンプル、インストーラ
@@ -636,7 +502,6 @@ Wind_driver/
 | 古い値が読める | `MODE_SAFE` へ切替、GPU / ION バッファか確認 |
 | 隠蔽が効かない | `CONFIG_KALLSYMS_ALL` の有無、`filldir64` の可視性 |
 | ジャイロが動かない | 対象が sensor を読むプロセスか、`sendObjects` が解決したか、`dmesg` で WRP が armed か |
-| ブレークポイントが入らない | 先に `bp_all_off`、次に `OP_BP_DIAG` で BRP/WRP の残量確認 |
 | シャドウページのヒット後に対象が落ちる | `KH_PTE_PA_MASK` / `KH_PHYS_TO_PTE` と実機 PA 幅の整合 |
 
 ログのキーワード
@@ -648,8 +513,6 @@ wind: netlink
 wind: sym use_mm
 filldir64
 gyro
-hwbp / ptebp / wrpbp / brkbp / udpbp
-bp: all off
 ```
 
 ---
@@ -660,12 +523,6 @@ bp: all off
 - `/dev/null` fops 通信路は一部機種でフリーズ再起動の記録があり、既定では無効
 - ゼロ CRC 方式が省くのはシンボル CRC のみ。vermagic 末尾、CFI、構造体配置の検査は省かない
 - ゼロ CRC はカーネルシリーズを跨げない。6.1 の ko を 6.12 に置くと `bad vermagic` で拒否される
-- `brkbp` は記録のみで、レジスタ書き戻しは未実装
-- `hwbp` / `ptebp` は TID 限定が未実装で、ヒットはプロセス全体
-- arm64 の実行ブレークポイントは `LEN_4` のみ。命令は 4 バイト境界に必要
-- BRP 4 本・WRP 2 本はハード上限。5 系統を同時に使うと奪い合う
-- `ptebp` は 1 スロット最大 8 ページ。ページが変わったら `OP_PTEBP_REFRESH`
-- UDP ブレークポイントは IPv4 のみ。IPv6 経路は未接続
 - 6.12.58 より前の成果物は `tools/device/` の config と CRC 表に依存する。機種を変える場合は再採取が必要
 
 ---

@@ -49,6 +49,7 @@ void gyro_set_enabled(bool enabled);
 int  gyro_sock_install(pid_t system_server_tgid);
 void gyro_sock_remove(void);
 void gyro_sock_set(u32 x_bits, u32 y_bits);
+void gyro_sock_set_enabled(bool enabled);
 bool gyro_sock_active(void);
 
 int  gyro_stop(void);
