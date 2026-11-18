@@ -751,6 +751,13 @@ static void __exit driver_unload(void)
 	printk("[+] wind: unload start\n");
 	windcfg_exit();
 	printk("[+] wind: -cfg\n");
+	/* hide.c 的 kp_filldir 在 windcfg_init 里因 hide_driver/oppo 后门被注册,
+	 * windcfg_exit 只清 g_bound_tgid 不摘它。这里必须 unregister, 否则模块
+	 * text 释放后 filldir64 的 kprobe 还指向已释放的 handler, 下一次任何进程
+	 * 列目录(getdents64)即 OOPS 重启。hide_driver/hide_pid 默认全开,
+	 * 每次 insmod 必注册, 所以 rmmod 是必现的。 */
+	unhide_all();
+	printk("[+] wind: -hide\n");
 	ace_exit();
 	printk("[+] wind: -ace\n");
 	clonebp_module_exit();
