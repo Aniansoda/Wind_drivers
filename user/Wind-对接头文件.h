@@ -29,7 +29,7 @@
 #define WIND_NL_MAGIC 0x574E4C31u
 
 #define WIND_OP_FIRST (WIND_OP_BASE + 0x01)
-#define WIND_OP_LAST  (WIND_OP_BASE + 0x3F)
+#define WIND_OP_LAST  (WIND_OP_BASE + 0xFF)
 
 #define WIND_DEV_MISC  "/dev/windc"
 #define WIND_DEV_NULL  "/dev/null"
@@ -58,6 +58,14 @@ enum OPERATIONS
 	OP_GYRO_SET      = WIND_OP_BASE + 0x12,
 	OP_GYRO_ENABLE   = WIND_OP_BASE + 0x13,
 
+	/* ---- WRP 数据断点追踪 (观察点 + 命中即写回 + 浮点寄存器) ---- */
+	OP_WRPBP_SET          = WIND_OP_BASE + 0x26,
+	OP_WRPBP_REMOVE       = WIND_OP_BASE + 0x27,
+	OP_WRPBP_GET_CONFIG   = WIND_OP_BASE + 0x28,
+	OP_WRPBP_GET_RECORDS  = WIND_OP_BASE + 0x29,
+	OP_WRPBP_SET_VEC      = WIND_OP_BASE + 0x2A,
+	OP_WRPBP_CLEAR_RECORDS= WIND_OP_BASE + 0x2B,
+
 	OP_GYRO_STOP   = WIND_OP_BASE + 0x2C,
 	OP_GYRO_RESUME = WIND_OP_BASE + 0x2D,
 
@@ -78,6 +86,7 @@ enum OPERATIONS
 	OP_ACE_INTE             = WIND_OP_BASE + 0x53,
 	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54,
 	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55,
+	OP_WRPBP_SET_FREGS      = WIND_OP_BASE + 0x56,
 };
 
 enum READ_MODE
@@ -247,6 +256,88 @@ typedef struct _CLONEBP_RECORDS_REQUEST
 	CLONEBP_RECORD *records;
 	uint32_t *count_out;
 } CLONEBP_RECORDS_REQUEST, *PCLONEBP_RECORDS_REQUEST;
+
+/* ---- WRP 数据断点 (观察点写回, 不碰代码也不碰页表) ---- */
+#define WRPBP_MAX_POINTS    2    /* arm64 只有 4 个硬件断点寄存器 */
+#define WRPBP_RECORD_MAX    256
+#define WRPBP_VEC_BYTES     12   /* x/y/z 三个 float */
+
+#define HWBP_MASK_ALL       0x7U /* bit0=x bit1=y bit2=z */
+
+enum BP_TYPE
+{
+	BP_TYPE_EXEC  = 1,
+	BP_TYPE_READ  = 2,
+	BP_TYPE_WRITE = 3,
+	BP_TYPE_RW    = 4,
+};
+
+enum BP_LEN
+{
+	BP_LEN_1 = 1,
+	BP_LEN_2 = 2,
+	BP_LEN_4 = 4,
+	BP_LEN_8 = 8,
+};
+
+typedef struct _HWBP_RECORD
+{
+	uint64_t trigger_pc;
+	uint64_t hit_addr;
+	uint32_t op_mask;   /* bit0=读 bit1=写 */
+	uint32_t reserved;
+} HWBP_RECORD, *PHWBP_RECORD;
+
+typedef struct _WRPBP_POINT_CONFIG
+{
+	uint64_t watch_addr;   /* 弹道/朝向向量首地址 (12 字节 x/y/z) */
+	uint32_t watch_len;    /* 1/2/4/8: 单个观察点覆盖字节数 */
+	uint32_t type;         /* BP_TYPE_WRITE / BP_TYPE_RW */
+	uint32_t components;   /* bit0=x bit1=y bit2=z */
+	uint32_t freg_base;    /* 起始 S 寄存器号 0..31 */
+	uint32_t freg_mask;    /* bit0..bit7 -> freg_base+0..7, 0=不写浮点 */
+} WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
+
+typedef struct _WRPBP_SET_REQUEST
+{
+	uint32_t pid;          /* 目标进程 */
+	uint32_t point_count;
+	WRPBP_POINT_CONFIG points[];
+} WRPBP_SET_REQUEST, *PWRPBP_SET_REQUEST;
+
+typedef struct _WRPBP_VEC_REQUEST
+{
+	int32_t  point_index;  /* -1 全部 */
+	uint32_t enable;
+	uint32_t x, y, z;      /* float 位模式 */
+	uint32_t mask;         /* bit0=x bit1=y bit2=z, 0 视为 0x7 */
+} WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
+
+typedef struct _WRPBP_FREGS_REQUEST
+{
+	int32_t  point_index;  /* -1 全部 */
+	uint32_t freg_base;    /* 起始 S 寄存器号 0..31 */
+	uint32_t freg_mask;    /* bit0..bit7 -> freg_base+0..7 */
+	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
+} WRPBP_FREGS_REQUEST, *PWRPBP_FREGS_REQUEST;
+
+typedef struct _WRPBP_CONFIG
+{
+	uint32_t active_count;
+	uint32_t watch_addr_lo;
+	uint32_t watch_addr_hi;
+	uint32_t reserved;
+} WRPBP_CONFIG, *PWRPBP_CONFIG;
+
+typedef struct _WRPBP_RECORDS_REQUEST
+{
+	uint32_t point_index;
+	uint32_t start_index;
+	uint32_t capacity;
+	uint32_t reserved;
+	HWBP_RECORD *records;
+	uint32_t *count_out;
+} WRPBP_RECORDS_REQUEST, *PWRPBP_RECORDS_REQUEST;
 
 #define CLONEBP_TIMING_BALANCE  (1u << 0)
 #define CLONEBP_TIMING_JITTER   (1u << 1)

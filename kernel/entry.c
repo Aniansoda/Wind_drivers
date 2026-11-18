@@ -23,6 +23,7 @@
 #include "sym.h"
 #include "nlcomm.h"
 #include "clonebp.h"
+#include "wrpbp.h"
 #include <linux/rcupdate.h>
 
 /* 卸载中标志: 所有 kprobe / perf 回调看到它立刻返回。
@@ -385,6 +386,70 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
+	/* ---- WRP 数据断点 (观察点 + 命中即写回 + 浮点寄存器) ---- */
+	case OP_WRPBP_SET:
+		return wrpbp_set_pid((uint32_t)0, (const void __user *)arg);
+	case OP_WRPBP_REMOVE:
+		return wrpbp_remove();
+	case OP_WRPBP_GET_CONFIG:
+	{
+		WRPBP_CONFIG cfg;
+
+		if (wrpbp_get_config(&cfg) != 0)
+			return -EINVAL;
+		if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg)) != 0)
+			return -EFAULT;
+		return 0;
+	}
+	case OP_WRPBP_GET_RECORDS:
+	{
+		WRPBP_RECORDS_REQUEST req;
+		HWBP_RECORD *recs;
+		uint32_t cnt = 0;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (!req.records || req.capacity == 0 || req.capacity > WRPBP_RECORD_MAX)
+			return -EINVAL;
+		recs = kcalloc(req.capacity, sizeof(*recs), GFP_KERNEL);
+		if (!recs)
+			return -ENOMEM;
+		if (wrpbp_get_records(req.point_index, req.start_index,
+				      recs, req.capacity, &cnt) != 0) {
+			kfree(recs);
+			return -EINVAL;
+		}
+		if (cnt && copy_to_user(req.records, recs, cnt * sizeof(*recs))) {
+			kfree(recs);
+			return -EFAULT;
+		}
+		kfree(recs);
+		if (req.count_out && copy_to_user(req.count_out, &cnt, sizeof(cnt)))
+			return -EFAULT;
+		return 0;
+	}
+	case OP_WRPBP_SET_VEC:
+	{
+		WRPBP_VEC_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		return wrpbp_set_vec(req.point_index, req.enable, req.x, req.y,
+				     req.z, req.mask);
+	}
+	case OP_WRPBP_SET_FREGS:
+	{
+		WRPBP_FREGS_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		return wrpbp_set_fregs(req.point_index, req.freg_base,
+				      req.freg_mask, req.freg_val,
+				      CLONEBP_FREG_MAX);
+	}
+	case OP_WRPBP_CLEAR_RECORDS:
+		return wrpbp_clear_records((int32_t)arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -623,6 +688,8 @@ static int __init driver_entry(void)
 	 * clonebp_set -> cb_alloc_point 解引用 NULL -> OOPS/看门狗重启。 */
 	if (clonebp_module_init() != 0)
 		pr_err("[wind] clonebp init failed\n");
+	wrpbp_module_init();
+	printk("[+] wind: -wrpbp\n");
 
 	/* 通道建立只由 transport 决定, 与 install_hook / hook_level 无关。
 	 * 以前这里把 install_hook=0 也当成"什么都不建", 结果用户按建议关 hook 做对照,
@@ -688,6 +755,8 @@ static void __exit driver_unload(void)
 	printk("[+] wind: -ace\n");
 	clonebp_module_exit();
 	printk("[+] wind: -clonebp\n");
+	wrpbp_module_exit();
+	printk("[+] wind: -wrpbp\n");
 
 	printk("[+] wind driver_unload");
 	gyro_remove();
