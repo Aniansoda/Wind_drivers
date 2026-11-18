@@ -219,37 +219,11 @@ static void gyro_rewrite_iov(struct iovec *iov, unsigned int n, unsigned long to
  * 落在 __sys_recvmsg / ksys_recvmsg 这类直接函数上时 x0=fd, x1=msghdr。
  */
 
-static int gyro_kretprobe_idx(struct kretprobe *rp)
+/* wrapper=true: 符号是 __arm64_sys_* 形态, 第一个参数是 struct pt_regs *。
+ * 落在 __sys_recvmsg / ksys_recvmsg 这类直接函数上时 x0=fd, x1=msghdr。 */
+static struct pt_regs *gyro_user_regs(bool wrapper, struct pt_regs *regs)
 {
-	int i;
-
-	for (i = 0; i < g_gyro_kp_cnt; i++)
-		if (rp == &g_gyro_kps[i])
-			return i;
-	return -1;
-}
-
-/* 0 = msghdr 形状(recvmsg), 1 = 平铺缓冲(read/recvfrom) */
-static int gyro_kretprobe_kind(struct kretprobe *rp)
-{
-	int i = gyro_kretprobe_idx(rp);
-
-	return i >= 0 ? g_gyro_kp_kind[i] : 0;
-}
-
-static bool gyro_krp_wrapper_of(struct kretprobe *rp)
-{
-	int i;
-
-	for (i = 0; i < g_gyro_kp_cnt; i++)
-		if (rp == &g_gyro_kps[i])
-			return g_gyro_kp_wrapper[i];
-	return false;
-}
-
-static struct pt_regs *gyro_user_regs(struct kretprobe *rp, struct pt_regs *regs)
-{
-	if (gyro_krp_wrapper_of(rp)) {
+	if (wrapper) {
 		struct pt_regs *ur = (struct pt_regs *)regs->regs[0];
 
 		if (!ur || !user_mode(ur))
@@ -260,14 +234,17 @@ static struct pt_regs *gyro_user_regs(struct kretprobe *rp, struct pt_regs *regs
 }
 
 /* 函数入口: 抓上下文。返回 1 = 跳过这次返回 (不触发 handler),
- * 返回 0 = 跟踪到返回点再调用 handler。 */
-static int gyro_recv_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+ * 返回 0 = 跟踪到返回点再调用 handler。
+ * idx 是编译期已知的下标: 5.16+ 的 struct kretprobe_instance 移除了 rp 成员,
+ * 不能再 ri->rp 反查 kretprobe, 这里每符号一个入口函数把下标带进来。 */
+static int gyro_recv_entry_common(struct kretprobe_instance *ri,
+				  struct pt_regs *regs, int idx)
 {
 	struct gyro_recv_ctx *ctx = (struct gyro_recv_ctx *)ri->data;
 	struct user_msghdr umh;
 	struct pt_regs *ur;
-	struct kretprobe *rp;
-	int idx;
+	bool wrapper = g_gyro_kp_wrapper[idx];
+	unsigned char kind = g_gyro_kp_kind[idx];
 
 	if (READ_ONCE(g_wind_unloading))
 		return 1;
@@ -281,12 +258,11 @@ static int gyro_recv_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!READ_ONCE(g_gyro_sock_enabled))
 		return 1;
 
-	rp = ri->rp;
-	ur = gyro_user_regs(rp, regs);
+	ur = gyro_user_regs(wrapper, regs);
 	if (!ur)
 		return 1;
 
-	if (gyro_kretprobe_kind(rp)) {
+	if (kind) {
 		/* read(fd, buf, count): 平铺缓冲。
 		 * 形状闸门: 长度必须正好是 0x68 的整数倍 —— 传感器队列读的就是
 		 * ASensorEvent 数组。以前不判, system_server 每秒几千次普通 read
@@ -301,9 +277,7 @@ static int gyro_recv_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 			return 1;
 		if (ctx->flat_len % ASENSOR_EVENT_SIZE)
 			return 1;
-		idx = gyro_kretprobe_idx(rp);
-		if (idx >= 0)
-			g_gyro_kp_hits[idx]++;
+		g_gyro_kp_hits[idx]++;
 		ctx->valid = true;
 		return 0;
 	}
@@ -314,14 +288,26 @@ static int gyro_recv_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!umh.msg_iov || !umh.msg_iovlen || umh.msg_iovlen > GYRO_IOV_MAX)
 		return 1;
 
-	idx = gyro_kretprobe_idx(rp);
-	if (idx >= 0)
-		g_gyro_kp_hits[idx]++;
+	g_gyro_kp_hits[idx]++;
 	ctx->iov = umh.msg_iov;
 	ctx->iovlen = umh.msg_iovlen;
 	ctx->valid = true;
 	return 0;
 }
+
+/* 每符号一个入口函数: 编译期带上下标, 绕开 ri->rp 的版本差异 */
+#define GYRO_ENTRY_FN(n)						\
+static int gyro_recv_entry_##n(struct kretprobe_instance *ri,		\
+			       struct pt_regs *regs)			\
+{									\
+	return gyro_recv_entry_common(ri, regs, (n));			\
+}
+GYRO_ENTRY_FN(0)
+GYRO_ENTRY_FN(1)
+GYRO_ENTRY_FN(2)
+GYRO_ENTRY_FN(3)
+GYRO_ENTRY_FN(4)
+GYRO_ENTRY_FN(5)
 
 /* 返回点: 数据已在用户缓冲里, regs_return_value(regs) 是真实字节数 */
 static int gyro_recv_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -421,10 +407,17 @@ static void gyro_sock_reset_stats(void)
 
 int gyro_sock_install(pid_t system_server_tgid)
 {
-	/* 每次安装从 0 开始计, 这样一次测试的 msgs/rewrites 就是这次的数据 */
-	gyro_sock_reset_stats();
 	unsigned int i;
 	int ok = 0;
+
+	/* 每符号一个入口函数: 编译期带上下标, 绕开 ri->rp 的版本差异 */
+	static kretprobe_handler_t entry_fns[GYRO_KP_MAX] = {
+		gyro_recv_entry_0, gyro_recv_entry_1, gyro_recv_entry_2,
+		gyro_recv_entry_3, gyro_recv_entry_4, gyro_recv_entry_5,
+	};
+
+	/* 每次安装从 0 开始计, 这样一次测试的 msgs/rewrites 就是这次的数据 */
+	gyro_sock_reset_stats();
 
 	if (g_gyro_kp_cnt > 0) {
 		WRITE_ONCE(g_gyro_tgid, system_server_tgid);
@@ -440,7 +433,7 @@ int gyro_sock_install(pid_t system_server_tgid)
 		kp = &g_gyro_kps[g_gyro_kp_cnt];
 		memset(kp, 0, sizeof(*kp));
 		kp->kp.symbol_name = g_gyro_cands[i].sym;
-		kp->entry_handler = gyro_recv_entry;
+		kp->entry_handler = entry_fns[g_gyro_kp_cnt];
 		kp->handler = gyro_recv_ret;
 		kp->data_size = sizeof(struct gyro_recv_ctx);
 		kp->maxactive = GYRO_MAXACTIVE;
