@@ -764,19 +764,26 @@ int ace_init(void)
 
 void ace_exit(void)
 {
-	unregister_kprobe(&ace_prop_kp);
-	unregister_kprobe(&ace_fd_kp);
-	unregister_kprobe(&ace_smaps_kp);
-	unregister_kretprobe(&ace_status_krp);
-	unregister_kprobe(&ace_connect_kp);
-	unregister_kprobe(&ace_comm_kp);
-	unregister_kprobe(&ace_statx_kp);
-	unregister_kprobe(&ace_faccess_kp);
-	unregister_kprobe(&ace_open_kp);
-	unregister_kprobe(&ace_status_kp);
-	unregister_kretprobe(&ace_ksym_krp);
-	unregister_kprobe(&ace_mods_kp);
-	unregister_kprobe(&ace_maps_kp);
+	/*
+	 * 只 unregister 已注册的探针。transport != 0 (默认 netlink) 时 ace_init()
+	 * 从不被调用, 这些 kprobe/kretprobe 的 addr 全是 NULL。
+	 * 5.15+ 的 unregister_kretprobes 会无条件 rethook_free(rh)/rph->rp 解引用,
+	 * 对未注册的 kretprobe (rh==NULL) 直接 NULL 解引用 → panic → 卸载重启。
+	 * 因此每个都加 addr 守卫, 与 kgsl_hook_remove() 一致。
+	 */
+	if (ace_prop_kp.addr)         unregister_kprobe(&ace_prop_kp);
+	if (ace_fd_kp.addr)           unregister_kprobe(&ace_fd_kp);
+	if (ace_smaps_kp.addr)        unregister_kprobe(&ace_smaps_kp);
+	if (ace_status_krp.kp.addr)   unregister_kretprobe(&ace_status_krp);
+	if (ace_connect_kp.addr)      unregister_kprobe(&ace_connect_kp);
+	if (ace_comm_kp.addr)         unregister_kprobe(&ace_comm_kp);
+	if (ace_statx_kp.addr)        unregister_kprobe(&ace_statx_kp);
+	if (ace_faccess_kp.addr)      unregister_kprobe(&ace_faccess_kp);
+	if (ace_open_kp.addr)         unregister_kprobe(&ace_open_kp);
+	if (ace_status_kp.addr)       unregister_kprobe(&ace_status_kp);
+	if (ace_ksym_krp.kp.addr)     unregister_kretprobe(&ace_ksym_krp);
+	if (ace_mods_kp.addr)         unregister_kprobe(&ace_mods_kp);
+	if (ace_maps_kp.addr)         unregister_kprobe(&ace_maps_kp);
 	WRITE_ONCE(g_ace_tgid, 0);
 	ACE_LOG("gone\n");
 }
