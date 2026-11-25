@@ -765,7 +765,7 @@ int ace_get_pkgname(uint32_t pid, char *buf, size_t len)
 
 	/* 兜底: argv[0] 读不到时用 comm */
 	if (kbuf[0] == '\0')
-		get_task_comm(kbuf, task);
+		__get_task_comm(kbuf, max, task);
 
 	memcpy(buf, kbuf, max);
 	buf[max - 1] = '\0';
