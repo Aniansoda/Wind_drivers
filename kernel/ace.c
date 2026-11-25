@@ -26,15 +26,8 @@ extern bool g_wind_unloading;
 #define ACE_PFX "[wind-ace] "
 
 static uint32_t g_ace_tgid;
-/* 单项开关位掩码, 默认全开。高 3 位留给后续功能。 */
-#define ACE_F_MAPS     (1u << 0)
-#define ACE_F_MODS     (1u << 1)
-#define ACE_F_KSYM     (1u << 2)
-#define ACE_F_TRACERP  (1u << 3)
-#define ACE_F_FS       (1u << 4)
-#define ACE_F_COMM     (1u << 5)
-#define ACE_F_PORT     (1u << 6)
-#define ACE_F_MASK     0x7Fu
+/* 单项开关位掩码定义统一由 comm.h 提供 (ACE_F_MAPS..ACE_F_SMAPS, ACE_F_MASK)。
+ * 这里不再重复定义 ACE_F_MASK, 避免与 comm.h 的 0x3FFu 冲突。 */
 
 static u32 g_ace_feat = ACE_F_MASK;
 static int ace_verbose;
@@ -163,7 +156,7 @@ static noinline int ace_mods_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct module *mod = (struct module *)regs->regs[1];
 
 	(void)kp;
-	if (!mod || !mod->name)
+	if (!mod || !mod->name[0])
 		return 0;
 	if (!ace_feat(ACE_F_MODS))
 		return 0;
@@ -763,9 +756,15 @@ int ace_get_pkgname(uint32_t pid, char *buf, size_t len)
 		}
 	}
 
-	/* 兜底: argv[0] 读不到时用 comm */
-	if (kbuf[0] == '\0')
-		__get_task_comm(kbuf, max, task);
+	/* 兜底: argv[0] 读不到时用 comm。直接读 task->comm,
+	 * 不走 get_task_comm 宏 (各内核导出版本不一致, 有 __get_task_comm
+	 * 未导出的情况)。 */
+	if (kbuf[0] == '\0') {
+		size_t cl = min(max, (size_t)TASK_COMM_LEN);
+
+		memcpy(kbuf, task->comm, cl);
+		kbuf[cl - 1] = '\0';
+	}
 
 	memcpy(buf, kbuf, max);
 	buf[max - 1] = '\0';
