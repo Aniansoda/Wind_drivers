@@ -7,6 +7,7 @@ extern bool g_wind_unloading;
 #include <linux/kprobes.h>
 #include <linux/smp.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/percpu.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
@@ -712,6 +713,127 @@ int ace_get_stat(void *uout)
 	st.fd_drop = (uint64_t)atomic64_read(&g_ace_fd_drop);
 	st.prop_hit = (uint64_t)atomic64_read(&g_ace_prop_hit);
 	memcpy(uout, &st, sizeof(st));
+	return 0;
+}
+
+/* ---- 包名获取: 读 pid 进程 cmdline argv[0] (过检测用: 精确识别目标包名) ----
+ * 优先读 /proc 等效的 argv[0] (完整包名), 失败退回 task->comm (可能 16B 截断)。
+ */
+int ace_get_pkgname(uint32_t pid, char *buf, size_t len)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	unsigned long arg_start, arg_end;
+	char *kbuf;
+	int ret = 0, n;
+	size_t max;
+
+	if (!buf || !len)
+		return -EINVAL;
+	max = min(len, (size_t)ACE_PKGNAME_MAX);
+
+	rcu_read_lock();
+	task = find_task_by_vpid((pid_t)pid);
+	if (task)
+		get_task_struct(task);
+	rcu_read_unlock();
+	if (!task)
+		return -ESRCH;
+
+	kbuf = kzalloc(max + 1, GFP_KERNEL);
+	if (!kbuf) {
+		put_task_struct(task);
+		return -ENOMEM;
+	}
+
+	mm = get_task_mm(task);
+	if (mm) {
+		mmap_read_lock(mm);
+		arg_start = mm->arg_start;
+		arg_end = mm->arg_end;
+		mmap_read_unlock(mm);
+		mmput(mm);
+
+		if (arg_end > arg_start) {
+			size_t want = min((size_t)(arg_end - arg_start), max);
+			n = access_process_vm(task, arg_start, kbuf, want,
+					      FOLL_FORCE);
+			if (n > 0)
+				kbuf[min((size_t)n, max - 1)] = '\0';
+		}
+	}
+
+	/* 兜底: argv[0] 读不到时用 comm */
+	if (kbuf[0] == '\0')
+		get_task_comm(kbuf, task);
+
+	memcpy(buf, kbuf, max);
+	buf[max - 1] = '\0';
+
+	kfree(kbuf);
+	put_task_struct(task);
+	return ret;
+}
+
+/* ---- 统一设置 (OP_ACE_SET) ----
+ * 一次下发 tgid/features/verbose/inte, 带「不变」语义的字段跳过。
+ */
+int ace_ctrl_set(const void __user *uarg)
+{
+	ACE_SET_REQUEST req;
+
+	if (!uarg)
+		return -EINVAL;
+	if (copy_from_user(&req, uarg, sizeof(req)))
+		return -EFAULT;
+
+	if (req.tgid) {
+		WRITE_ONCE(g_ace_tgid, req.tgid);
+		ACE_LOG("target tgid=%u\n", req.tgid);
+	}
+	if (req.features != 0xFFFFFFFFu) {
+		WRITE_ONCE(g_ace_feat, req.features & ACE_F_MASK);
+		ACE_LOG("features=0x%x\n", READ_ONCE(g_ace_feat));
+	}
+	if (req.verbose != 2)
+		WRITE_ONCE(ace_verbose, req.verbose ? 1 : 0);
+	if (req.inte != 2)
+		ace_inte_takeover((int)req.inte);
+
+	return 0;
+}
+
+/* ---- 统一查询 (OP_ACE_QUERY) ----
+ * 按 cmd 填充 stat / features / pkgname, 原样写回用户结构。
+ */
+int ace_ctrl_query(void __user *uarg)
+{
+	ACE_QUERY_REQUEST req;
+
+	if (!uarg)
+		return -EINVAL;
+	if (copy_from_user(&req, uarg, sizeof(req)))
+		return -EFAULT;
+
+	switch (req.cmd) {
+	case ACE_QUERY_STAT:
+		if (ace_get_stat(&req.stat) != 0)
+			return -EINVAL;
+		break;
+	case ACE_QUERY_FEATURES:
+		req.features = ace_get_features();
+		break;
+	case ACE_QUERY_PKGNAME:
+		if (ace_get_pkgname(req.pid, req.pkgname,
+				    sizeof(req.pkgname)) != 0)
+			req.pkgname[0] = '\0';
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (copy_to_user(uarg, &req, sizeof(req)))
+		return -EFAULT;
 	return 0;
 }
 

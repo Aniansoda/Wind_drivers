@@ -346,31 +346,9 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return clonebp_set_record(req.pid, req.point_index, &req.point);
 	}
 	case OP_ACE_SET:
-		return ace_set_pid((uint32_t)arg);
-	case OP_ACE_SET_FEATURES:
-		return ace_set_features((uint32_t)arg);
-	case OP_ACE_GET_FEATURES:
-	{
-		uint32_t f = ace_get_features();
-
-		if (copy_to_user((void __user *)arg, &f, sizeof(f)) != 0)
-			return -EFAULT;
-		return 0;
-	}
-	case OP_ACE_INTE:
-		return ace_inte_takeover((int)arg) > 0 ? 0 : -ENODEV;
-	case OP_ACE_VERBOSE:
-		return ace_set_verbose((int)arg);
-	case OP_ACE_GET_STAT:
-	{
-		ACE_STAT st;
-
-		if (ace_get_stat(&st) != 0)
-			return -EINVAL;
-		if (copy_to_user((void __user *)arg, &st, sizeof(st)) != 0)
-			return -EFAULT;
-		return 0;
-	}
+		return ace_ctrl_set((const void __user *)arg);
+	case OP_ACE_QUERY:
+		return ace_ctrl_query((void __user *)arg);
 	case OP_CLONEBP_TIMING:
 	{
 		CLONEBP_TIMING_CONFIG in, out;

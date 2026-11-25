@@ -81,11 +81,7 @@ enum OPERATIONS
 	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47,
 
 	OP_ACE_SET              = WIND_OP_BASE + 0x50,
-	OP_ACE_GET_STAT         = WIND_OP_BASE + 0x51,
-	OP_ACE_VERBOSE          = WIND_OP_BASE + 0x52,
-	OP_ACE_INTE             = WIND_OP_BASE + 0x53,
-	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54,
-	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55,
+	OP_ACE_QUERY            = WIND_OP_BASE + 0x51,
 	OP_WRPBP_SET_FREGS      = WIND_OP_BASE + 0x56,
 };
 
@@ -386,6 +382,32 @@ typedef struct _ACE_STAT
 	uint64_t prop_hit;
 } ACE_STAT, *PACE_STAT;
 
+/* ---- ACE 统一设置 (OP_ACE_SET): 0=不变 / 0xFFFFFFFF=不变 / 2=不变 ---- */
+typedef struct _ACE_SET_REQUEST
+{
+	uint32_t tgid;        /* 目标 tgid, 0=不改变 */
+	uint32_t features;    /* 伪装开关位掩码, 0xFFFFFFFF=不改变 */
+	uint32_t verbose;     /* 日志开关, 0/1=关/开, 2=不改变 */
+	uint32_t inte;        /* inte 三节点, 0=接管重建 1=只摘除, 2=不改变 */
+} ACE_SET_REQUEST, *PACE_SET_REQUEST;
+
+/* ---- ACE 统一查询 (OP_ACE_QUERY) ---- */
+#define ACE_QUERY_STAT       1
+#define ACE_QUERY_FEATURES   2
+#define ACE_QUERY_PKGNAME    3
+#define ACE_PKGNAME_MAX      256
+
+typedef struct _ACE_QUERY_REQUEST
+{
+	uint32_t cmd;
+	uint32_t pid;
+	uint32_t reserved0;
+	uint32_t reserved1;
+	ACE_STAT stat;
+	uint32_t features;
+	char     pkgname[ACE_PKGNAME_MAX];
+} ACE_QUERY_REQUEST, *PACE_QUERY_REQUEST;
+
 class c_wind
 {
 public:
@@ -407,20 +429,21 @@ public:
 	int clonebp_set_timing(CLONEBP_TIMING_CONFIG *io) { return io ? xfer(OP_CLONEBP_TIMING, (uintptr_t)io) : -1; }
 
 
-	int ace_set(uint32_t tgid) { return xfer(OP_ACE_SET, (uintptr_t)tgid); }
-	int ace_get_stat(ACE_STAT *out) { return out ? xfer(OP_ACE_GET_STAT, (uintptr_t)out) : -1; }
-	int ace_verbose(int on) { return xfer(OP_ACE_VERBOSE, (uintptr_t)on); }
-	int ace_inte(int mode) { return xfer(OP_ACE_INTE, (uintptr_t)mode); }
-	int ace_set_features(uint32_t mask) { return xfer(OP_ACE_SET_FEATURES, (uintptr_t)mask); }
-	int ace_get_features(uint32_t *out) { return out ? xfer(OP_ACE_GET_FEATURES, (uintptr_t)out) : -1; }
+	int ace_set(uint32_t tgid) { ACE_SET_REQUEST r; memset(&r,0,sizeof(r)); r.tgid=tgid; r.features=0xFFFFFFFFu; r.verbose=2; r.inte=2; return xfer(OP_ACE_SET,(uintptr_t)&r); }
+	int ace_verbose(int on) { ACE_SET_REQUEST r; memset(&r,0,sizeof(r)); r.tgid=0; r.features=0xFFFFFFFFu; r.verbose=on; r.inte=2; return xfer(OP_ACE_SET,(uintptr_t)&r); }
+	int ace_inte(int mode) { ACE_SET_REQUEST r; memset(&r,0,sizeof(r)); r.tgid=0; r.features=0xFFFFFFFFu; r.verbose=2; r.inte=mode; return xfer(OP_ACE_SET,(uintptr_t)&r); }
+	int ace_set_features(uint32_t mask) { ACE_SET_REQUEST r; memset(&r,0,sizeof(r)); r.tgid=0; r.features=mask; r.verbose=2; r.inte=2; return xfer(OP_ACE_SET,(uintptr_t)&r); }
+
+	int ace_get_stat(ACE_STAT *out) { if(!out) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_STAT; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) *out=r.stat; return (int)ret; }
+	int ace_get_features(uint32_t *out) { if(!out) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_FEATURES; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) *out=r.features; return (int)ret; }
+	int ace_get_pkgname(uint32_t pid, char *out, uint32_t cap) { if(!out||!cap) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_PKGNAME; r.pid=pid; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) { snprintf(out,cap,"%s",r.pkgname); } return (int)ret; }
 
 	int ace_enable_feature(uint32_t bit, bool on)
 	{
 		uint32_t cur = 0;
-		uintptr_t ret = xfer(OP_ACE_GET_FEATURES, (uintptr_t)&cur);
-		if (ret < 0) return (int)ret;
+		if (ace_get_features(&cur) < 0) return -1;
 		cur = on ? (cur | bit) : (cur & ~bit);
-		return xfer(OP_ACE_SET_FEATURES, (uintptr_t)cur);
+		return ace_set_features(cur);
 	}
 
 private:

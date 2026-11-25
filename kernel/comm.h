@@ -60,12 +60,8 @@ enum OPERATIONS
 	OP_CLONEBP_CLEAR_RECORDS= WIND_OP_BASE + 0x45, /* 清记录 (-1 全部) */
 	OP_CLONEBP_REFRESH      = WIND_OP_BASE + 0x46, /* 重新克隆影子页(页被重映射后自愈) */
 	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47, /* 时序对抗: 耗时归一化/抖动/兜底阈值 */
-	OP_ACE_SET              = WIND_OP_BASE + 0x50, /* 设 ACE 目标 tgid */
-	OP_ACE_GET_STAT         = WIND_OP_BASE + 0x51, /* 读 ACE 伪装命中计数 */
-	OP_ACE_VERBOSE          = WIND_OP_BASE + 0x52, /* 开关驱动自身日志(默认关) */
-	OP_ACE_SET_FEATURES     = WIND_OP_BASE + 0x54, /* 设单项伪装开关位掩码 */
-	OP_ACE_GET_FEATURES     = WIND_OP_BASE + 0x55, /* 读当前开关位掩码 */
-	OP_ACE_INTE             = WIND_OP_BASE + 0x53, /* 0=接管 inte 三节点(重建假节点) 1=只摘除 */
+	OP_ACE_SET              = WIND_OP_BASE + 0x50, /* ACE 统一设置: tgid/features/verbose/inte */
+	OP_ACE_QUERY            = WIND_OP_BASE + 0x51, /* ACE 统一查询: stat/features/pkgname */
 };
 
 /* ---- 读取模式 ---- */
@@ -386,5 +382,35 @@ typedef struct _ACE_STAT
 	uint64_t fd_drop;        /* /proc/<pid>/fd 枚举被阻断的次数 */
 	uint64_t prop_hit;       /* 属性区共享映射被识别的次数 */
 } ACE_STAT, *PACE_STAT;
+
+/* ---- ACE 统一设置 (OP_ACE_SET): 一次下发全部可设项 ----
+ * 0 表示「不变」的字段语义: tgid==0 不改, features==0xFFFFFFFF 不改,
+ * verbose==2 不改, inte==2 不改。 */
+typedef struct _ACE_SET_REQUEST
+{
+	uint32_t tgid;        /* 目标 tgid, 0=不改变 */
+	uint32_t features;    /* 伪装开关位掩码, 0xFFFFFFFF=不改变 */
+	uint32_t verbose;     /* 日志开关, 0/1=关/开, 2=不改变 */
+	uint32_t inte;        /* inte 三节点, 0=接管重建假节点 1=只摘除, 2=不改变 */
+} ACE_SET_REQUEST, *PACE_SET_REQUEST;
+
+/* ---- ACE 统一查询 (OP_ACE_QUERY) ----
+ * 按 cmd 填充对应输出区; pid 用于 PKGNAME 查询。 */
+#define ACE_QUERY_STAT       1   /* 填 stat */
+#define ACE_QUERY_FEATURES   2   /* 填 features */
+#define ACE_QUERY_PKGNAME    3   /* 按 pid 填 pkgname */
+
+#define ACE_PKGNAME_MAX      256
+
+typedef struct _ACE_QUERY_REQUEST
+{
+	uint32_t cmd;                 /* ACE_QUERY_* */
+	uint32_t pid;                 /* PKGNAME 查询目标 */
+	uint32_t reserved0;
+	uint32_t reserved1;
+	ACE_STAT stat;                /* QUERY_STAT 输出 */
+	uint32_t features;            /* QUERY_FEATURES 输出 */
+	char     pkgname[ACE_PKGNAME_MAX]; /* QUERY_PKGNAME 输出 */
+} ACE_QUERY_REQUEST, *PACE_QUERY_REQUEST;
 
 #endif /* _COMM_H_ */
