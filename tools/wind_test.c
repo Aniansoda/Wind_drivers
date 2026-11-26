@@ -76,6 +76,11 @@ enum {
 
     OP_ACE_SET          = WIND_OP_BASE + 0x50,
     OP_ACE_QUERY        = WIND_OP_BASE + 0x51,
+    OP_PAGE_HOOK        = WIND_OP_BASE + 0x57,
+    OP_HOOK_VIEW        = WIND_OP_BASE + 0x58,
+    OP_PAGEHOOK_STAT    = WIND_OP_BASE + 0x59,
+    OP_MEM_ALLOC        = WIND_OP_BASE + 0x5A,
+    OP_MEM_FREE         = WIND_OP_BASE + 0x5B,
 };
 
 enum { MODE_FAST = 0, MODE_SAFE = 1 };
@@ -306,6 +311,55 @@ typedef struct _ACE_QUERY_REQUEST {
     uint32_t features;
     char     pkgname[ACE_PKGNAME_MAX];
 } ACE_QUERY_REQUEST;
+
+#define PAGE_HOOK_REMOVE     0u
+#define PAGE_HOOK_INSTALL    1u
+#define PAGE_HOOK_PATCH_MAX  256u
+#define PAGE_HOOK_VIEW_DATA  0u
+
+typedef struct _PAGE_HOOK_REQUEST {
+    int32_t  pid;
+    uint32_t action;
+    uint64_t address;
+    uint64_t patch_buffer;
+    uint32_t patch_size;
+    uint32_t flags;
+} PAGE_HOOK_REQUEST;
+
+typedef struct _HOOK_VIEW_REQUEST {
+    int32_t  pid;
+    uint32_t view;
+    uint64_t address;
+} HOOK_VIEW_REQUEST;
+
+#define PAGEHOOK_STAT_MAX_PAGES 16
+
+typedef struct _PAGEHOOK_PAGE_INFO {
+    uint64_t va;
+    uint32_t state;
+    uint32_t pad;
+    uint64_t ifault;
+    uint64_t dfault;
+} PAGEHOOK_PAGE_INFO;
+
+typedef struct _PAGEHOOK_STAT {
+    uint32_t page_cnt;
+    uint32_t page_cnt_used;
+    uint64_t ifault;
+    uint64_t dfault;
+    uint64_t switch_cnt;
+    uint64_t view_orig;
+    PAGEHOOK_PAGE_INFO pages[PAGEHOOK_STAT_MAX_PAGES];
+} PAGEHOOK_STAT;
+
+typedef struct _SHAREMEM_REQUEST {
+    int32_t  pid;
+    uint32_t protection;
+    uint64_t size;
+    uint64_t target_address;
+    uint64_t caller_address;
+    uint64_t allocated_size;
+} SHAREMEM_REQUEST;
 
 typedef struct _WIND_MAP_STATS {
     uint64_t reads;
@@ -664,6 +718,139 @@ static int cmd_ace_get_features(void)
     return (int)r;
 }
 
+/* ---- 页级执行补丁 hook ---- */
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* "D503201F" 或 "d5,03,20,1f" 或 "0xD5,0x03,0x20,0x1F" */
+static uint32_t parse_hex_bytes(const char *s, uint8_t *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    uint8_t byte = 0;
+    int hi = -1;
+
+    while (*s && n < cap) {
+        int c = *s++;
+
+        if (c == ' ' || c == ',' || c == ':' || c == 'x' || c == 'X')
+            continue;
+        if (c == '0' && (*s == 'x' || *s == 'X'))
+            continue;
+        int v = hexval(c);
+        if (v < 0)
+            continue;
+        if (hi < 0) {
+            hi = v;
+        } else {
+            byte = (uint8_t)((hi << 4) | v);
+            out[n++] = byte;
+            hi = -1;
+        }
+    }
+    return n;
+}
+
+static int cmd_page_hook(const char *addr, const char *patch)
+{
+    PAGE_HOOK_REQUEST r;
+    uint8_t buf[PAGE_HOOK_PATCH_MAX];
+    uint32_t n;
+
+    memset(buf, 0, sizeof(buf));
+    n = parse_hex_bytes(patch, buf, sizeof(buf));
+    if (n == 0) {
+        fprintf(stderr, "patch 解析为空\n");
+        return -1;
+    }
+    memset(&r, 0, sizeof(r));
+    r.action = PAGE_HOOK_INSTALL;
+    r.address = strtoull(addr, NULL, 0);
+    r.patch_buffer = (uint64_t)(uintptr_t)buf;
+    r.patch_size = n;
+    r.flags = 0;
+    long ret = nl_call(OP_PAGE_HOOK, (uint64_t)&r);
+    if (ret == 0)
+        printf("  hooked addr=0x%llx len=%u\n",
+               (unsigned long long)r.address, n);
+    return (int)ret;
+}
+
+static int cmd_page_unhook(const char *addr)
+{
+    PAGE_HOOK_REQUEST r;
+
+    memset(&r, 0, sizeof(r));
+    r.action = PAGE_HOOK_REMOVE;
+    r.address = strtoull(addr, NULL, 0);
+    return (int)nl_call(OP_PAGE_HOOK, (uint64_t)&r);
+}
+
+static int cmd_hook_view(const char *addr, const char *view)
+{
+    HOOK_VIEW_REQUEST r;
+
+    memset(&r, 0, sizeof(r));
+    r.view = (uint32_t)strtoul(view, NULL, 0);
+    r.address = strtoull(addr, NULL, 0);
+    return (int)nl_call(OP_HOOK_VIEW, (uint64_t)&r);
+}
+
+static int cmd_pagehook_stat(void)
+{
+    PAGEHOOK_STAT st;
+    uint32_t i;
+
+    memset(&st, 0, sizeof(st));
+    long ret = nl_call(OP_PAGEHOOK_STAT, (uint64_t)&st);
+    if (ret == 0) {
+        printf("  pages=%u ifault=%llu dfault=%llu switch=%llu view_orig=%llu\n",
+               st.page_cnt,
+               (unsigned long long)st.ifault,
+               (unsigned long long)st.dfault,
+               (unsigned long long)st.switch_cnt,
+               (unsigned long long)st.view_orig);
+        for (i = 0; i < st.page_cnt_used && i < PAGEHOOK_STAT_MAX_PAGES; ++i)
+            printf("    [%u] va=0x%llx state=%u ifault=%llu dfault=%llu\n",
+                   i, (unsigned long long)st.pages[i].va, st.pages[i].state,
+                   (unsigned long long)st.pages[i].ifault,
+                   (unsigned long long)st.pages[i].dfault);
+    }
+    return (int)ret;
+}
+
+/* ---- 跨进程共享页 ---- */
+
+static int cmd_mem_alloc(const char *size, const char *prot)
+{
+    SHAREMEM_REQUEST r;
+
+    memset(&r, 0, sizeof(r));
+    r.size = strtoull(size, NULL, 0);
+    r.protection = (uint32_t)strtoul(prot ? prot : "3", NULL, 0);
+    long ret = nl_call(OP_MEM_ALLOC, (uint64_t)&r);
+    if (ret == 0)
+        printf("  caller=0x%llx target=0x%llx size=%llu\n",
+               (unsigned long long)r.caller_address,
+               (unsigned long long)r.target_address,
+               (unsigned long long)r.allocated_size);
+    return (int)ret;
+}
+
+static int cmd_mem_free(const char *target)
+{
+    SHAREMEM_REQUEST r;
+
+    memset(&r, 0, sizeof(r));
+    r.target_address = strtoull(target, NULL, 0);
+    return (int)nl_call(OP_MEM_FREE, (uint64_t)&r);
+}
+
 static int cmd_ace_pkgname(const char *pidstr)
 {
     ACE_QUERY_REQUEST q;
@@ -760,6 +947,15 @@ static int selftest(const char *pidstr)
     r = cmd_ace_stat();                   print_ret("ace-stat", r);
     r = cmd_ace_pkgname(pidstr);          print_ret("ace-pkgname", r);
 
+    /* 页级执行补丁 hook (占位地址, 验证通道) */
+    r = cmd_page_hook("0x7000000000", "1F2003D5"); print_ret("page-hook", r);
+    r = cmd_pagehook_stat();              print_ret("pagehook-stat", r);
+    r = cmd_hook_view("0x7000000000", "0"); print_ret("hook-view", r);
+    r = cmd_page_unhook("0x7000000000");  print_ret("page-unhook", r);
+
+    /* 跨进程共享页 */
+    r = cmd_mem_alloc("4096", "3");       print_ret("mem-alloc", r);
+
     r = nl_call(OP_UNBIND, 0);            print_ret("unbind", r);
 
     printf("== selftest done ==\n");
@@ -808,6 +1004,16 @@ static void usage(const char *argv0)
 "  ace-get-features               读当前位掩码\n"
 "  ace-inte <0|1>                 inte 节点接管/摘除\n"
 "  ace-pkgname <pid>              取进程包名 (cmdline argv[0])\n"
+"\n"
+"页级执行补丁 hook (Satan HOOK_MEMORY 等价):\n"
+"  page-hook <addr> <hexbytes>    安装页 hook, 影子页执行补丁\n"
+"  page-unhook <addr>             移除该页 hook\n"
+"  hook-view <addr> <0>           切回数据视图 (读原始字节)\n"
+"  pagehook-stat                  读页 hook 统计\n"
+"\n"
+"跨进程共享物理页 (Satan ALLOCATE_MEMORY 等价):\n"
+"  mem-alloc <size> [prot]        目标进程+本进程共享页, prot 默认 3 (RW)\n"
+"  mem-free <target_addr>         释放记账\n"
 "\n"
 "浮点字段: 十进制按 float 解析, 0x 前缀按 IEEE754 位模式直通。\n",
         argv0, argv0);
@@ -896,6 +1102,12 @@ int main(int argc, char **argv)
         r = nl_call(OP_ACE_SET, (uint64_t)&s);
     }
     else if (!strcmp(cmd, "ace-get-features")) r = cmd_ace_get_features();
+    else if (!strcmp(cmd, "page-hook")) r = cmd_page_hook(argv[2], argv[3]);
+    else if (!strcmp(cmd, "page-unhook")) r = cmd_page_unhook(argv[2]);
+    else if (!strcmp(cmd, "hook-view")) r = cmd_hook_view(argv[2], argv[3]);
+    else if (!strcmp(cmd, "pagehook-stat")) r = cmd_pagehook_stat();
+    else if (!strcmp(cmd, "mem-alloc")) r = cmd_mem_alloc(argv[2], argc > 3 ? argv[3] : NULL);
+    else if (!strcmp(cmd, "mem-free")) r = cmd_mem_free(argv[2]);
     else if (!strcmp(cmd, "ace-inte")) {
         ACE_SET_REQUEST s;
         memset(&s, 0, sizeof(s));

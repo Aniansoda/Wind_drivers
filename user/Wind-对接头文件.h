@@ -83,6 +83,11 @@ enum OPERATIONS
 	OP_ACE_SET              = WIND_OP_BASE + 0x50,
 	OP_ACE_QUERY            = WIND_OP_BASE + 0x51,
 	OP_WRPBP_SET_FREGS      = WIND_OP_BASE + 0x56,
+	OP_PAGE_HOOK            = WIND_OP_BASE + 0x57,
+	OP_HOOK_VIEW            = WIND_OP_BASE + 0x58,
+	OP_PAGEHOOK_STAT        = WIND_OP_BASE + 0x59,
+	OP_MEM_ALLOC            = WIND_OP_BASE + 0x5A,
+	OP_MEM_FREE             = WIND_OP_BASE + 0x5B,
 };
 
 enum READ_MODE
@@ -408,6 +413,62 @@ typedef struct _ACE_QUERY_REQUEST
 	char     pkgname[ACE_PKGNAME_MAX];
 } ACE_QUERY_REQUEST, *PACE_QUERY_REQUEST;
 
+/* ---- 页级执行补丁 hook (对齐 Satan HOOK_MEMORY) ---- */
+#define PAGE_HOOK_REMOVE     0U
+#define PAGE_HOOK_INSTALL    1U
+#define PAGE_HOOK_PATCH_MAX  256U
+#define PAGE_HOOK_VIEW_DATA  0U
+
+typedef struct _PAGE_HOOK_REQUEST
+{
+	int32_t  pid;
+	uint32_t action;
+	uint64_t address;
+	uint64_t patch_buffer;
+	uint32_t patch_size;
+	uint32_t flags;
+} PAGE_HOOK_REQUEST;
+
+typedef struct _HOOK_VIEW_REQUEST
+{
+	int32_t  pid;
+	uint32_t view;
+	uint64_t address;
+} HOOK_VIEW_REQUEST;
+
+#define PAGEHOOK_STAT_MAX_PAGES 16
+
+typedef struct _PAGEHOOK_PAGE_INFO
+{
+	uint64_t va;
+	uint32_t state;
+	uint32_t pad;
+	uint64_t ifault;
+	uint64_t dfault;
+} PAGEHOOK_PAGE_INFO;
+
+typedef struct _PAGEHOOK_STAT
+{
+	uint32_t page_cnt;
+	uint32_t page_cnt_used;
+	uint64_t ifault;
+	uint64_t dfault;
+	uint64_t switch_cnt;
+	uint64_t view_orig;
+	PAGEHOOK_PAGE_INFO pages[PAGEHOOK_STAT_MAX_PAGES];
+} PAGEHOOK_STAT;
+
+/* ---- 跨进程共享物理页 (对齐 Satan ALLOCATE_MEMORY) ---- */
+typedef struct _SHAREMEM_REQUEST
+{
+	int32_t  pid;
+	uint32_t protection;
+	uint64_t size;
+	uint64_t target_address;
+	uint64_t caller_address;
+	uint64_t allocated_size;
+} SHAREMEM_REQUEST;
+
 class c_wind
 {
 public:
@@ -437,6 +498,74 @@ public:
 	int ace_get_stat(ACE_STAT *out) { if(!out) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_STAT; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) *out=r.stat; return (int)ret; }
 	int ace_get_features(uint32_t *out) { if(!out) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_FEATURES; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) *out=r.features; return (int)ret; }
 	int ace_get_pkgname(uint32_t pid, char *out, uint32_t cap) { if(!out||!cap) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_PKGNAME; r.pid=pid; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) { snprintf(out,cap,"%s",r.pkgname); } return (int)ret; }
+
+	/* ---- 页级执行补丁 hook (对齐 Satan hook/unhook/set_hook_view) ---- */
+
+	/* 在目标地址安装页 hook: 影子页执行 patch, 原始页保持不变 */
+	int page_hook(uintptr_t address, const void *patch, uint32_t size)
+	{
+		PAGE_HOOK_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.pid = 0;
+		r.action = PAGE_HOOK_INSTALL;
+		r.address = (uint64_t)address;
+		r.patch_buffer = (uint64_t)(uintptr_t)patch;
+		r.patch_size = size;
+		r.flags = 0;
+		return (int)xfer(OP_PAGE_HOOK, (uintptr_t)&r);
+	}
+
+	/* 移除目标地址所在页的 hook */
+	int page_unhook(uintptr_t address)
+	{
+		PAGE_HOOK_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.action = PAGE_HOOK_REMOVE;
+		r.address = (uint64_t)address;
+		return (int)xfer(OP_PAGE_HOOK, (uintptr_t)&r);
+	}
+
+	/* 切回数据视图: 读原始字节 (补丁前内容) */
+	int page_set_view_data(uintptr_t address)
+	{
+		HOOK_VIEW_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.view = PAGE_HOOK_VIEW_DATA;
+		r.address = (uint64_t)address;
+		return (int)xfer(OP_HOOK_VIEW, (uintptr_t)&r);
+	}
+
+	int page_hook_stat(PAGEHOOK_STAT *out)
+	{
+		if (!out) return -1;
+		return (int)xfer(OP_PAGEHOOK_STAT, (uintptr_t)out);
+	}
+
+	/* ---- 跨进程共享物理页 (对齐 Satan allocate_shared_memory) ----
+	 * 返回当前进程可直接访问的地址, target 侧地址写进 target_out。
+	 */
+	uintptr_t share_alloc(size_t size, uint32_t prot,
+			      uintptr_t *target_out = nullptr,
+			      size_t *allocated_out = nullptr)
+	{
+		SHAREMEM_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.size = (uint64_t)size;
+		r.protection = prot;
+		if (xfer(OP_MEM_ALLOC, (uintptr_t)&r) != 0)
+			return 0;
+		if (target_out)    *target_out = (uintptr_t)r.target_address;
+		if (allocated_out) *allocated_out = (size_t)r.allocated_size;
+		return (uintptr_t)r.caller_address;
+	}
+
+	int share_free(uintptr_t target_address)
+	{
+		SHAREMEM_REQUEST r;
+		memset(&r, 0, sizeof(r));
+		r.target_address = (uint64_t)target_address;
+		return (int)xfer(OP_MEM_FREE, (uintptr_t)&r);
+	}
 
 	int ace_enable_feature(uint32_t bit, bool on)
 	{

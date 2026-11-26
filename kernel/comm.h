@@ -62,6 +62,15 @@ enum OPERATIONS
 	OP_CLONEBP_TIMING       = WIND_OP_BASE + 0x47, /* 时序对抗: 耗时归一化/抖动/兜底阈值 */
 	OP_ACE_SET              = WIND_OP_BASE + 0x50, /* ACE 统一设置: tgid/features/verbose/inte */
 	OP_ACE_QUERY            = WIND_OP_BASE + 0x51, /* ACE 统一查询: stat/features/pkgname */
+
+	/* 页级执行补丁 hook (对齐 Satan HOOK_MEMORY / SET_HOOK_VIEW) */
+	OP_PAGE_HOOK            = WIND_OP_BASE + 0x57, /* 安装/移除页 hook */
+	OP_HOOK_VIEW            = WIND_OP_BASE + 0x58, /* 切换视图 (只支持 DATA) */
+	OP_PAGEHOOK_STAT        = WIND_OP_BASE + 0x59, /* 读页 hook 统计 */
+
+	/* 跨进程共享物理页 (对齐 Satan ALLOCATE_MEMORY) */
+	OP_MEM_ALLOC            = WIND_OP_BASE + 0x5A, /* 目标进程+调用者共享同一批物理页 */
+	OP_MEM_FREE             = WIND_OP_BASE + 0x5B, /* 释放共享页记账 */
 };
 
 /* ---- 读取模式 ---- */
@@ -402,6 +411,40 @@ typedef struct _ACE_SET_REQUEST
 
 #define ACE_PKGNAME_MAX      256
 
+/* ---- 页级执行补丁 hook (OP_PAGE_HOOK) ----
+ * 与 Satan satan_hook_request 字段一一对应。
+ * install: 克隆目标页到影子页, 在影子页写入 patch, 原始页保持不可执行;
+ *          首次取指触发 IABT, 内核切到影子页执行补丁, 用户读取时再切回。
+ * remove:  拆掉该页 hook, 还原原始页。
+ */
+#define PAGE_HOOK_REMOVE     0U
+#define PAGE_HOOK_INSTALL    1U
+#define PAGE_HOOK_PATCH_MAX  256U
+
+typedef struct _PAGE_HOOK_REQUEST
+{
+	int32_t  pid;           /* 目标进程 PID, 0=用已绑定会话 */
+	uint32_t action;        /* PAGE_HOOK_INSTALL / PAGE_HOOK_REMOVE */
+	uint64_t address;       /* 目标指令虚拟地址 */
+	uint64_t patch_buffer;  /* 调用者进程中的补丁字节缓冲区 */
+	uint32_t patch_size;    /* 补丁长度, 不能跨页, 上限 256 */
+	uint32_t flags;         /* 必须为 0 */
+} PAGE_HOOK_REQUEST, *PPAGE_HOOK_REQUEST;
+
+/* ---- 视图切换 (OP_HOOK_VIEW) ----
+ * 只提供 DATA 视图: 强制把该页切回原始页, 供外部读取补丁前字节。
+ * 页面在 hook 生效期间从未提供可执行的用户视图。
+ */
+#define PAGE_HOOK_VIEW_DATA  0U
+
+typedef struct _HOOK_VIEW_REQUEST
+{
+	int32_t  pid;
+	uint32_t view;          /* 必须为 PAGE_HOOK_VIEW_DATA */
+	uint64_t address;       /* 已 hook 页中的任意地址 */
+} HOOK_VIEW_REQUEST, *PHOOK_VIEW_REQUEST;
+
+
 typedef struct _ACE_QUERY_REQUEST
 {
 	uint32_t cmd;                 /* ACE_QUERY_* */
@@ -412,5 +455,43 @@ typedef struct _ACE_QUERY_REQUEST
 	uint32_t features;            /* QUERY_FEATURES 输出 */
 	char     pkgname[ACE_PKGNAME_MAX]; /* QUERY_PKGNAME 输出 */
 } ACE_QUERY_REQUEST, *PACE_QUERY_REQUEST;
+
+/* ---- 页 hook 统计 (OP_PAGEHOOK_STAT) ---- */
+#define PAGEHOOK_STAT_MAX_PAGES 16
+
+typedef struct _PAGEHOOK_PAGE_INFO
+{
+	uint64_t va;
+	uint32_t state;      /* 0=原始页 1=影子页 2=兜底 */
+	uint32_t pad;
+	uint64_t ifault;
+	uint64_t dfault;
+} PAGEHOOK_PAGE_INFO;
+
+typedef struct _PAGEHOOK_STAT
+{
+	uint32_t page_cnt;
+	uint32_t page_cnt_used;
+	uint64_t ifault;     /* 取指异常(切影子页)次数 */
+	uint64_t dfault;     /* 读取异常(切原始页)次数 */
+	uint64_t switch_cnt;
+	uint64_t view_orig;
+	PAGEHOOK_PAGE_INFO pages[PAGEHOOK_STAT_MAX_PAGES];
+} PAGEHOOK_STAT, *PPAGEHOOK_STAT;
+
+
+/* ---- 跨进程共享页 (OP_MEM_ALLOC) ----
+ * 字段与 Satan satan_allocate_memory_request 一一对应。
+ * 驱动在目标进程和调用者进程各建一段 VMA, 两者映射同一批物理页。
+ */
+typedef struct _SHAREMEM_REQUEST
+{
+	int32_t  pid;             /* 目标进程 PID, 0=用已绑定会话 */
+	uint32_t protection;      /* PROT_READ/PROT_WRITE/PROT_EXEC 组合 */
+	uint64_t size;            /* 请求最小字节数, 4KB 向上对齐 */
+	uint64_t target_address;  /* 输出: 目标进程 VA */
+	uint64_t caller_address;  /* 输出: 调用者进程 VA */
+	uint64_t allocated_size;  /* 输出: 实际映射长度 */
+} SHAREMEM_REQUEST, *PSHAREMEM_REQUEST;
 
 #endif /* _COMM_H_ */

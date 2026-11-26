@@ -23,6 +23,8 @@
 #include "sym.h"
 #include "nlcomm.h"
 #include "clonebp.h"
+#include "pagehook.h"
+#include "sharemem.h"
 #include "wrpbp.h"
 #include <linux/rcupdate.h>
 
@@ -349,6 +351,88 @@ static long dispatch_ioctl(unsigned int cmd, unsigned long arg)
 		return ace_ctrl_set((const void __user *)arg);
 	case OP_ACE_QUERY:
 		return ace_ctrl_query((void __user *)arg);
+	case OP_PAGE_HOOK:
+	{
+		PAGE_HOOK_REQUEST req;
+		struct mm_struct *mm;
+		u8 *kbuf;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (!g_sess || !g_sess->bound || !g_sess->task || !g_sess->task->mm)
+			return -ENOTCONN;
+		mm = g_sess->task->mm;
+		if (req.action == PAGE_HOOK_REMOVE)
+			return pagehook_remove(mm, req.address);
+		if (req.action != PAGE_HOOK_INSTALL)
+			return -EINVAL;
+		if (!req.patch_buffer || !req.patch_size ||
+		    req.patch_size > PAGE_HOOK_PATCH_MAX)
+			return -EINVAL;
+		kbuf = kmalloc(req.patch_size, GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		if (copy_from_user(kbuf, (void __user *)req.patch_buffer,
+				   req.patch_size)) {
+			kfree(kbuf);
+			return -EFAULT;
+		}
+		ret = pagehook_install(mm, req.address, kbuf, req.patch_size);
+		kfree(kbuf);
+		return ret;
+	}
+	case OP_HOOK_VIEW:
+	{
+		HOOK_VIEW_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (!g_sess || !g_sess->bound || !g_sess->task || !g_sess->task->mm)
+			return -ENOTCONN;
+		return pagehook_set_view(g_sess->task->mm, req.address, req.view);
+	}
+	case OP_PAGEHOOK_STAT:
+	{
+		PAGEHOOK_STAT st;
+
+		pagehook_get_stat(&st);
+		if (copy_to_user((void __user *)arg, &st, sizeof(st)))
+			return -EFAULT;
+		return 0;
+	}
+	case OP_MEM_ALLOC:
+	{
+		SHAREMEM_REQUEST req;
+		u64 tva = 0, cva = 0, sz = 0;
+		int ret;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (!g_sess || !g_sess->bound || !g_sess->task || !g_sess->task->mm)
+			return -ENOTCONN;
+		ret = sharemem_alloc(g_sess->task->mm, current->mm,
+				     req.size, req.protection, &tva, &cva, &sz);
+		if (ret)
+			return ret;
+		req.target_address = tva;
+		req.caller_address = cva;
+		req.allocated_size = sz;
+		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+			return -EFAULT;
+		return 0;
+	}
+	case OP_MEM_FREE:
+	{
+		SHAREMEM_REQUEST req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (!g_sess || !g_sess->bound)
+			return -ENOTCONN;
+		return sharemem_free(g_sess->task ? g_sess->task->mm : NULL,
+				     req.target_address);
+	}
 	case OP_CLONEBP_TIMING:
 	{
 		CLONEBP_TIMING_CONFIG in, out;
@@ -664,6 +748,8 @@ static int __init driver_entry(void)
 	/* clonebp 的 g_cb_points 必须无条件初始化: transport 默认 3 时
 	 * 不走 transport==0 分支, 若只在分支里 init, g_cb_points 保持 NULL,
 	 * clonebp_set -> cb_alloc_point 解引用 NULL -> OOPS/看门狗重启。 */
+	sharemem_module_init();
+	pagehook_module_init();
 	if (clonebp_module_init() != 0)
 		pr_err("[wind] clonebp init failed\n");
 	wrpbp_module_init();
@@ -738,6 +824,8 @@ static void __exit driver_unload(void)
 	printk("[+] wind: -hide\n");
 	ace_exit();
 	printk("[+] wind: -ace\n");
+	sharemem_module_exit();
+	pagehook_module_exit();
 	clonebp_module_exit();
 	printk("[+] wind: -clonebp\n");
 	wrpbp_module_exit();
