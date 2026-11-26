@@ -5,7 +5,7 @@
  *
  * 做法:
  *   1. alloc_pages 拿一批页(物理连续不必需, 逐页映射)
- *   2. 在目标进程 mm 里建一段匿名 VMA(kthread_use_mm + vm_mmap),
+ *   2. 在目标进程 mm 里建一段匿名 VMA(wind_kthread_use_mm + vm_mmap),
  *      再用 remap_pfn_range 把我们的页顶掉匿名页
  *   3. 在调用者进程 mm 里同样建 VMA 并 remap 同一批页
  *   两个 VA 指向同一物理页, 任一侧写入另一侧立即可见。
@@ -31,6 +31,7 @@ extern bool g_wind_unloading;
 #include <linux/pid.h>
 #include <linux/highmem.h>
 
+#include "sym.h"
 #include "sharemem.h"
 #include "comm.h"
 
@@ -66,10 +67,10 @@ static int sm_mmap_thread(void *arg)
 {
 	struct sm_mmap_work *w = arg;
 
-	kthread_use_mm(w->mm);
+	wind_kthread_use_mm(w->mm);
 	w->addr = vm_mmap(NULL, 0, w->len, w->prot,
 			  MAP_PRIVATE | MAP_ANONYMOUS, 0);
-	kthread_unuse_mm(w->mm);
+	wind_kthread_unuse_mm(w->mm);
 	w->ret = IS_ERR_VALUE(w->addr) ? -ENOMEM : 0;
 	if (w->ret)
 		w->addr = 0;

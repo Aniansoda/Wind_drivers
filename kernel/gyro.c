@@ -112,6 +112,7 @@ extern bool g_wind_unloading;
 /* 用户态一帧都没推的时候, 以前 gyro-diag 一行都不会出, 看起来像"驱动没反应"。
  * 改成独立心跳: 装上之后每 2 秒一条, 不管用户态推没推。 */
 static struct delayed_work gyro_diag_work;
+static bool gyro_diag_work_inited;   /* INIT_DELAYED_WORK 是否跑过 */
 static unsigned int gyro_diag_dumps;
 
 static void gyro_diag_tick(struct work_struct *w)
@@ -740,6 +741,7 @@ int gyro_install(pid_t pid)
 		printk(KERN_INFO "gyro: socket 路线已启用 tgid=%d\n", pid);
 		gyro_diag_dumps = 0;
 		INIT_DELAYED_WORK(&gyro_diag_work, gyro_diag_tick);
+		gyro_diag_work_inited = true;
 		schedule_delayed_work(&gyro_diag_work, 2 * HZ);
 		return 0;
 	}
@@ -756,8 +758,14 @@ int gyro_install(pid_t pid)
 
 void gyro_remove(void)
 {
-	/* 先停心跳, 否则卸载过程中还会有一条 tick 打到已经拆掉的 kprobe 上 */
-	cancel_delayed_work_sync(&gyro_diag_work);
+	/* 先停心跳, 否则卸载过程中还会有一条 tick 打到已经拆掉的 kprobe 上。
+	 * 心跳只在 socket 路线装成功后才 INIT, 从没装过就 rmmod 时
+	 * cancel 一个未初始化的 delayed_work 会打 WARN + Call trace
+	 * (日志里 gyro_remove+0x1c/0x98 那条), 所以先看标志。 */
+	if (gyro_diag_work_inited) {
+		cancel_delayed_work_sync(&gyro_diag_work);
+		gyro_diag_work_inited = false;
+	}
 	gyro_sock_remove();
 	if (gyro_bp)
 	{
