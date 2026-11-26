@@ -569,9 +569,16 @@ static int cmd_wrpbp_config(void)
 {
     WRPBP_CONFIG cfg;
     long r = nl_call(OP_WRPBP_GET_CONFIG, (uint64_t)&cfg);
-    if (r == 0)
+    if (r == 0) {
         printf("  active=%u watch_addr=0x%08x%08x\n", cfg.active_count,
                cfg.watch_addr_hi, cfg.watch_addr_lo);
+        /* skipped 在涨 = 卡写修复生效(pc 被推进, store 没有重试) */
+        printf("  skipped=%u writes=%u fails=%u\n",
+               cfg.skipped, cfg.writes, cfg.fails);
+        if (cfg.writes && !cfg.skipped)
+            printf("  [warn] 有写回但没有跳过: 目标可能是 32 位 compat 任务, "
+                   "或 wind_wrp_skip_store=0\n");
+    }
     return (int)r;
 }
 
