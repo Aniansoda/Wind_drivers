@@ -17,6 +17,7 @@ extern bool g_wind_unloading;
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/version.h>
 #include <linux/mman.h>   /* PROT_* / MAP_* / vm_mmap */
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -125,7 +126,16 @@ static int sm_remap_in(struct mm_struct *mm, unsigned long va,
 	/* 直接 remap 覆盖匿名页 PTE。zap_page_range_single 不导出给模块,
 	 * 这里不做显式 zap: remap_pfn_range 会重写该范围 PTE, 被覆盖的
 	 * 匿名页随 vma 回收释放。 */
+	/* 6.1 起 vm_flags 是 const(vm_flags_t), 不能直接 |=. 6.3 才引入
+	 * vm_flags_set(), 所以 6.1/6.2 只能绕过 const 限定。
+	 * 字段本身是普通 unsigned long, 语义不变。 */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0))
+	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+	*(vm_flags_t *)&vma->vm_flags |= VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+#else
 	vma->vm_flags |= VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
 	vma->vm_pgoff = 0;
 
 	for (i = 0; i < nr; ++i) {
