@@ -449,6 +449,69 @@ typedef struct _SHAREMEM_REQUEST
 	uint64_t allocated_size;
 } SHAREMEM_REQUEST;
 
+/* 与内核 comm.h 对拍: 结构对不上会静默读错字段, 用编译期断言挡住。
+ * 内核侧 WRPBP_CONFIG 已扩到 32 字节(加 skipped/writes/fails),
+ * 老客户端只开到 16 字节时, copy_to_user 会写穿用户栈。 */
+static_assert(sizeof(WRPBP_POINT_CONFIG) == 32, "WRPBP_POINT_CONFIG 必须 32 字节");
+static_assert(sizeof(WRPBP_CONFIG) == 32, "WRPBP_CONFIG 必须 32 字节");
+static_assert(sizeof(WRPBP_VEC_REQUEST) == 24, "WRPBP_VEC_REQUEST 必须 24 字节");
+static_assert(sizeof(PAGE_HOOK_REQUEST) == 32, "PAGE_HOOK_REQUEST 必须 32 字节");
+static_assert(sizeof(HOOK_VIEW_REQUEST) == 16, "HOOK_VIEW_REQUEST 必须 16 字节");
+static_assert(sizeof(SHAREMEM_REQUEST) == 40, "SHAREMEM_REQUEST 必须 40 字节");
+
+/*
+ * c_wind —— Wind 驱动用户态封装（净荷零依赖，只需 C++11 与 linux/netlink.h）
+ *
+ * 通道
+ *   netlink AF_NETLINK unit 29（默认，范围 29..35），需 bind nl_pid=getpid()
+ *   WIND_NL_MSG{magic, op, arg, result} 塞在 nlmsghdr 之后
+ *   所有 op 高 16 位固定 0x574E（"WN"）
+ *
+ * 能力分组
+ *   会话       initialize / unbind / is_bound / target_pid
+ *   内存       read / write / read_batch / write_batch / module_base / set_mode
+ *   隐藏       hide_file / hide_process / unhide_all / kgsl_hook / kgsl_hide
+ *   陀螺仪     gyro_install / gyro_remove / gyro_set / gyro_enable / gyro_stop
+ *   克隆页断点 clonebp_set / clonebp_remove / clonebp_get_config / clonebp_get_records
+ *   ACE 伪装   ace_set / ace_verbose / ace_inte / ace_set_features /
+ *              ace_get_features / ace_get_stat / ace_get_pkgname
+ *   页 hook    page_hook / page_unhook / page_set_view_data / page_hook_stat
+ *   共享页     share_alloc / share_free
+ *   WRP 观察点 wrpbp_set / wrpbp_set_one / wrpbp_set_vec / wrpbp_set_fregs /
+ *              wrpbp_get_config / wrpbp_get_records / wrpbp_skip_active
+ *
+ * ACE 两个 opcode 覆盖原来六个
+ *   OP_ACE_SET   (0x50) ACE_SET_REQUEST{tgid,features,verbose,inte}
+ *                      0 / 0xFFFFFFFF / 2 / 2 表示该字段不改
+ *   OP_ACE_QUERY (0x51) ACE_QUERY_REQUEST{cmd,pid,...}
+ *                      cmd=1 取 ACE_STAT，cmd=2 取 features，cmd=3 取 pkgname
+ *
+ * WRP 观察点（0x26..0x2B / 0x56）
+ *   OP_WRPBP_SET (0x26) WRPBP_SET_REQUEST{pid, point_count, points[]}
+ *                       pid 由 wrpbp_set() 自动填当前绑定 pid，
+ *                       手拼请求漏填 pid 会被内核当成 find_task_by_vpid(0)
+ *                       返回 NULL，表现成"绑定了但追踪点没下发"
+ *   OP_WRPBP_SET_VEC (0x2A) mask bit0=x bit1=y bit2=z，默认 0x7 三位全写
+ *   卡写语义: arm64 的 WRP 在 store 提交前 trap。内核写回目标地址后必须
+ *   推进 pc 跳过那条 store（wind_wrp_skip_store=1），否则 CPU 重试会覆盖
+ *   写回值，并再次命中同一观察点，把线程卡死在这条指令上——后续 netlink
+ *   命令（含 bind）就再也发不出去。用户态用 wrpbp_skip_active() 或
+ *   WRPBP_CONFIG.skipped 确认跳过真的在发生。
+ *
+ * 页级执行补丁 hook（对齐 Satan HOOK_MEMORY / SET_HOOK_VIEW）
+ *   OP_PAGE_HOOK      (0x57) PAGE_HOOK_REQUEST{pid,action,address,patch_buffer,patch_size,flags}
+ *   OP_HOOK_VIEW      (0x58) HOOK_VIEW_REQUEST{pid,view,address}，view 只支持 0=DATA
+ *   OP_PAGEHOOK_STAT  (0x59) PAGEHOOK_STAT
+ *   同 VA 双物理页：原始页用户可读不可执行，影子页可执行；取指走影子、读取走原始
+ *
+ * 跨进程共享物理页（对齐 Satan ALLOCATE_MEMORY）
+ *   OP_MEM_ALLOC (0x5A) SHAREMEM_REQUEST，返回 target_address 与 caller_address
+ *   OP_MEM_FREE  (0x5B)
+ *
+ * 注意
+ *   sizeof(c_wind) 约 48 KB，其中 47 KB 是帧缓存表（2048 槽），
+ *   局部实例建议 new 到堆上，避免爆栈。
+ */
 class c_wind
 {
 public:
@@ -493,7 +556,6 @@ public:
 		return (int)xfer(OP_PAGE_HOOK, (uintptr_t)&r);
 	}
 
-	/* 移除目标地址所在页的 hook */
 	int page_unhook(uintptr_t address)
 	{
 		PAGE_HOOK_REQUEST r;
@@ -503,7 +565,6 @@ public:
 		return (int)xfer(OP_PAGE_HOOK, (uintptr_t)&r);
 	}
 
-	/* 切回数据视图: 读原始字节 (补丁前内容) */
 	int page_set_view_data(uintptr_t address)
 	{
 		HOOK_VIEW_REQUEST r;
@@ -781,9 +842,12 @@ public:
 		return ret;
 	}
 
-	/* 单点便捷版: 装一个写观察点 */
+	/* 单点便捷版: 装一个观察点。
+	 * type 取 enum BP_TYPE: WRITE=3 只抓写, RW=4 读写都抓。
+	 * 向量追踪一律用 WRITE —— 只抓游戏自己的写入, 少一半异常,
+	 * 也不会把我们自己的回读当成命中。 */
 	int wrpbp_set_one(uint64_t watch_addr, uint32_t watch_len = 4,
-			  uint32_t type = 1 /* BP_TYPE_WRITE */)
+			  uint32_t type = BP_TYPE_WRITE)
 	{
 		WRPBP_POINT_CONFIG pt;
 
@@ -791,7 +855,7 @@ public:
 		pt.watch_addr = watch_addr;
 		pt.watch_len = watch_len;
 		pt.type = type;
-		pt.components = 0x7;
+		pt.components = HWBP_MASK_ALL;
 		return wrpbp_set(&pt, 1);
 	}
 
@@ -802,17 +866,107 @@ public:
 		return out ? (int)xfer_impl(OP_WRPBP_GET_CONFIG, (uintptr_t)out) : -1;
 	}
 
+	/* 观察点写回: mask bit0=x bit1=y bit2=z。
+	 * 默认 0x7 三位全写 —— 向量追踪只改 x/y 会让 z 每帧都像"漂移",
+	 * 上层判 dirty 时又会因为 z 变化反复重发, 两边互相踢。
+	 * 参数直接收 float, 内部转位模式, 省得调用方自己 memcpy。 */
 	int wrpbp_set_vec(int32_t point_index, uint32_t enable,
-			  uint32_t x, uint32_t y, uint32_t z, uint32_t mask)
+			  float x, float y, float z, uint32_t mask = HWBP_MASK_ALL)
 	{
 		WRPBP_VEC_REQUEST r;
 
 		memset(&r, 0, sizeof(r));
 		r.point_index = point_index;
 		r.enable = enable;
-		r.x = x; r.y = y; r.z = z;
+		memcpy(&r.x, &x, sizeof(r.x));
+		memcpy(&r.y, &y, sizeof(r.y));
+		memcpy(&r.z, &z, sizeof(r.z));
 		r.mask = mask;
 		return (int)xfer_impl(OP_WRPBP_SET_VEC, (uintptr_t)&r);
+	}
+
+	/* 等价的 float 重载, 给已经抱着 float 的调用方 */
+	int wrpbp_set_vec_f(int32_t point_index, uint32_t enable,
+			    float x, float y, float z,
+			    uint32_t mask = HWBP_MASK_ALL)
+	{
+		return wrpbp_set_vec(point_index, enable, x, y, z, mask);
+	}
+
+	/* 位模式版: 调用方手里是 u32 位模式时用这个 */
+	int wrpbp_set_vec_bits(int32_t point_index, uint32_t enable,
+			       uint32_t xb, uint32_t yb, uint32_t zb,
+			       uint32_t mask = HWBP_MASK_ALL)
+	{
+		WRPBP_VEC_REQUEST r;
+
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.enable = enable;
+		r.x = xb; r.y = yb; r.z = zb;
+		r.mask = mask;
+		return (int)xfer_impl(OP_WRPBP_SET_VEC, (uintptr_t)&r);
+	}
+
+	/* 停止写回, 观察点保留(页表/调试寄存器都不动) */
+	int wrpbp_pause()
+	{
+		return wrpbp_set_vec(-1, 0, 0.0f, 0.0f, 0.0f, HWBP_MASK_ALL);
+	}
+
+	/* 浮点寄存器通道: 命中时改 S[freg_base..+n] 而不是内存 */
+	int wrpbp_set_fregs(int32_t point_index, uint32_t freg_base,
+			    uint32_t freg_mask, const float *vals, uint32_t count)
+	{
+		WRPBP_FREGS_REQUEST r;
+		uint32_t k, n = count;
+
+		if (n > CLONEBP_FREG_MAX)
+			n = CLONEBP_FREG_MAX;
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.freg_base = freg_base;
+		r.freg_mask = freg_mask;
+		for (k = 0; k < n; ++k)
+			memcpy(&r.freg_val[k], &vals[k], sizeof(r.freg_val[k]));
+		return (int)xfer_impl(OP_WRPBP_SET_FREGS, (uintptr_t)&r);
+	}
+
+	int wrpbp_get_records(uint32_t point_index, uint32_t start,
+			      HWBP_RECORD *recs, uint32_t cap, uint32_t *cnt)
+	{
+		WRPBP_RECORDS_REQUEST r;
+
+		if (!recs || !cap)
+			return -1;
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.start_index = start;
+		r.capacity = cap;
+		r.records = recs;
+		r.count_out = cnt;
+		return (int)xfer_impl(OP_WRPBP_GET_RECORDS, (uintptr_t)&r);
+	}
+
+	int wrpbp_clear_records(int32_t point_index = -1)
+	{
+		return (int)xfer_impl(OP_WRPBP_CLEAR_RECORDS,
+				      (uintptr_t)(intptr_t)point_index);
+	}
+
+	/* 卡写修复是否真的在生效:
+	 *   skipped 增长 -> 内核推进了 pc, store 没有被重试, 写回能留住
+	 *   writes 涨而 skipped 不涨 -> 32 位 compat 任务, 或
+	 *                                insmod 时 wind_wrp_skip_store=0
+	 *   fails 涨 -> 观察点落在只读 VMA, 内存通道写不进去
+	 * 返回 1 表示跳过计数在工作, 0 表示没在跳, -1 表示查不到。 */
+	int wrpbp_skip_active()
+	{
+		WRPBP_CONFIG cfg;
+
+		if (wrpbp_get_config(&cfg) != 0)
+			return -1;
+		return cfg.skipped ? 1 : 0;
 	}
 
 	int set_mode(int mode)
