@@ -45,7 +45,10 @@ Android / Linux ARM64 向けカーネル空間メモリアクセス・デバッ�
 | コード | 旧 | 現 |
 |---|---|---|
 | `0x38..0x3D` | 予約 | 廃止、定義しない |
-| `0x50..0x55` | — | **ACE 検出回避カモフラージュ**、10 feature bit / 11 kprobe |
+| `0x50..0x51` | 独立 6 opcode | **ACE を 2 つに統合**: `OP_ACE_SET` 統一設定、`OP_ACE_QUERY` 統一取得 |
+| `0x51` | — | `ACE_QUERY_PKGNAME` 追加、cmdline `argv[0]` から**完全なパッケージ名**（comm の 16 バイト切り詰めなし） |
+| `0x57..0x59` | — | **ページ単位の実行パッチ hook**、同一 VA に 2 物理ページ、取指は影ページ・読み取りは元ページ |
+| `0x5A..0x5B` | — | **プロセス間共有物理ページ**、対象と呼び出し側が同じページを指す |
 | `0x33` | — | `OP_STATS` キャッシュ統計 |
 | ジャイロ | 実行ブレークポイント常駐 | 実行ブレークポイントで位置特定 → **WRP 定常状態へ移行**、X/Y のみ書換、Z は窓に入れない |
 | シンボル | 直接参照 | ホワイトリスト外 32 個を `register_kprobe` で実行時解決 |
@@ -170,13 +173,72 @@ insmod wind.ko transport=0            # 通信路なしで読み込みのみ、�
 
 | コード | 名前 | 引数 | 機能 |
 |---|---|---|---|
-| 0x50 | `OP_ACE_SET` | tgid | カモフラージュ対象を指定、0 で解除 |
-| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | 10 項目のヒット数を読む |
-| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | モジュール自身のログ切替、既定はオフ |
-| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` ノードの接収 / 摘除のみ |
-| 0x54 | `OP_ACE_SET_FEATURES` | ビットマスク | 10 個のスイッチを書く、下位 10 ビット |
+| 0x50 | `OP_ACE_SET` | `ACE_SET_REQUEST*` | 統一設定: 対象 tgid + 機能ビット + ログ + inte |
+| 0x51 | `OP_ACE_QUERY` | `ACE_QUERY_REQUEST*` | 統一取得: 統計 / ビットマスク / パッケージ名 |
 
-詳細は `README.md` の「8 ACE 反检测伪装」を参照
+2 つの opcode で従来の 6 つを置き換え、機能は一つも落としていない。
+各フィールドは「変更しない」センチネル付きで、1 回の呼び出しで 1 項目だけ変えられる:
+
+```c
+typedef struct _ACE_SET_REQUEST {
+    uint32_t tgid;      /* 0          = 変更しない */
+    uint32_t features;  /* 0xFFFFFFFF = 変更しない */
+    uint32_t verbose;   /* 0/1 = オフ/オン, 2 = 変更しない */
+    uint32_t inte;      /* 0 = 偽ノード再構築, 1 = 摘除のみ, 2 = 変更しない */
+} ACE_SET_REQUEST;
+```
+
+照会は `cmd` で分岐し、1 往復で全部返す:
+
+| `cmd` | 定数 | 出力 |
+|---|---|---|
+| 1 | `ACE_QUERY_STAT` | `stat` (`ACE_STAT`、10 項目 + 現在の features) |
+| 2 | `ACE_QUERY_FEATURES` | `features` |
+| 3 | `ACE_QUERY_PKGNAME` | `pkgname[256]`、引数 `pid` で照会 |
+
+**パッケージ名照会を追加した理由** `task->comm` は 16 バイトしかなく、
+`com.tencent.tmgp.sgame` は `com.tencent.tmg` に切り詰められ、それで照合すると必ず誤判定する。
+新 API は `mm->arg_start` から `argv[0]` を直接読み、完全なパッケージ名を返すので、
+プロセス再起動後も pid 頼みではなく名前で tgid を再バインドできる。
+
+### ページ単位の実行パッチ hook
+
+| コード | 名前 | 引数 | 機能 |
+|---|---|---|---|
+| 0x57 | `OP_PAGE_HOOK` | `PAGE_HOOK_REQUEST*` | ページ hook の設置 / 解除 |
+| 0x58 | `OP_HOOK_VIEW` | `HOOK_VIEW_REQUEST*` | データビューに戻し元のバイトを読む |
+| 0x59 | `OP_PAGEHOOK_STAT` | `PAGEHOOK_STAT*` | ページ hook の統計 |
+
+```c
+typedef struct _PAGE_HOOK_REQUEST {
+    int32_t  pid;           /* 0 = バインド済みセッションを使う */
+    uint32_t action;        /* 0 = REMOVE, 1 = INSTALL */
+    uint64_t address;       /* 対象命令の VA */
+    uint64_t patch_buffer;  /* 呼び出し側プロセスのパッチバイト */
+    uint32_t patch_size;    /* ページを跨げない、上限 256 */
+    uint32_t flags;         /* 必ず 0 */
+} PAGE_HOOK_REQUEST;
+```
+
+### プロセス間で共有する物理ページ
+
+| コード | 名前 | 引数 | 機能 |
+|---|---|---|---|
+| 0x5A | `OP_MEM_ALLOC` | `SHAREMEM_REQUEST*` | 対象プロセスと呼び出し側に同じ物理ページを対応付ける |
+| 0x5B | `OP_MEM_FREE` | `SHAREMEM_REQUEST*` | 記帳を解放 |
+
+```c
+typedef struct _SHAREMEM_REQUEST {
+    int32_t  pid;             /* 0 = バインド済みセッションを使う */
+    uint32_t protection;      /* PROT_READ / WRITE / EXEC の組み合わせ */
+    uint64_t size;            /* 要求バイト数、4 KiB 切り上げ */
+    uint64_t target_address;  /* 出力: 対象プロセスの VA */
+    uint64_t caller_address;  /* 出力: 呼び出し側プロセスの VA */
+    uint64_t allocated_size;  /* 出力: 実際のマップ長 */
+} SHAREMEM_REQUEST;
+```
+
+ページ hook と共有ページの詳細は `README.md` の「9 / 10」節を参照
 
 
 ---

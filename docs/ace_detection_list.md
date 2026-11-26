@@ -6,7 +6,7 @@
 
 | ID | 检测点 | ACE 实现证据 | 观测手段 | 驱动对策 | 状态 |
 |---|---|---|---|---|---|
-| A1 | 外挂进程可见性 | `mvm_bk_proc`/`mvm_bk_task`、ckguard `/proc/%u/cmdline`+`getPackageName` | 遍历 `/proc/*/cmdline` 比对黑名单/包名 | `hide_process()` 走 `filldir64` | **强/已有** |
+| A1 | 外挂进程可见性 | `mvm_bk_proc`/`mvm_bk_task`、ckguard `/proc/%u/cmdline`+`getPackageName` | 遍历 `/proc/*/cmdline` 比对黑名单/包名 | `hide_process()` 走 `filldir64`；己方定位用 `ace_get_pkgname()` 读完整 `argv[0]`（不受 comm 16 字节截断），进程重启后按包名重绑 | **强/已有** |
 | A2 | 启动链 | `/proc/<pid>/stat` ppid | 父进程非 zygote 则可疑 | 需伪造 stat 输出 | 中/**已实现** |
 | A3 | 线程名 | `/proc/<pid>/task/*/comm` | 找 `gum-js-loop`、`gmain` 等 | 需过滤 comm | 中/**已实现** |
 | A4 | 进程数量异常 | 遍历 /proc 计数 | 统计频次 | 同 A1 | 弱/已有 |
@@ -18,7 +18,7 @@
 | B1 | 注入 so 可见 | 常规 + `.got.plt` 串 | `/proc/self/maps` | `show_map_vma` 过滤 | 强/新写 |
 | B2 | 匿名可执行段 | 同上 | maps 里 `rwxp` 且无文件 | 同 B1 扩展 | 强/新写 |
 | B3 | memfd/ashmem 加载 | 同上 | maps 中 `/memfd:` | 同 B1 | 中/新写 |
-| B4 | 双映射页表 | page table walk | 同 VA 两物理页 | clonebp `bailout_max` 下调 | 强/已有 |
+| B4 | 双映射页表 | page table walk | 同 VA 两物理页 | clonebp `bailout_max` 下调；`OP_PAGE_HOOK` 与 clonebp 同构（原始页不可执行 / 影子页可执行），同页命中各自分流 | 强/已有 |
 | B5 | 自身不可 dump | **动态验证** `/proc/<pid>/mem` → I/O error | `prctl(PR_GET_DUMPABLE)` 复检 | 保持 0，改回反被发现 | 强/无需 |
 
 ## C 调试器面
@@ -28,7 +28,7 @@
 | C1 | TracerPid | `debugger=%s`、`ptrace` | `/proc/self/status` | `proc_pid_status` 临时清 `task->ptrace` | 强/新写 |
 | C2 | ptrace 自附加 | `ptrace` | `ptrace(ATTACH,self)` 成功=无调试器 | 保持默认 | 强/无需 |
 | C3 | 硬件断点占用 | — | `PR_GET_HWBP`/调试寄存器读 | clonebp 不占 BRP | 中/已有 |
-| C4 | 断点指令扫描 | — | 比对 `.text` 找 `BRK`/`0xcc` | clonebp 不改原页字节 | 中/已有 |
+| C4 | 断点指令扫描 | — | 比对 `.text` 找 `BRK`/`0xcc` | clonebp 不改原页字节；`OP_PAGE_HOOK` 也不写 BRK，补丁只在影子页 | 中/已有 |
 
 ## D 内核面
 
@@ -70,7 +70,7 @@
 
 | ID | 检测点 | 证据 | 观测手段 | 驱动对策 | 状态 |
 |---|---|---|---|---|---|
-| H1 | 页表 hook 耗时 | 页表差异+计时 | 同页读/执行交替测方差 | clonebp `CB_TM_BALANCE` | 强/已有 |
+| H1 | 页表 hook 耗时 | 页表差异+计时 | 同页读/执行交替测方差 | clonebp `CB_TM_BALANCE`；`OP_HOOK_VIEW(DATA)` 可预先把页切回原始态，省掉一次异常往返 | 强/已有 |
 | H2 | 单次异常首项离群 | 同上 | 同址连读 N 次 | `CB_TM_JITTER` + `bailout_max` | 强/已有 |
 
 ## I 完整性面
@@ -89,6 +89,25 @@
 | 已实现 | 11 | B1 B2 B3 C1 D1 D2 D3 E1 E2 E3 A3 G1 |
 | 待实现 | 6 | A2 D5 E5 F1 F2 F3 F4 |
 | 无需/服务端 | 5 | B5 E4 G2 I1 I2 |
+
+## 驱动接口对照（本轮新增）
+
+| 检测面 | 接口 | opcode | 说明 |
+|---|---|---|---|
+| A1 进程定位 | `OP_ACE_QUERY` + `ACE_QUERY_PKGNAME` | 0x51 | 读 `mm->arg_start` 的 `argv[0]`，拿完整包名；失败退回 `task->comm` |
+| B4 双映射 | `OP_PAGE_HOOK` | 0x57 | 同 VA 双物理页，原始页不可执行、影子页可执行 |
+| B4 双映射 | `OP_HOOK_VIEW` | 0x58 | 强制切回原始页，读补丁前字节 |
+| C4 指令完整 | `OP_PAGE_HOOK` | 0x57 | 不写 BRK、不改原页字节，补丁只在影子页 |
+| H1 时序 | `OP_HOOK_VIEW` | 0x58 | 预切原始页，减少异常往返次数 |
+| — 观测 | `OP_PAGEHOOK_STAT` | 0x59 | 每页 ifault / dfault / 当前 state |
+| — 载荷投放 | `OP_MEM_ALLOC` | 0x5A | 目标进程与调用者共享同一批物理页 |
+| — 载荷回收 | `OP_MEM_FREE` | 0x5B | 释放记账 |
+
+ACE 主接口从 6 个 opcode 合并为 2 个，功能未减：
+`OP_ACE_SET`(0x50) 统一设置 tgid / features / verbose / inte，
+`OP_ACE_QUERY`(0x51) 统一查询 stat / features / pkgname。
+
+---
 
 ## 优先级
 

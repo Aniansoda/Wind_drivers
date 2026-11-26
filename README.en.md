@@ -46,7 +46,10 @@ Source `kernel/` 8067 lines across 19 `.c` / `.h` files
 |---|---|---|
 | `0x38..0x3D` | reserved | removed, no longer defined |
 | `0x33` | — | `OP_STATS` cache statistics |
-| `0x50..0x55` | — | **ACE anti-detection camouflage**, 10 feature bits / 11 kprobes |
+| `0x50..0x51` | 6 separate opcodes | **ACE merged into 2**: `OP_ACE_SET` unified setter, `OP_ACE_QUERY` unified getter |
+| `0x51` | — | New `ACE_QUERY_PKGNAME`, reads cmdline `argv[0]` for the **full package name** (no 16-byte comm truncation) |
+| `0x57..0x59` | — | **Page-level execution patch hook**, dual physical pages per VA, fetch hits shadow, reads hit original |
+| `0x5A..0x5B` | — | **Cross-process shared physical pages**, target and caller map the same pages |
 | Gyro | one resident execution breakpoint | execution breakpoint to locate, then **switch to steady WRP**, X/Y rewritten, Z never in window |
 | Symbols | direct references | 32 out-of-whitelist symbols resolved at runtime via `register_kprobe` |
 | Compat | `#ifdef` scattered in code | one `compat.h`, single source tree for 5.10 → 6.18 |
@@ -168,11 +171,70 @@ No collision with the common `0x800` demo drivers
 
 | Opcode | Name | Argument | Purpose |
 |---|---|---|---|
-| 0x50 | `OP_ACE_SET` | tgid | Select the camouflage target; 0 clears it |
-| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | Read the 10 hit counters |
-| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | Toggle the module's own logging, off by default |
-| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` nodes: rebuild fakes / detach only |
-| 0x54 | `OP_ACE_SET_FEATURES` | bitmask | Write the 10 camouflage switches, low 10 bits |
+| 0x50 | `OP_ACE_SET` | `ACE_SET_REQUEST*` | Unified setter: target tgid + feature bits + logging + inte |
+| 0x51 | `OP_ACE_QUERY` | `ACE_QUERY_REQUEST*` | Unified getter: stats / feature mask / package name |
+
+Two opcodes replace the previous six with nothing dropped. Fields carry "leave unchanged"
+sentinels so one call can touch just one of them:
+
+```c
+typedef struct _ACE_SET_REQUEST {
+    uint32_t tgid;      /* 0          = unchanged */
+    uint32_t features;  /* 0xFFFFFFFF = unchanged */
+    uint32_t verbose;   /* 0/1 = off/on, 2 = unchanged */
+    uint32_t inte;      /* 0 = rebuild fakes, 1 = detach only, 2 = unchanged */
+} ACE_SET_REQUEST;
+```
+
+Queries dispatch on `cmd` and return everything in one round trip:
+
+| `cmd` | Constant | Output field |
+|---|---|---|
+| 1 | `ACE_QUERY_STAT` | `stat` (`ACE_STAT`, 10 counters + current features) |
+| 2 | `ACE_QUERY_FEATURES` | `features` |
+| 3 | `ACE_QUERY_PKGNAME` | `pkgname[256]`, looked up by the `pid` argument |
+
+**Why the package-name query** `task->comm` is only 16 bytes, so
+`com.tencent.tmgp.sgame` gets cut to `com.tencent.tmg` and matching on it misfires.
+The new call reads `argv[0]` starting at `mm->arg_start` and returns the full package
+name, so a restarted process can be re-bound by name instead of by pid roulette.
+
+### Page-level execution patch hook
+
+| Opcode | Name | Argument | Purpose |
+|---|---|---|---|
+| 0x57 | `OP_PAGE_HOOK` | `PAGE_HOOK_REQUEST*` | Install / remove a page hook |
+| 0x58 | `OP_HOOK_VIEW` | `HOOK_VIEW_REQUEST*` | Switch to the data view, read original bytes |
+| 0x59 | `OP_PAGEHOOK_STAT` | `PAGEHOOK_STAT*` | Read page-hook counters |
+
+```c
+typedef struct _PAGE_HOOK_REQUEST {
+    int32_t  pid;           /* 0 = use the bound session */
+    uint32_t action;        /* 0 = REMOVE, 1 = INSTALL */
+    uint64_t address;       /* target instruction VA */
+    uint64_t patch_buffer;  /* patch bytes in the caller's process */
+    uint32_t patch_size;    /* must not cross a page, max 256 */
+    uint32_t flags;         /* must be 0 */
+} PAGE_HOOK_REQUEST;
+```
+
+### Cross-process shared physical pages
+
+| Opcode | Name | Argument | Purpose |
+|---|---|---|---|
+| 0x5A | `OP_MEM_ALLOC` | `SHAREMEM_REQUEST*` | Map the same physical pages into target and caller |
+| 0x5B | `OP_MEM_FREE` | `SHAREMEM_REQUEST*` | Release bookkeeping |
+
+```c
+typedef struct _SHAREMEM_REQUEST {
+    int32_t  pid;             /* 0 = use the bound session */
+    uint32_t protection;      /* PROT_READ / WRITE / EXEC combination */
+    uint64_t size;            /* requested bytes, aligned up to 4 KiB */
+    uint64_t target_address;  /* out: VA in the target process */
+    uint64_t caller_address;  /* out: VA in the calling process */
+    uint64_t allocated_size;  /* out: actual mapped length */
+} SHAREMEM_REQUEST;
+```
 
 `0x38..0x3D` are removed; do not reserve them client-side
 

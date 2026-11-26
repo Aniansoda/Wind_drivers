@@ -45,7 +45,10 @@ Android / Linux ARM64 커널 공간 메모리 읽기·쓰기 및 디버깅 프�
 | 코드 | 이전 | 현재 |
 |---|---|---|
 | `0x38..0x3D` | 예약 | 폐지, 정의하지 않음 |
-| `0x50..0x55` | — | **ACE 탐지 회피 위장**, 10 feature bit / 11 kprobe |
+| `0x50..0x51` | 독립 6 opcode | **ACE 를 2 개로 통합**: `OP_ACE_SET` 통합 설정, `OP_ACE_QUERY` 통합 조회 |
+| `0x51` | — | `ACE_QUERY_PKGNAME` 추가, cmdline `argv[0]` 에서 **완전한 패키지명** (comm 16 바이트 절단 없음) |
+| `0x57..0x59` | — | **페이지 단위 실행 패치 hook**, 동일 VA 에 물리 페이지 두 장, 인출은 그림자·읽기는 원본 |
+| `0x5A..0x5B` | — | **프로세스 간 공유 물리 페이지**, 대상과 호출자가 같은 페이지를 가리킴 |
 | `0x33` | — | `OP_STATS` 캐시 통계 |
 | 자이로 | 실행 브레이크포인트 상주 | 실행 브레이크포인트로 위치 파악 후 **WRP 정상 상태로 전환**, X/Y만 기록, Z는 창에 넣지 않음 |
 | 심볼 | 직접 참조 | 화이트리스트 밖 32개를 `register_kprobe` 로 실행 시 해석 |
@@ -170,13 +173,72 @@ insmod wind.ko transport=0            # 통신 경로 없이 적재만, 진단�
 
 | 코드 | 이름 | 인수 | 기능 |
 |---|---|---|---|
-| 0x50 | `OP_ACE_SET` | tgid | 위장 대상 지정, 0 이면 해제 |
-| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | 10 개 히트 카운터 읽기 |
-| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | 모듈 자체 로그 전환, 기본 꺼짐 |
-| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 노드 인수 / 제거만 |
-| 0x54 | `OP_ACE_SET_FEATURES` | 비트마스크 | 10 개 스위치 기록, 하위 10 비트 |
+| 0x50 | `OP_ACE_SET` | `ACE_SET_REQUEST*` | 통합 설정: 대상 tgid + 기능 비트 + 로그 + inte |
+| 0x51 | `OP_ACE_QUERY` | `ACE_QUERY_REQUEST*` | 통합 조회: 통계 / 비트마스크 / 패키지명 |
 
-자세한 내용은 `README.md` 의 「8 ACE 反检测伪装」 참조
+opcode 두 개로 기존 여섯 개를 대체했고 기능은 하나도 빠지지 않았다.
+각 필드에 "변경 안 함" 센티널이 있어 한 번의 호출로 한 항목만 바꿀 수 있다:
+
+```c
+typedef struct _ACE_SET_REQUEST {
+    uint32_t tgid;      /* 0          = 변경 안 함 */
+    uint32_t features;  /* 0xFFFFFFFF = 변경 안 함 */
+    uint32_t verbose;   /* 0/1 = 끔/켬, 2 = 변경 안 함 */
+    uint32_t inte;      /* 0 = 가짜 노드 재구성, 1 = 제거만, 2 = 변경 안 함 */
+} ACE_SET_REQUEST;
+```
+
+조회는 `cmd` 로 분기하며 한 번 왕복으로 전부 반환한다:
+
+| `cmd` | 상수 | 출력 |
+|---|---|---|
+| 1 | `ACE_QUERY_STAT` | `stat` (`ACE_STAT`, 10 항목 + 현재 features) |
+| 2 | `ACE_QUERY_FEATURES` | `features` |
+| 3 | `ACE_QUERY_PKGNAME` | `pkgname[256]`, 인자 `pid` 로 조회 |
+
+**패키지명 조회를 추가한 이유** `task->comm` 은 16 바이트뿐이라
+`com.tencent.tmgp.sgame` 이 `com.tencent.tmg` 로 잘려 매칭이 반드시 오판된다.
+새 API 는 `mm->arg_start` 부터 `argv[0]` 를 직접 읽어 완전한 패키지명을 돌려주므로
+프로세스 재시작 후에도 pid 대신 이름으로 tgid 를 다시 묶을 수 있다.
+
+### 페이지 단위 실행 패치 hook
+
+| 코드 | 이름 | 인수 | 기능 |
+|---|---|---|---|
+| 0x57 | `OP_PAGE_HOOK` | `PAGE_HOOK_REQUEST*` | 페이지 hook 설치 / 해제 |
+| 0x58 | `OP_HOOK_VIEW` | `HOOK_VIEW_REQUEST*` | 데이터 뷰로 전환, 원본 바이트 읽기 |
+| 0x59 | `OP_PAGEHOOK_STAT` | `PAGEHOOK_STAT*` | 페이지 hook 통계 |
+
+```c
+typedef struct _PAGE_HOOK_REQUEST {
+    int32_t  pid;           /* 0 = 바인딩된 세션 사용 */
+    uint32_t action;        /* 0 = REMOVE, 1 = INSTALL */
+    uint64_t address;       /* 대상 명령 VA */
+    uint64_t patch_buffer;  /* 호출자 프로세스의 패치 바이트 */
+    uint32_t patch_size;    /* 페이지를 넘을 수 없음, 최대 256 */
+    uint32_t flags;         /* 반드시 0 */
+} PAGE_HOOK_REQUEST;
+```
+
+### 프로세스 간 공유 물리 페이지
+
+| 코드 | 이름 | 인수 | 기능 |
+|---|---|---|---|
+| 0x5A | `OP_MEM_ALLOC` | `SHAREMEM_REQUEST*` | 대상 프로세스와 호출자에 같은 물리 페이지 매핑 |
+| 0x5B | `OP_MEM_FREE` | `SHAREMEM_REQUEST*` | 장부 해제 |
+
+```c
+typedef struct _SHAREMEM_REQUEST {
+    int32_t  pid;             /* 0 = 바인딩된 세션 사용 */
+    uint32_t protection;      /* PROT_READ / WRITE / EXEC 조합 */
+    uint64_t size;            /* 요청 바이트, 4 KiB 올림 */
+    uint64_t target_address;  /* 출력: 대상 프로세스 VA */
+    uint64_t caller_address;  /* 출력: 호출자 프로세스 VA */
+    uint64_t allocated_size;  /* 출력: 실제 매핑 길이 */
+} SHAREMEM_REQUEST;
+```
+
+페이지 hook 과 공유 페이지는 `README.md` 의 「9 / 10」 절 참조
 
 
 ---

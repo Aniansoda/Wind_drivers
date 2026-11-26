@@ -469,6 +469,46 @@ typedef struct _SHAREMEM_REQUEST
 	uint64_t allocated_size;
 } SHAREMEM_REQUEST;
 
+/*
+ * c_wind —— Wind 驱动用户态封装（净荷零依赖，仅需 C++11 与 linux/netlink.h）
+ *
+ * 通道
+ *   netlink AF_NETLINK unit 29（默认，范围 29..35），需 bind nl_pid=getpid()
+ *   WIND_NL_MSG{magic, op, arg, result} 塞在 nlmsghdr 之后
+ *   所有 op 高 16 位固定 0x574E（"WN"）
+ *
+ * 能力分组
+ *   会话       bind / unbind
+ *   内存       read / write / read_batch / write_batch / module_base / set_mode
+ *   帧缓存     frame_begin / frame_read / snap_start / snap_value / snap_stop
+ *   隐藏       hide_file / hide_process / unhide_all / kgsl_hook / kgsl_hide
+ *   陀螺仪     gyro_install / gyro_remove / gyro_set / gyro_enable / gyro_stop / gyro_resume
+ *   克隆页断点 clonebp_set / clonebp_remove / clonebp_get_config / clonebp_get_records
+ *   ACE 伪装   ace_set / ace_verbose / ace_inte / ace_set_features /
+ *              ace_get_features / ace_get_stat / ace_get_pkgname
+ *   页 hook    page_hook / page_unhook / page_set_view_data / page_hook_stat
+ *   共享页     share_alloc / share_free
+ *
+ * ACE 两个 opcode 覆盖原来六个
+ *   OP_ACE_SET   (0x50) ACE_SET_REQUEST{tgid,features,verbose,inte}
+ *                      0 / 0xFFFFFFFF / 2 / 2 表示该字段不改
+ *   OP_ACE_QUERY (0x51) ACE_QUERY_REQUEST{cmd,pid,...}
+ *                      cmd=1 取 ACE_STAT，cmd=2 取 features，cmd=3 取 pkgname
+ *
+ * 页级执行补丁 hook（对齐 Satan HOOK_MEMORY / SET_HOOK_VIEW）
+ *   OP_PAGE_HOOK      (0x57) PAGE_HOOK_REQUEST{pid,action,address,patch_buffer,patch_size,flags}
+ *   OP_HOOK_VIEW      (0x58) HOOK_VIEW_REQUEST{pid,view,address}，view 只支持 0=DATA
+ *   OP_PAGEHOOK_STAT  (0x59) PAGEHOOK_STAT
+ *   同 VA 双物理页：原始页用户可读不可执行，影子页可执行；取指走影子、读取走原始
+ *
+ * 跨进程共享物理页（对齐 Satan ALLOCATE_MEMORY）
+ *   OP_MEM_ALLOC (0x5A) SHAREMEM_REQUEST，返回 target_address 与 caller_address
+ *   OP_MEM_FREE  (0x5B)
+ *
+ * 注意
+ *   sizeof(c_wind) 约 48 KB，其中 47 KB 是帧缓存表（2048 槽），
+ *   局部实例建议 new 到堆上，避免爆栈。
+ */
 class c_wind
 {
 public:

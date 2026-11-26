@@ -51,7 +51,10 @@ Android / Linux ARM64 内核态内存读写与调试框架
 | 陀螺仪 | 单个执行断点常驻 | 执行断点定位 → **转 WRP 稳态**，X/Y 改写，Z 不进窗口 |
 | 符号 | 直接引用 | 32 个白名单外符号全部 `register_kprobe` 运行时解析 |
 | 兼容 | `#ifdef` 散在代码里 | 统一 `compat.h`，5.10 → 6.18 一份源码 |
-| `0x50..0x55` | — | **ACE 反检测伪装**，10 个 feature bit / 11 个 kprobe |
+| `0x50..0x51` | 6 个独立 opcode | **ACE 合并为 2 个**：`OP_ACE_SET` 统一设置，`OP_ACE_QUERY` 统一查询 |
+| `0x51` | — | 新增 `ACE_QUERY_PKGNAME`，读 cmdline `argv[0]` 拿**完整包名**（不受 16 字节 comm 截断） |
+| `0x57..0x59` | — | **页级执行补丁 hook**，同 VA 双物理页，取指走影子页、读取走原始页 |
+| `0x5A..0x5B` | — | **跨进程共享物理页**，目标进程与调用者映射同一批页 |
 
 ETM 那条路已删除：Coresight 需要目标 SoC 打开时钟与 funnel，机型覆盖率不够，且观测不到数据本身
 
@@ -170,12 +173,68 @@ insmod wind.ko transport=0            # 只加载，不装通道，用于排查
 
 | 码 | 名称 | 参数 | 功能 |
 |---|---|---|---|
-| 0x50 | `OP_ACE_SET` | tgid | 指定伪装目标，0 为解除 |
-| 0x51 | `OP_ACE_GET_STAT` | `ACE_STAT*` | 读 10 项命中计数 |
-| 0x52 | `OP_ACE_VERBOSE` | 0 / 1 | 开关驱动自身日志，默认关 |
-| 0x53 | `OP_ACE_INTE` | 0 / 1 | OnePlus `inte` 节点接管 / 仅摘除 |
-| 0x54 | `OP_ACE_SET_FEATURES` | 位掩码 | 写 10 个伪装开关，低 10 位有效 |
-| 0x55 | `OP_ACE_GET_FEATURES` | `uint32_t*` | 读当前开关掩码 |
+| 0x50 | `OP_ACE_SET` | `ACE_SET_REQUEST*` | 统一设置：目标 tgid + 伪装位 + 日志 + inte |
+| 0x51 | `OP_ACE_QUERY` | `ACE_QUERY_REQUEST*` | 统一查询：统计 / 掩码 / 包名 |
+
+两条 opcode 覆盖原来六个，功能一项没少。字段带「不变」哨兵，只改想改的那一项：
+
+```c
+typedef struct _ACE_SET_REQUEST {
+    uint32_t tgid;      /* 0          = 不改 */
+    uint32_t features;  /* 0xFFFFFFFF = 不改 */
+    uint32_t verbose;   /* 0/1 = 关/开, 2 = 不改 */
+    uint32_t inte;      /* 0 = 重建假节点, 1 = 只摘除, 2 = 不改 */
+} ACE_SET_REQUEST;
+```
+
+查询用 `cmd` 分派，一次往返拿全：
+
+| `cmd` | 常量 | 输出字段 |
+|---|---|---|
+| 1 | `ACE_QUERY_STAT` | `stat`（`ACE_STAT`，10 项计数 + 当前 features） |
+| 2 | `ACE_QUERY_FEATURES` | `features` |
+| 3 | `ACE_QUERY_PKGNAME` | `pkgname[256]`，按入参 `pid` 查 |
+
+**为什么加包名查询** `task->comm` 只有 16 字节，`com.tencent.tmgp.sgame` 会被截成
+`com.tencent.tmg`，拿它匹配必然误判。新接口直接读 `mm->arg_start` 起的 `argv[0]`，
+拿到完整包名，进程重启后也能按包名重新绑 tgid，不用靠 pid 碰运气。
+
+### 页级执行补丁 hook
+
+| 码 | 名称 | 参数 | 功能 |
+|---|---|---|---|
+| 0x57 | `OP_PAGE_HOOK` | `PAGE_HOOK_REQUEST*` | 安装 / 移除页 hook |
+| 0x58 | `OP_HOOK_VIEW` | `HOOK_VIEW_REQUEST*` | 切回数据视图，读原始字节 |
+| 0x59 | `OP_PAGEHOOK_STAT` | `PAGEHOOK_STAT*` | 读页 hook 统计 |
+
+```c
+typedef struct _PAGE_HOOK_REQUEST {
+    int32_t  pid;           /* 0 = 用已绑定会话 */
+    uint32_t action;        /* 0 = REMOVE, 1 = INSTALL */
+    uint64_t address;       /* 目标指令虚拟地址 */
+    uint64_t patch_buffer;  /* 调用者进程中的补丁字节 */
+    uint32_t patch_size;    /* 不能跨页, 上限 256 */
+    uint32_t flags;         /* 必须为 0 */
+} PAGE_HOOK_REQUEST;
+```
+
+### 跨进程共享物理页
+
+| 码 | 名称 | 参数 | 功能 |
+|---|---|---|---|
+| 0x5A | `OP_MEM_ALLOC` | `SHAREMEM_REQUEST*` | 目标进程与本进程映射同一批物理页 |
+| 0x5B | `OP_MEM_FREE` | `SHAREMEM_REQUEST*` | 释放记账 |
+
+```c
+typedef struct _SHAREMEM_REQUEST {
+    int32_t  pid;             /* 0 = 用已绑定会话 */
+    uint32_t protection;      /* PROT_READ / WRITE / EXEC 组合 */
+    uint64_t size;            /* 请求字节数, 4KB 向上对齐 */
+    uint64_t target_address;  /* 输出: 目标进程 VA */
+    uint64_t caller_address;  /* 输出: 调用者进程 VA */
+    uint64_t allocated_size;  /* 输出: 实际映射长度 */
+} SHAREMEM_REQUEST;
+```
 
 `0x38..0x3D` 已撤销，不要在客户端里占位
 
@@ -312,6 +371,7 @@ WRP 递归安全 自己的 `copy_to_user_nofault` 会再次触发观察点
 | 9 | `ACE_F_SMAPS` | `show_smap` | smaps 段级过滤 |
 
 **顺序** 先 `ace_set(pid)` 绑定目标，再 `ace_set_features(mask)` 打开需要的位
+两个方法内部都拼 `ACE_SET_REQUEST` 发同一条 `OP_ACE_SET`，调用方式不变
 `ace_get_stat` 回读 10 个计数器，确认每一项是否真的命中过
 计数为 0 说明该挂点没被走到，通常是 symbol 名在该内核版本上变了，看 `dmesg` 里的解析结果
 
@@ -323,6 +383,72 @@ WRP 递归安全 自己的 `copy_to_user_nofault` 会再次触发观察点
 
 **OnePlus `inte` 节点** `ace_inte(0)` 重建三个假节点，`ace_inte(1)` 只摘除不重建
 非 OnePlus 机型上返回 `-ENODEV`，可以先试一次再决定是否走这条
+
+### 9 页级执行补丁 hook
+
+同 VA 双物理页，不占 BRP/WRP 硬件断点寄存器，不改原始页字节：
+
+| 页 | PTE | 谁访问 |
+|---|---|---|
+| 原始页 | `USER \| RDONLY \| UXN \| PXN` | 用户读取，读到补丁前字节 |
+| 影子页 | `PXN`（无 `USER`，PX 放开） | CPU 取指，跑补丁后的指令 |
+
+切换完全由异常驱动，用户态无感：
+
+```
+取指命中原始页  → IABT (ESR.EC=0x20/0x21) → 切影子页 → 重试取指 → 执行补丁
+用户读取命中影子页 → DABT (ESR.EC=0x24/0x25) → 切回原始页 → 重试 → 读到原字节
+```
+
+`do_mem_abort` / `brk_handler` 都被 `NOKPROBE` 保护，挂在上游
+`el0t_64_sync_handler`，用 `read_sysreg(far_el1/esr_el1)` 取故障现场。
+`far/esr` 不能从 `regs->regs[0]/regs->regs[1]` 拿，那是用户 x0/x1。
+
+**两处保护挂点**
+
+| 挂点 | 为什么 |
+|---|---|
+| `do_mprotect_pkey` | mprotect 会按 VMA 重建 PTE，此刻挂影子页会被改成用户可读，补丁字节直接泄露 |
+| `mmput` | 进程退出前把挂影子页的那些页先切回原始页 |
+
+**异常环保护** 同一页在 `HZ/4` 窗口内异常次数超过 16，退到兜底态（原始页放宽为可读可执行），
+放行原始行为，避免「切页 → 再异常 → 再切页」的死循环把看门狗拖到重启。
+
+**与 clonebp 的关系** clonebp 在影子页写 `BRK` 做断点，命中后记录/改寄存器；
+这里不写 BRK、不记录、不改寄存器，只持续替换执行内容。两者按页命中各自分流，可同时开着。
+
+```cpp
+uint8_t patch[] = {0x1F, 0x20, 0x03, 0xD5};   /* nop */
+w.page_hook(0x7f00001000, patch, sizeof(patch));
+w.page_set_view_data(0x7f00001000);           /* 想读原始字节时先切回 */
+w.page_unhook(0x7f00001000);
+```
+
+### 10 跨进程共享物理页
+
+目标进程和调用者进程各建一段 VMA，映射同一批物理页：
+
+```
+alloc_page 拿页
+  → kthread_use_mm(target_mm) + vm_mmap() 在目标进程建匿名 VMA
+  → remap_pfn_range() 把我们的页顶掉匿名页
+  → 调用者进程同样处理（current->mm 直接用）
+```
+
+进程上下文的 `current->mm` 不能直接换，会打乱 `mm_users` 计数，且 `vm_mmap` 内部还要拿
+`mmap_write_lock` 会死锁，所以放独立 kthread 里 `kthread_use_mm`。
+
+`zap_page_range_single` 不导出给模块，这里不显式 zap：`remap_pfn_range` 会重写该范围 PTE。
+
+```cpp
+uintptr_t tva = 0;
+uintptr_t cva = w.share_alloc(4096, PROT_READ | PROT_WRITE, &tva);
+memcpy((void *)cva, "payload", 7);   /* 目标进程 tva 处立即可见 */
+w.share_free(tva);
+```
+
+**限制** `vm_munmap` / `do_munmap` 都不导出给模块，`share_free` 只清记账、不撤 VMA。
+VMA 由目标进程自行 `munmap` 或进程退出时回收；在 region 存续期内页一直有效，不会出现释放后访问。
 
 ---
 
@@ -409,7 +535,7 @@ nofault   copy_from_user_nofault  copy_to_user_nofault
 
 | 文件 | 作用 |
 |---|---|
-| `user/Wind-对接头文件.h` | 一个 `c_wind` 类包含全部能力：读写 / 批量 / 帧缓存 / 快照 / 隐藏 / kgsl / 陀螺仪 / 克隆页断点 / ACE 伪装 |
+| `user/Wind-对接头文件.h` | 一个 `c_wind` 类包含全部能力：读写 / 批量 / 帧缓存 / 快照 / 隐藏 / kgsl / 陀螺仪 / 克隆页断点 / ACE 伪装 / 页 hook / 共享页 |
 | `user/Wind-drivers-netlink_v1.3.0.zip` | netlink 通道客户端示例 |
 | `user/Wind-Drivers-*.sh` | 各内核版本自解压安装包（5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18） |
 | `user/Wind-Drivers-6.6.ko` | 6.6 预编译模块 |
@@ -431,6 +557,30 @@ d.frame_read(base + 0x100, hp);
 d.snap_start(base + 0x200, 60);             // 后台 60Hz 刷新
 uint32_t cur = d.snap_value<uint32_t>();
 d.snap_stop();
+
+/* ACE 伪装 + 完整包名 */
+char pkg[256];
+d.ace_get_pkgname(pid, pkg, sizeof(pkg));   // "com.xxx.yyy", 不受 comm 截断
+d.ace_set(pid);
+d.ace_set_features(0x3FF);                  // 10 位全开
+d.ace_inte(0);                              // OnePlus inte 节点接管
+
+ACE_STAT st;
+d.ace_get_stat(&st);                        // 回读 10 项命中计数
+
+/* 页级执行补丁 hook */
+uint8_t nop[] = {0x1F, 0x20, 0x03, 0xD5};
+d.page_hook(addr, nop, sizeof(nop));        // 影子页执行 patch
+d.page_set_view_data(addr);                 // 读原始字节
+PAGEHOOK_STAT ph;
+d.page_hook_stat(&ph);
+d.page_unhook(addr);
+
+/* 跨进程共享物理页 */
+uintptr_t tva = 0;
+uintptr_t cva = d.share_alloc(4096, PROT_READ | PROT_WRITE, &tva);
+memcpy((void *)cva, "payload", 7);          // 目标进程 tva 立即可见
+d.share_free(tva);
 ```
 
 `sizeof(c_wind)` 约 48 KB，其中 47 KB 是帧缓存表（2048 槽）
@@ -499,12 +649,15 @@ Wind_driver/
 │   ├── hide.c              文件与进程隐藏（kprobe）
 │   ├── gyro.c              陀螺仪 hook（exec bp → WRP 稳态）
 │   ├── kgsl.c              GPU kgsl hook
-│   ├── ace.c               ACE 反检测伪装（10 个 kprobe）
+│   ├── ace.c               ACE 反检测伪装（10 个 kprobe）+ 包名查询
+│   ├── pagehook.c          页级执行补丁 hook（同 VA 双物理页）
+│   ├── sharemem.c          跨进程共享物理页
 │   ├── nlcomm.c            netlink 私有通道与 op 白名单
 │   ├── sym.c               32 个白名单外符号的运行时解析
 │   ├── comm.h              操作码与协议结构
 │   ├── compat.h            内核版本兼容层（5.10 → 6.18）
 │   ├── memory.h / gyro.h / nlcomm.h / process.h / kgsl.h / sym.h
+│   ├── pagehook.h / sharemem.h
 │   ├── Kconfig
 │   └── Makefile
 ├── user/                   用户态对接头文件、客户端、安装包
@@ -572,6 +725,8 @@ bp: all off
 | 五十五 | 5.10 / 6.12 / 6.18 三套内核的移植差异（`kmap_local_page`、`PTE_ADDR_MASK`） |
 | 五十六 | 6.10 之后没有 `include/linux/version.h`，改引生成头 |
 | 五十七 | `kthread_use_mm` / `kthread_unuse_mm` 未导出，改运行时解析 |
+| 五十八 | ACE 六个 opcode 合并为两个，新增完整包名查询 |
+| 五十九 | 新增页级执行补丁 hook 与跨进程共享物理页 |
 
 详细逐轮改动、真机证据与未完成项见 `CHANGES.md`
 性能与发热对比见 `tools/windbench.cpp`
