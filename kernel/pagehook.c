@@ -122,7 +122,17 @@ static pte_t *ph_pte_get(struct mm_struct *mm, unsigned long addr)
 #endif
 }
 
-static void ph_flush_va_local(struct mm_struct *mm, unsigned long va)
+/* 与 clonebp 同款: arm64 没有导出的 local_flush_tlb_page, 直接走 __tlbi。
+ * 只冲刷本 CPU 上该 VA, 避免全局 shootdown 带来的耗时方差。 */
+static void ph_flush_va_local(unsigned long va)
+{
+	dsb(ishst);
+	__tlbi(vae1is, va >> PAGE_SHIFT);
+	dsb(ish);
+	isb();
+}
+
+static void ph_flush_page_local(struct mm_struct *mm, unsigned long va)
 {
 	int cpu;
 
@@ -131,7 +141,7 @@ static void ph_flush_va_local(struct mm_struct *mm, unsigned long va)
 	preempt_disable();
 	cpu = smp_processor_id();
 	if (mm_cpumask(mm) && cpumask_test_cpu(cpu, mm_cpumask(mm)))
-		local_flush_tlb_page(va);
+		ph_flush_va_local(va);
 	preempt_enable();
 }
 
@@ -186,7 +196,7 @@ static int ph_switch_raw(struct mm_struct *mm, struct ph_page *pp, int to_shadow
 	local_irq_restore(flags);
 
 	atomic_set(&pp->state, to_shadow);
-	ph_flush_va_local(mm, pp->va_page);
+	ph_flush_page_local(mm, pp->va_page);
 	atomic64_inc(&g_ph_switch);
 	return 0;
 }

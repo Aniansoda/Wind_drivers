@@ -17,6 +17,7 @@ extern bool g_wind_unloading;
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/mman.h>   /* PROT_* / MAP_* / vm_mmap */
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
