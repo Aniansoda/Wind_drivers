@@ -58,7 +58,6 @@ enum OPERATIONS
 	OP_GYRO_SET      = WIND_OP_BASE + 0x12,
 	OP_GYRO_ENABLE   = WIND_OP_BASE + 0x13,
 
-	/* ---- WRP 数据断点追踪 (观察点 + 命中即写回 + 浮点寄存器) ---- */
 	OP_WRPBP_SET          = WIND_OP_BASE + 0x26,
 	OP_WRPBP_REMOVE       = WIND_OP_BASE + 0x27,
 	OP_WRPBP_GET_CONFIG   = WIND_OP_BASE + 0x28,
@@ -159,7 +158,7 @@ typedef struct _WIND_MAP_STATS
 #define CLONEBP_MAX_PAGES    64
 #define CLONEBP_PATCH_MAX    16
 #define CLONEBP_REG_MAX      8
-#define CLONEBP_FREG_MAX     8   /* 浮点槽位数: bit0..bit7 -> freg_base+0..7 */
+#define CLONEBP_FREG_MAX     8
 #define CLONEBP_BRK_IMM_BASE 0x1000
 
 #define CLONEBP_MODE_LOG     0
@@ -191,20 +190,8 @@ typedef struct _CLONEBP_POINT_CONFIG
 	uint32_t imm;
 	uint32_t patch_len;
 	uint8_t  patch[CLONEBP_PATCH_MAX];
-
-	/* ---- 浮点寄存器写回 (arm64 S0..S31) ----
-	 * reg_base/reg_mask/reg_val 只能写 X0..X30。要改 float 参数
-	 * (比如 UE4 里通过 S0..S7 传的 FVector / 弹道参数) 就得走这里。
-	 *
-	 *   S3 = vregs[3] 的低 32 位, 所以 freg_base=3 就是 S3。
-	 *   freg_mask bit0..bit7 -> freg_base+0 .. freg_base+7。
-	 *   freg_val[k] 是 float 的位模式 (不是 double, 高位补 0)。
-	 *
-	 * 写 S3/S4/S5 三个 float: freg_base=3, freg_mask=0x7,
-	 *   freg_val[0..2] = {x,y,z} 的位模式。
-	 */
-	uint32_t freg_base;               /* 起始 S 寄存器号 0..31 */
-	uint32_t freg_mask;               /* bit0..bit7 对应 freg_base+0..7, 0=不写浮点 */
+	uint32_t freg_base;
+	uint32_t freg_mask;
 	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
 } CLONEBP_POINT_CONFIG, *PCLONEBP_POINT_CONFIG;
 
@@ -223,16 +210,11 @@ typedef struct _CLONEBP_RECORD
 	uint32_t reserved;
 } CLONEBP_RECORD, *PCLONEBP_RECORD;
 
-/* ---- 改单点配置 (OP_CLONEBP_SET_RECORD = 0x44) ----
- * 已经装好的点就地改寄存器写回值, 不用先拆再装。
- * point_index 是 clonebp_set 时的下标; point 里只有
- * reg_* / freg_* / mode / flags 会被采纳, addr / patch 忽略。
- */
 typedef struct _CLONEBP_SET_RECORD_REQUEST
 {
-	uint32_t pid;                     /* 目标进程, 0 = 用已绑定的 mm */
-	uint32_t point_index;             /* 第几个点 */
-	CLONEBP_POINT_CONFIG point;       /* 新配置 */
+	uint32_t pid;
+	uint32_t point_index;
+	CLONEBP_POINT_CONFIG point;
 } CLONEBP_SET_RECORD_REQUEST, *PCLONEBP_SET_RECORD_REQUEST;
 
 typedef struct _CLONEBP_CONFIG
@@ -258,12 +240,10 @@ typedef struct _CLONEBP_RECORDS_REQUEST
 	uint32_t *count_out;
 } CLONEBP_RECORDS_REQUEST, *PCLONEBP_RECORDS_REQUEST;
 
-/* ---- WRP 数据断点 (观察点写回, 不碰代码也不碰页表) ---- */
-#define WRPBP_MAX_POINTS    2    /* arm64 只有 4 个硬件断点寄存器 */
+#define WRPBP_MAX_POINTS    2
 #define WRPBP_RECORD_MAX    256
-#define WRPBP_VEC_BYTES     12   /* x/y/z 三个 float */
-
-#define HWBP_MASK_ALL       0x7U /* bit0=x bit1=y bit2=z */
+#define WRPBP_VEC_BYTES     12
+#define HWBP_MASK_ALL       0x7U
 
 enum BP_TYPE
 {
@@ -285,41 +265,41 @@ typedef struct _HWBP_RECORD
 {
 	uint64_t trigger_pc;
 	uint64_t hit_addr;
-	uint32_t op_mask;   /* bit0=读 bit1=写 */
+	uint32_t op_mask;
 	uint32_t reserved;
 } HWBP_RECORD, *PHWBP_RECORD;
 
 typedef struct _WRPBP_POINT_CONFIG
 {
-	uint64_t watch_addr;   /* 弹道/朝向向量首地址 (12 字节 x/y/z) */
-	uint32_t watch_len;    /* 1/2/4/8: 单个观察点覆盖字节数 */
-	uint32_t type;         /* BP_TYPE_WRITE / BP_TYPE_RW */
-	uint32_t components;   /* bit0=x bit1=y bit2=z */
-	uint32_t freg_base;    /* 起始 S 寄存器号 0..31 */
-	uint32_t freg_mask;    /* bit0..bit7 -> freg_base+0..7, 0=不写浮点 */
+	uint64_t watch_addr;
+	uint32_t watch_len;
+	uint32_t type;
+	uint32_t components;
+	uint32_t freg_base;
+	uint32_t freg_mask;
 } WRPBP_POINT_CONFIG, *PWRPBP_POINT_CONFIG;
 
 typedef struct _WRPBP_SET_REQUEST
 {
-	uint32_t pid;          /* 目标进程 */
+	uint32_t pid;
 	uint32_t point_count;
 	WRPBP_POINT_CONFIG points[];
 } WRPBP_SET_REQUEST, *PWRPBP_SET_REQUEST;
 
 typedef struct _WRPBP_VEC_REQUEST
 {
-	int32_t  point_index;  /* -1 全部 */
+	int32_t  point_index;
 	uint32_t enable;
-	uint32_t x, y, z;      /* float 位模式 */
-	uint32_t mask;         /* bit0=x bit1=y bit2=z, 0 视为 0x7 */
+	uint32_t x, y, z;
+	uint32_t mask;
 } WRPBP_VEC_REQUEST, *PWRPBP_VEC_REQUEST;
 
 typedef struct _WRPBP_FREGS_REQUEST
 {
-	int32_t  point_index;  /* -1 全部 */
-	uint32_t freg_base;    /* 起始 S 寄存器号 0..31 */
-	uint32_t freg_mask;    /* bit0..bit7 -> freg_base+0..7 */
-	uint32_t freg_val[CLONEBP_FREG_MAX]; /* float 位模式 */
+	int32_t  point_index;
+	uint32_t freg_base;
+	uint32_t freg_mask;
+	uint32_t freg_val[CLONEBP_FREG_MAX];
 } WRPBP_FREGS_REQUEST, *PWRPBP_FREGS_REQUEST;
 
 typedef struct _WRPBP_CONFIG
@@ -327,7 +307,11 @@ typedef struct _WRPBP_CONFIG
 	uint32_t active_count;
 	uint32_t watch_addr_lo;
 	uint32_t watch_addr_hi;
+	uint32_t skipped;
+	uint32_t writes;
+	uint32_t fails;
 	uint32_t reserved;
+	uint32_t reserved2;
 } WRPBP_CONFIG, *PWRPBP_CONFIG;
 
 typedef struct _WRPBP_RECORDS_REQUEST
@@ -387,16 +371,14 @@ typedef struct _ACE_STAT
 	uint64_t prop_hit;
 } ACE_STAT, *PACE_STAT;
 
-/* ---- ACE 统一设置 (OP_ACE_SET): 0=不变 / 0xFFFFFFFF=不变 / 2=不变 ---- */
 typedef struct _ACE_SET_REQUEST
 {
-	uint32_t tgid;        /* 目标 tgid, 0=不改变 */
-	uint32_t features;    /* 伪装开关位掩码, 0xFFFFFFFF=不改变 */
-	uint32_t verbose;     /* 日志开关, 0/1=关/开, 2=不改变 */
-	uint32_t inte;        /* inte 三节点, 0=接管重建 1=只摘除, 2=不改变 */
+	uint32_t tgid;
+	uint32_t features;
+	uint32_t verbose;
+	uint32_t inte;
 } ACE_SET_REQUEST, *PACE_SET_REQUEST;
 
-/* ---- ACE 统一查询 (OP_ACE_QUERY) ---- */
 #define ACE_QUERY_STAT       1
 #define ACE_QUERY_FEATURES   2
 #define ACE_QUERY_PKGNAME    3
@@ -413,7 +395,6 @@ typedef struct _ACE_QUERY_REQUEST
 	char     pkgname[ACE_PKGNAME_MAX];
 } ACE_QUERY_REQUEST, *PACE_QUERY_REQUEST;
 
-/* ---- 页级执行补丁 hook (对齐 Satan HOOK_MEMORY) ---- */
 #define PAGE_HOOK_REMOVE     0U
 #define PAGE_HOOK_INSTALL    1U
 #define PAGE_HOOK_PATCH_MAX  256U
@@ -458,7 +439,6 @@ typedef struct _PAGEHOOK_STAT
 	PAGEHOOK_PAGE_INFO pages[PAGEHOOK_STAT_MAX_PAGES];
 } PAGEHOOK_STAT;
 
-/* ---- 跨进程共享物理页 (对齐 Satan ALLOCATE_MEMORY) ---- */
 typedef struct _SHAREMEM_REQUEST
 {
 	int32_t  pid;
@@ -469,46 +449,6 @@ typedef struct _SHAREMEM_REQUEST
 	uint64_t allocated_size;
 } SHAREMEM_REQUEST;
 
-/*
- * c_wind —— Wind 驱动用户态封装（净荷零依赖，仅需 C++11 与 linux/netlink.h）
- *
- * 通道
- *   netlink AF_NETLINK unit 29（默认，范围 29..35），需 bind nl_pid=getpid()
- *   WIND_NL_MSG{magic, op, arg, result} 塞在 nlmsghdr 之后
- *   所有 op 高 16 位固定 0x574E（"WN"）
- *
- * 能力分组
- *   会话       bind / unbind
- *   内存       read / write / read_batch / write_batch / module_base / set_mode
- *   帧缓存     frame_begin / frame_read / snap_start / snap_value / snap_stop
- *   隐藏       hide_file / hide_process / unhide_all / kgsl_hook / kgsl_hide
- *   陀螺仪     gyro_install / gyro_remove / gyro_set / gyro_enable / gyro_stop / gyro_resume
- *   克隆页断点 clonebp_set / clonebp_remove / clonebp_get_config / clonebp_get_records
- *   ACE 伪装   ace_set / ace_verbose / ace_inte / ace_set_features /
- *              ace_get_features / ace_get_stat / ace_get_pkgname
- *   页 hook    page_hook / page_unhook / page_set_view_data / page_hook_stat
- *   共享页     share_alloc / share_free
- *
- * ACE 两个 opcode 覆盖原来六个
- *   OP_ACE_SET   (0x50) ACE_SET_REQUEST{tgid,features,verbose,inte}
- *                      0 / 0xFFFFFFFF / 2 / 2 表示该字段不改
- *   OP_ACE_QUERY (0x51) ACE_QUERY_REQUEST{cmd,pid,...}
- *                      cmd=1 取 ACE_STAT，cmd=2 取 features，cmd=3 取 pkgname
- *
- * 页级执行补丁 hook（对齐 Satan HOOK_MEMORY / SET_HOOK_VIEW）
- *   OP_PAGE_HOOK      (0x57) PAGE_HOOK_REQUEST{pid,action,address,patch_buffer,patch_size,flags}
- *   OP_HOOK_VIEW      (0x58) HOOK_VIEW_REQUEST{pid,view,address}，view 只支持 0=DATA
- *   OP_PAGEHOOK_STAT  (0x59) PAGEHOOK_STAT
- *   同 VA 双物理页：原始页用户可读不可执行，影子页可执行；取指走影子、读取走原始
- *
- * 跨进程共享物理页（对齐 Satan ALLOCATE_MEMORY）
- *   OP_MEM_ALLOC (0x5A) SHAREMEM_REQUEST，返回 target_address 与 caller_address
- *   OP_MEM_FREE  (0x5B)
- *
- * 注意
- *   sizeof(c_wind) 约 48 KB，其中 47 KB 是帧缓存表（2048 槽），
- *   局部实例建议 new 到堆上，避免爆栈。
- */
 class c_wind
 {
 public:
@@ -539,9 +479,7 @@ public:
 	int ace_get_features(uint32_t *out) { if(!out) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_FEATURES; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) *out=r.features; return (int)ret; }
 	int ace_get_pkgname(uint32_t pid, char *out, uint32_t cap) { if(!out||!cap) return -1; ACE_QUERY_REQUEST r; memset(&r,0,sizeof(r)); r.cmd=ACE_QUERY_PKGNAME; r.pid=pid; long ret=xfer(OP_ACE_QUERY,(uintptr_t)&r); if(ret==0) { snprintf(out,cap,"%s",r.pkgname); } return (int)ret; }
 
-	/* ---- 页级执行补丁 hook (对齐 Satan hook/unhook/set_hook_view) ---- */
-
-	/* 在目标地址安装页 hook: 影子页执行 patch, 原始页保持不变 */
+	/* ---- 页级执行补丁 hook ---- */
 	int page_hook(uintptr_t address, const void *patch, uint32_t size)
 	{
 		PAGE_HOOK_REQUEST r;
@@ -581,7 +519,7 @@ public:
 		return (int)xfer(OP_PAGEHOOK_STAT, (uintptr_t)out);
 	}
 
-	/* ---- 跨进程共享物理页 (对齐 Satan allocate_shared_memory) ----
+	/* ---- 跨进程共享物理页 ----
 	 * 返回当前进程可直接访问的地址, target 侧地址写进 target_out。
 	 */
 	uintptr_t share_alloc(size_t size, uint32_t prot,
@@ -732,12 +670,12 @@ public:
 					break;
 			}
 			if (nl_fd < 0)
-				printf("[-] netlink 探测 %d..%d 全部失败, 请确认已加载\n",
+				printf("[ - ] netlink 探测 %d..%d 全部失败, 请确认已加载\n",
 				       WIND_NL_UNIT_MIN, WIND_NL_UNIT_MAX);
 			return;
 		}
 		if (!try_unit(unit))
-			printf("[-] netlink unit=%d 不可用: %s\n", unit, strerror(errno));
+			printf("[ - ] netlink unit=%d 不可用: %s\n", unit, strerror(errno));
 	}
 
 	bool try_unit(int unit)
@@ -776,7 +714,7 @@ public:
 
 		fd = open(dev, O_RDWR);
 		if (fd < 0)
-			printf("[-] open %s 失败: %s\n", dev, strerror(errno));
+			printf("[ - ] open %s 失败: %s\n", dev, strerror(errno));
 	}
 
 	~c_wind()
@@ -800,7 +738,7 @@ public:
 	{
 		if (xfer_impl(OP_BIND, (uintptr_t)target) != 0)
 		{
-			printf("[-] bind pid %d 失败\n", target);
+			printf("[ - ] bind pid %d 失败\n", target);
 			return false;
 		}
 		pid = target;
@@ -815,6 +753,66 @@ public:
 		bound = false;
 		pid = 0;
 		return ret;
+	}
+
+	/* ---- WRP 观察点 ----
+	 * pid 一律从当前绑定会话带下去, 不用调用方再传。
+	 * 以前要手工拼 WRPBP_SET_REQUEST 且自己填 pid, 忘记填就是 pid=0,
+	 * 内核 find_task_by_vpid(0) 返回 NULL -> -ESRCH,
+	 * 表现成"绑定了但追踪点没下发"。
+	 */
+	int wrpbp_set(const WRPBP_POINT_CONFIG *points, uint32_t count)
+	{
+		if (!points || !count || !bound || pid <= 0)
+			return -1;
+
+		size_t need = sizeof(WRPBP_SET_REQUEST) +
+			      (size_t)count * sizeof(WRPBP_POINT_CONFIG);
+		WRPBP_SET_REQUEST *req = (WRPBP_SET_REQUEST *)calloc(1, need);
+		int ret;
+
+		if (!req)
+			return -1;
+		req->pid = (uint32_t)pid;      /* 关键: 绑定 pid 随请求下发 */
+		req->point_count = count;
+		memcpy(req->points, points, (size_t)count * sizeof(*points));
+		ret = (int)xfer_impl(OP_WRPBP_SET, (uintptr_t)req);
+		free(req);
+		return ret;
+	}
+
+	/* 单点便捷版: 装一个写观察点 */
+	int wrpbp_set_one(uint64_t watch_addr, uint32_t watch_len = 4,
+			  uint32_t type = 1 /* BP_TYPE_WRITE */)
+	{
+		WRPBP_POINT_CONFIG pt;
+
+		memset(&pt, 0, sizeof(pt));
+		pt.watch_addr = watch_addr;
+		pt.watch_len = watch_len;
+		pt.type = type;
+		pt.components = 0x7;
+		return wrpbp_set(&pt, 1);
+	}
+
+	int wrpbp_remove() { return (int)xfer_impl(OP_WRPBP_REMOVE, 0); }
+
+	int wrpbp_get_config(WRPBP_CONFIG *out)
+	{
+		return out ? (int)xfer_impl(OP_WRPBP_GET_CONFIG, (uintptr_t)out) : -1;
+	}
+
+	int wrpbp_set_vec(int32_t point_index, uint32_t enable,
+			  uint32_t x, uint32_t y, uint32_t z, uint32_t mask)
+	{
+		WRPBP_VEC_REQUEST r;
+
+		memset(&r, 0, sizeof(r));
+		r.point_index = point_index;
+		r.enable = enable;
+		r.x = x; r.y = y; r.z = z;
+		r.mask = mask;
+		return (int)xfer_impl(OP_WRPBP_SET_VEC, (uintptr_t)&r);
 	}
 
 	int set_mode(int mode)

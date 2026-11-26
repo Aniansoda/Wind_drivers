@@ -350,7 +350,11 @@ typedef struct _WRPBP_CONFIG
 	uint32_t active_count;
 	uint32_t watch_addr_lo;
 	uint32_t watch_addr_hi;
+	uint32_t skipped;      /* 因卡写修复被跳过的 store 条数 */
+	uint32_t writes;       /* 成功写回次数 */
+	uint32_t fails;        /* 写回失败次数 */
 	uint32_t reserved;
+	uint32_t reserved2;
 } WRPBP_CONFIG, *PWRPBP_CONFIG;
 
 typedef struct _WRPBP_RECORDS_REQUEST

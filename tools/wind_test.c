@@ -263,7 +263,11 @@ typedef struct _WRPBP_CONFIG {
     uint32_t active_count;
     uint32_t watch_addr_lo;
     uint32_t watch_addr_hi;
+    uint32_t skipped;
+    uint32_t writes;
+    uint32_t fails;
     uint32_t reserved;
+    uint32_t reserved2;
 } WRPBP_CONFIG;
 
 typedef struct _WRPBP_RECORDS_REQUEST {

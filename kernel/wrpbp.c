@@ -34,6 +34,7 @@
 #include <linux/jiffies.h>
 #include <linux/atomic.h>
 #include <linux/thread_info.h>
+#include <linux/compat.h>
 #include <asm/ptrace.h>
 #include <asm/fpsimd.h>
 
@@ -56,6 +57,25 @@ extern bool g_wind_fp_writeback;
 #define WRPBP_MAX_POINTS  2
 #define HWBP_MASK_ALL     0x7U
 #define WRPBP_RATE_MAX    800
+
+/* ---- 卡写修复开关 ----
+ * arm64 的 WRP 在 store 提交前 trap。handler 写完目标地址后返回, CPU 会
+ * 重新执行那条 store, 把我们写的值覆盖掉, 并再次触发同一 watchpoint ->
+ * store 永远执行不完, 目标线程卡死, 后续 netlink 命令(含 bind)再也下发不出去。
+ * 修法: 写回成功后把 pc 推进到下一条指令, 由驱动独占这次写入, 不让 CPU 重试。
+ * insmod wind.ko wind_wrp_skip_store=0 可关掉(回到旧的覆盖行为)。
+ */
+static bool g_wrp_skip_store = true;
+module_param_named(wind_wrp_skip_store, g_wrp_skip_store, bool, 0644);
+MODULE_PARM_DESC(wind_wrp_skip_store,
+		 "WRP 写回后跳过触发的 store 指令, 默认 1 (修复卡写)");
+
+#define WRPBP_SKIP_MAX    800   /* 每秒最多跳过这么多 store, 超了退回旧行为 */
+
+/* 跳过节流: 页面被当寄存器狂写时, 无节制跳过会把指令流跳乱 */
+static unsigned long wrpbp_skip_pc[BP_SLOT_MAX];   /* 最近一次的 store pc, 诊断用 */
+static unsigned long wrpbp_skip_last[BP_SLOT_MAX];
+static u32 wrpbp_skip_cnt[BP_SLOT_MAX];
 
 /* ===================================================================
  * 环形记录
@@ -148,6 +168,7 @@ static DEFINE_PER_CPU(int, wrpbp_busy);
 
 /* 诊断计数 (只读诊断, 竞态无害) */
 static u32 g_wrpbp_hits, g_wrpbp_writes, g_wrpbp_skips, g_wrpbp_fails;
+static u32 g_wrpbp_skipped;   /* 因卡写修复被跳过的 store 条数 */
 static u64 g_wrpbp_last_hit_pc;
 static u32 g_wrpbp_last_rx, g_wrpbp_last_ry, g_wrpbp_last_rz;
 
@@ -158,8 +179,11 @@ static void bpc_note_regs(u32 x, u32 y, u32 z)
 	g_wrpbp_last_rz = z;
 }
 
-/* 命中后把目标向量写回: 只走 nofault uaccess, 断点上下文里不能睡眠 */
-static void wrpbp_apply_vec(int slot)
+/* 命中后把目标向量写回: 只走 nofault uaccess, 断点上下文里不能睡眠。
+ * 返回 1 表示本次确实向目标地址写入了新值(调用方据此决定是否跳过 store),
+ * 返回 0 表示没写(只读 VMA / 读失败 / 已是目标值)。
+ */
+static int wrpbp_apply_vec(int slot)
 {
 	struct wrpbp_vecmod *v = &wrpbp_vec[slot];
 	struct wrpbp_slot *sl = &wrpbp_slots[slot];
@@ -168,10 +192,10 @@ static void wrpbp_apply_vec(int slot)
 	int ret = -EFAULT;
 
 	if (!mask)
-		return;
+		return 0;
 	/* 只读 VMA: 写回去必然失败, 直接跳过内存通道(寄存器通道仍可用) */
 	if (sl->ro)
-		return;
+		return 0;
 
 	if (wind_copy_from_user_nofault(buf, (void __user *)sl->watch_addr,
 					WRPBP_VEC_BYTES) != 0)
@@ -182,7 +206,7 @@ static void wrpbp_apply_vec(int slot)
 	    (!(mask & 0x2) || buf[1] == v->y) &&
 	    (!(mask & 0x4) || buf[2] == v->z)) {
 		g_wrpbp_skips++;
-		return;
+		return 0;
 	}
 
 	if (mask & 0x1)
@@ -198,9 +222,10 @@ out:
 	if (ret == 0) {
 		g_wrpbp_writes++;
 		bpc_note_regs(v->x, v->y, v->z);
-	} else {
-		g_wrpbp_fails++;
+		return 1;
 	}
+	g_wrpbp_fails++;
+	return 0;
 }
 
 /* 浮点寄存器写回: 内存改写对"先搬进 S 寄存器再算"的代码无效, 这里补一条
@@ -289,6 +314,7 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 
 			if (wrpbp_vec[i].enabled) {
 				unsigned long now = jiffies;
+				int wrote = 0;
 
 				if (!wrpbp_rate_last[i] ||
 				    time_after(now, wrpbp_rate_last[i] + HZ)) {
@@ -309,9 +335,41 @@ static void wrpbp_triggered(struct perf_event *bp, struct perf_sample_data *data
 					}
 				} else {
 					this_cpu_inc(wrpbp_busy);
-					wrpbp_apply_vec(i);
+					wrote = wrpbp_apply_vec(i);
 					wrpbp_apply_fregs(i);
 					this_cpu_dec(wrpbp_busy);
+				}
+
+				/* 卡写修复: 写回成功后跳过触发的 store。
+				 * 否则 CPU 返回后会重试这条 store, 把刚写的值覆盖掉,
+				 * 并再次命中同一 watchpoint, 无限循环把线程卡死。
+				 * A64 指令定长 4 字节, 推进 pc 即跳过;
+				 * 32 位 compat 任务是 2/4 字节混排, 不推进(退回旧行为)。 */
+				if (wrote && g_wrp_skip_store && !is_compat_task()) {
+					unsigned long pc = instruction_pointer(regs);
+
+					if (wrpbp_skip_last[i] &&
+					    time_after(jiffies,
+						       wrpbp_skip_last[i] + HZ)) {
+						wrpbp_skip_last[i] = jiffies;
+						wrpbp_skip_cnt[i] = 0;
+					}
+					wrpbp_skip_last[i] = jiffies;
+
+					if (++wrpbp_skip_cnt[i] <= WRPBP_SKIP_MAX) {
+						wrpbp_skip_pc[i] = pc;
+						instruction_pointer_set(regs, pc + 4);
+						g_wrpbp_skipped++;
+					} else if (!wrpbp_rate_warned[i]) {
+						/* 跳得过密说明页面被当寄存器狂写,
+						 * 退回旧行为比把指令流跳乱安全 */
+						wrpbp_rate_warned[i] = true;
+						pr_warn("wrpbp: slot %d 跳过率超限(%d/s), "
+							"停止跳 store 地址=%llx\n",
+							i, WRPBP_SKIP_MAX,
+							(unsigned long long)
+							wrpbp_slots[i].watch_addr);
+					}
 				}
 			}
 			return;
@@ -526,6 +584,7 @@ int wrpbp_set_vec(int32_t point_index, u32 enable, u32 x, u32 y, u32 z, u32 mask
 		wrpbp_vec[i].z = z;
 		wrpbp_rate_warned[i] = false;
 		wrpbp_rate_last[i] = 0;
+		wrpbp_skip_pc[i] = 0;
 		atomic_set(&wrpbp_rate_cnt[i], 0);
 	}
 	return 0;
@@ -574,6 +633,9 @@ int wrpbp_get_config(WRPBP_CONFIG *out)
 		out->watch_addr_hi = (u32)(wrpbp_slots[i].watch_addr >> 32);
 		break;
 	}
+	out->skipped = g_wrpbp_skipped;
+	out->writes  = g_wrpbp_writes;
+	out->fails   = g_wrpbp_fails;
 	return 0;
 }
 
