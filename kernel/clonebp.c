@@ -34,7 +34,7 @@ extern bool g_wind_unloading;
 #include <asm/fpsimd.h>
 #include <asm/sysreg.h>
 #include "sym.h"   /* wind_kallsyms_lookup_name / wind_fpsimd_preserve_current_state */
-#include "memory.h" /* wind_force_kernel_page_rw / wind_flush_code */
+#include "memory.h" /* wind_force_kernel_page_rw / wind_flush_kernel_code */
 
 /* 浮点写回总开关, 默认开。insmod wind.ko wind_fp_writeback=0 可整体关掉,
  * 用来区分"崩在浮点写回"还是"崩在别处"。
@@ -727,7 +727,7 @@ static int cb_el0_inline_install(void)
 		return r;
 	tramp[4] = orig;   /* 槽位A: 原指令 */
 	tramp[5] = bjmp;   /* 槽位B: b <addr+4> */
-	wind_flush_code(&tramp[4], 8);
+	wind_flush_kernel_code(&tramp[4], 8);
 	wind_force_kernel_page_rw((unsigned long)cb_el0_tramp, false);
 
 	/* 再 patch 原函数第一条指令 (内核镜像 .text) */
@@ -737,7 +737,7 @@ static int cb_el0_inline_install(void)
 	cb_el0_orig_insn = orig;
 	cb_el0_addr = addr;
 	WRITE_ONCE(*(u32 *)addr, bentry);
-	wind_flush_code((void *)addr, 4);
+	wind_flush_kernel_code((void *)addr, 4);
 	wind_force_kernel_page_rw(addr, false);
 
 	cb_el0_inlined = true;
@@ -752,7 +752,7 @@ static void cb_el0_inline_uninstall(void)
 	if (cb_el0_addr && cb_el0_orig_insn &&
 	    !wind_force_kernel_page_rw(cb_el0_addr, true)) {
 		WRITE_ONCE(*(u32 *)cb_el0_addr, cb_el0_orig_insn);
-		wind_flush_code((void *)cb_el0_addr, 4);
+		wind_flush_kernel_code((void *)cb_el0_addr, 4);
 		wind_force_kernel_page_rw(cb_el0_addr, false);
 	}
 	cb_el0_inlined = false;

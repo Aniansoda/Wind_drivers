@@ -41,7 +41,7 @@ extern bool g_wind_unloading;
 #include "pagehook.h"
 #include "comm.h"
 #include "sym.h"    /* wind_kallsyms_lookup_name */
-#include "memory.h" /* wind_force_kernel_page_rw / wind_flush_code */
+#include "memory.h" /* wind_force_kernel_page_rw / wind_flush_kernel_code */
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0))
 #define ph_kmap(pg)      kmap_atomic(pg)
@@ -388,7 +388,7 @@ static int ph_el0_inline_install(void)
 		return r;
 	tramp[4] = orig;   /* 槽位A: 原指令 */
 	tramp[5] = bjmp;   /* 槽位B: b <addr+4> */
-	wind_flush_code(&tramp[4], 8);
+	wind_flush_kernel_code(&tramp[4], 8);
 	wind_force_kernel_page_rw((unsigned long)ph_el0_tramp, false);
 
 	/* 再 patch 原函数第一条指令 (内核镜像 .text) */
@@ -398,7 +398,7 @@ static int ph_el0_inline_install(void)
 	ph_el0_orig_insn = orig;
 	ph_el0_addr = addr;
 	WRITE_ONCE(*(u32 *)addr, bentry);
-	wind_flush_code((void *)addr, 4);
+	wind_flush_kernel_code((void *)addr, 4);
 	wind_force_kernel_page_rw(addr, false);
 
 	ph_el0_inlined = true;
@@ -413,7 +413,7 @@ static void ph_el0_inline_uninstall(void)
 	if (ph_el0_addr && ph_el0_orig_insn &&
 	    !wind_force_kernel_page_rw(ph_el0_addr, true)) {
 		WRITE_ONCE(*(u32 *)ph_el0_addr, ph_el0_orig_insn);
-		wind_flush_code((void *)ph_el0_addr, 4);
+		wind_flush_kernel_code((void *)ph_el0_addr, 4);
 		wind_force_kernel_page_rw(ph_el0_addr, false);
 	}
 	ph_el0_inlined = false;

@@ -669,6 +669,25 @@ static void wind_flush_code_range(void *kaddr, size_t len)
 	asm volatile("dsb ish\n\tisb" : : : "memory");
 }
 
+/* 内核镜像指令 patch 专用: I/D cache 一致 + 跨 CPU icache 失效。
+ * wind_flush_code_range 的 ic ivau 只失效当前 CPU 的 icache, 多核上其他
+ * CPU 仍可能缓存旧指令, 继续走未 patch 的异常路径 -> 目标代码在 UXN 原始页
+ * 上反复 IABT 死循环。这里在 dc cvau (clean to PoU) 后改用 ic ialluis,
+ * 广播失效 inner shareable 域内所有 CPU 的 icache。 */
+void wind_flush_kernel_code(void *kaddr, size_t len)
+{
+	unsigned long a = (unsigned long)kaddr & ~63UL;
+	unsigned long end = ((unsigned long)kaddr + len + 63UL) & ~63UL;
+	unsigned long p;
+
+	for (p = a; p < end; p += 64)
+		asm volatile("dc cvau, %0" : : "r"(p) : "memory");
+	asm volatile("dsb ish" : : : "memory");
+	asm volatile("ic ialluis" : : : "memory");
+	asm volatile("dsb ish" : : : "memory");
+	asm volatile("isb" : : : "memory");
+}
+
 /* 改写目标进程代码页字节。
  * 代码页是 file-backed 只读映射, 直接写物理页会污染 page cache (所有加载
  * 同一 .so 的进程一起变), 所以先走 GUP(FOLL_WRITE) 让内核按 MAP_PRIVATE

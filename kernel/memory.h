@@ -93,6 +93,8 @@ int wind_unmap_in(struct mm_struct *mm, unsigned long addr, unsigned long len);
 
 /* 改完字节后刷 I/D cache (影子页 / 跳板页) */
 void wind_flush_code(void *kaddr, size_t len);
+/* 内核镜像指令 patch 专用: 刷 I/D cache 并广播失效所有 CPU 的 icache */
+void wind_flush_kernel_code(void *kaddr, size_t len);
 
 /* ---- 影子页: 私有副本映射到目标 VA, 原页与文件不动 ---- */
 struct wind_shadow {
