@@ -22,6 +22,7 @@ extern bool g_wind_unloading;
 
 #include "ace.h"
 #include "comm.h"
+#include "sym.h"
 
 #define ACE_PFX "[wind-ace] "
 
@@ -745,7 +746,7 @@ int ace_get_pkgname(uint32_t pid, char *buf, size_t len)
 		arg_start = mm->arg_start;
 		arg_end = mm->arg_end;
 		mmap_read_unlock(mm);
-		mmput(mm);
+		wind_mmput(mm);
 
 		if (arg_end > arg_start) {
 			size_t want = min((size_t)(arg_end - arg_start), max);

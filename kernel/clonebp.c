@@ -959,7 +959,7 @@ int clonebp_set(struct task_struct *task, const void __user *uconf, uint32_t cou
 		return -ESRCH;
 
 	if (cb_install_hooks() < 0) {
-		mmput(mm);
+		wind_mmput(mm);
 		return -ENODEV;
 	}
 
@@ -967,7 +967,7 @@ int clonebp_set(struct task_struct *task, const void __user *uconf, uint32_t cou
 	if (g_cb_mm && g_cb_mm != mm) {
 		/* 只允许单目标 mm, 避免异常路径歧义 */
 		mutex_unlock(&g_cb_lock);
-		mmput(mm);
+		wind_mmput(mm);
 		return -EBUSY;
 	}
 	g_cb_mm = mm;
@@ -1019,7 +1019,7 @@ int clonebp_set(struct task_struct *task, const void __user *uconf, uint32_t cou
 	if (ok == 0) {
 		g_cb_mm = NULL;
 		mutex_unlock(&g_cb_lock);
-		mmput(mm);
+		wind_mmput(mm);
 		return -EFAULT;
 	}
 	mutex_unlock(&g_cb_lock);
@@ -1072,7 +1072,7 @@ int clonebp_remove_all(struct mm_struct *mm)
 	cb_remove_hooks();
 	/* 释放 clonebp_set 里 get_task_mm 拿到的 mm 引用 (补泄漏) */
 	if (mm)
-		mmput(mm);
+		wind_mmput(mm);
 	return 0;
 }
 
@@ -1255,7 +1255,7 @@ int clonebp_set_pid(uint32_t pid_arg, const void __user *ureq)
 	put_task_struct(task);
 	if (!mm)
 		return -ESRCH;
-	mmput(mm);
+	wind_mmput(mm);
 
 	/* clonebp_set 内部再次 get_task_mm, 这里只做存在性校验 */
 	rcu_read_lock();

@@ -728,9 +728,9 @@ static void wind_remote_map_work(struct work_struct *work)
 		return;
 	}
 	if (r->unmap) {
-		r->ret = vm_munmap(r->addr, r->len);
+		r->ret = wind_vm_munmap(r->addr, r->len);
 	} else {
-		unsigned long a = vm_mmap(NULL, r->hint, r->len,
+		unsigned long a = wind_vm_mmap(NULL, r->hint, r->len,
 					  PROT_READ | PROT_WRITE | PROT_EXEC,
 					  MAP_PRIVATE | MAP_ANONYMOUS |
 					  MAP_FIXED_NOREPLACE, 0);

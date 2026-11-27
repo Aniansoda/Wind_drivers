@@ -38,6 +38,16 @@ typedef int (*remap_pfn_range_fn)(struct vm_area_struct *, unsigned long,
 				  unsigned long, unsigned long, pgprot_t);
 static remap_pfn_range_fn g_remap_pfn_range = NULL;
 
+/* vm_mmap / find_vma: 在目标 mm 里建匿名 VMA 并定位 (白名单外)。
+ * sharemem.c 需要, 与 kthread_use_mm 一样真机不导出, 走 kprobe 解析。 */
+typedef unsigned long (*vm_mmap_fn)(struct file *, unsigned long, unsigned long,
+				    unsigned long, unsigned long, unsigned long);
+typedef struct vm_area_struct *(*find_vma_fn)(struct mm_struct *, unsigned long);
+typedef int (*vm_munmap_fn)(unsigned long, size_t);
+static vm_mmap_fn g_vm_mmap = NULL;
+static find_vma_fn g_find_vma = NULL;
+static vm_munmap_fn g_vm_munmap = NULL;
+
 /* vmap 三件套: 物理地址 → 内核虚拟地址临时映射 (白名单外) */
 typedef void (*free_vm_area_fn)(struct vm_struct *);
 typedef void (*vunmap_fn)(const void *);
@@ -274,6 +284,29 @@ int wind_remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 	return g_remap_pfn_range(vma, addr, pfn, size, prot);
 }
 
+unsigned long wind_vm_mmap(struct file *file, unsigned long addr,
+			   unsigned long len, unsigned long prot,
+			   unsigned long flag, unsigned long offset)
+{
+	if (!g_vm_mmap)
+		return -ENOMEM;   /* 解析不到, 当成没映射成 */
+	return g_vm_mmap(file, addr, len, prot, flag, offset);
+}
+
+struct vm_area_struct *wind_find_vma(struct mm_struct *mm, unsigned long addr)
+{
+	if (!g_find_vma)
+		return NULL;
+	return g_find_vma(mm, addr);
+}
+
+int wind_vm_munmap(unsigned long start, size_t len)
+{
+	if (!g_vm_munmap)
+		return -EOPNOTSUPP;
+	return g_vm_munmap(start, len);
+}
+
 void wind_free_vm_area(struct vm_struct *area)
 {
 	if (g_free_vm_area)
@@ -447,6 +480,9 @@ int wind_sym_init(void)
 	g_mmput = (mmput_fn)wind_kprobe_resolve("mmput");
 	g_iounmap = (iounmap_fn)wind_kprobe_resolve("iounmap");
 	g_remap_pfn_range = (remap_pfn_range_fn)wind_kprobe_resolve("remap_pfn_range");
+	g_vm_mmap = (vm_mmap_fn)wind_kprobe_resolve("vm_mmap");
+	g_find_vma = (find_vma_fn)wind_kprobe_resolve("find_vma");
+	g_vm_munmap = (vm_munmap_fn)wind_kprobe_resolve("vm_munmap");
 	g_free_vm_area = (free_vm_area_fn)wind_kprobe_resolve("free_vm_area");
 	g_vunmap = (vunmap_fn)wind_kprobe_resolve("vunmap");
 	g_get_vm_area_caller = (get_vm_area_caller_fn)wind_kprobe_resolve("__get_vm_area_caller");
@@ -513,6 +549,9 @@ void wind_sym_exit(void)
 	g_mmput = NULL;
 	g_iounmap = NULL;
 	g_remap_pfn_range = NULL;
+	g_vm_mmap = NULL;
+	g_find_vma = NULL;
+	g_vm_munmap = NULL;
 	g_free_vm_area = NULL;
 	g_vunmap = NULL;
 	g_get_vm_area_caller = NULL;

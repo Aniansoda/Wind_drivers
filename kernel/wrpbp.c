@@ -414,7 +414,7 @@ static int wrpbp_addr_probe(struct mm_struct *mm, uint64_t addr, u32 len,
 		return 0;
 
 	mmap_read_lock(mm);
-	vma = find_vma(mm, (unsigned long)addr);
+	vma = wind_find_vma(mm, (unsigned long)addr);
 	if (vma && (unsigned long)addr >= vma->vm_start &&
 	    (unsigned long)addr + len <= vma->vm_end) {
 		*writable = !!(vma->vm_flags & VM_WRITE);
@@ -557,12 +557,12 @@ int wrpbp_set(struct task_struct *task, const WRPBP_POINT_CONFIG *points,
 		       i, (unsigned long long)sl->watch_addr, len, n_ev,
 		       (int)wrpbp_tgid);
 	}
-	mmput(mm);
+	wind_mmput(mm);
 	return 0;
 
 fail:
 	if (mm)
-		mmput(mm);
+		wind_mmput(mm);
 	wrpbp_remove();
 	return ret;
 }

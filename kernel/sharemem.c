@@ -5,8 +5,8 @@
  *
  * 做法:
  *   1. alloc_pages 拿一批页(物理连续不必需, 逐页映射)
- *   2. 在目标进程 mm 里建一段匿名 VMA(wind_kthread_use_mm + vm_mmap),
- *      再用 remap_pfn_range 把我们的页顶掉匿名页
+ *   2. 在目标进程 mm 里建一段匿名 VMA(wind_kthread_use_mm + wind_vm_mmap),
+ *      再用 wind_remap_pfn_range 把我们的页顶掉匿名页
  *   3. 在调用者进程 mm 里同样建 VMA 并 remap 同一批页
  *   两个 VA 指向同一物理页, 任一侧写入另一侧立即可见。
  */
@@ -52,7 +52,7 @@ static struct sm_region g_sm_regions[SM_MAX_REGIONS];
 
 /* ---- 用 kthread 借目标 mm 建 VMA ----
  * 进程上下文的 current->mm 不能直接换成目标 mm (会破坏 mm_users 计数,
- * 且 vm_mmap 内部还要拿 mmap_write_lock)。放独立 kthread 里 use_mm 最稳。
+ * 且 wind_vm_mmap 内部还要拿 mmap_write_lock)。放独立 kthread 里 use_mm 最稳。
  */
 struct sm_mmap_work {
 	struct mm_struct *mm;
@@ -68,7 +68,7 @@ static int sm_mmap_thread(void *arg)
 	struct sm_mmap_work *w = arg;
 
 	wind_kthread_use_mm(w->mm);
-	w->addr = vm_mmap(NULL, 0, w->len, w->prot,
+	w->addr = wind_vm_mmap(NULL, 0, w->len, w->prot,
 			  MAP_PRIVATE | MAP_ANONYMOUS, 0);
 	wind_kthread_unuse_mm(w->mm);
 	w->ret = IS_ERR_VALUE(w->addr) ? -ENOMEM : 0;
@@ -118,14 +118,14 @@ static int sm_remap_in(struct mm_struct *mm, unsigned long va,
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
 
-	vma = find_vma(mm, va);
+	vma = wind_find_vma(mm, va);
 	if (!vma || vma->vm_start > va || vma->vm_end < va + nr * PAGE_SIZE) {
 		mmap_write_unlock(mm);
 		return -EFAULT;
 	}
 
 	/* 直接 remap 覆盖匿名页 PTE。zap_page_range_single 不导出给模块,
-	 * 这里不做显式 zap: remap_pfn_range 会重写该范围 PTE, 被覆盖的
+	 * 这里不做显式 zap: wind_remap_pfn_range 会重写该范围 PTE, 被覆盖的
 	 * 匿名页随 vma 回收释放。 */
 	/* 6.1 起 vm_flags 是 const(vm_flags_t), 不能直接 |=. 6.3 才引入
 	 * vm_flags_set(), 所以 6.1/6.2 只能绕过 const 限定。
@@ -140,7 +140,7 @@ static int sm_remap_in(struct mm_struct *mm, unsigned long va,
 	vma->vm_pgoff = 0;
 
 	for (i = 0; i < nr; ++i) {
-		ret = remap_pfn_range(vma, va + i * PAGE_SIZE,
+		ret = wind_remap_pfn_range(vma, va + i * PAGE_SIZE,
 				      page_to_pfn(pages[i]), PAGE_SIZE,
 				      vma->vm_page_prot);
 		if (ret)

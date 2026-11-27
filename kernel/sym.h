@@ -54,6 +54,11 @@ void wind_mmput(struct mm_struct *mm);
 void wind_iounmap(volatile void __iomem *addr);
 int wind_remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 			 unsigned long pfn, unsigned long size, pgprot_t prot);
+unsigned long wind_vm_mmap(struct file *file, unsigned long addr,
+			   unsigned long len, unsigned long prot,
+			   unsigned long flag, unsigned long offset);
+struct vm_area_struct *wind_find_vma(struct mm_struct *mm, unsigned long addr);
+int wind_vm_munmap(unsigned long start, size_t len);
 
 /* vmap 三件套 (白名单外, 运行时解析) */
 void wind_free_vm_area(struct vm_struct *area);
