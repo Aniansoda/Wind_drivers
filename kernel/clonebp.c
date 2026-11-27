@@ -248,7 +248,7 @@ static atomic_t cb_bailout_cnt[CLONEBP_MAX_PAGES];
 static void cb_flush_va_local(unsigned long va)
 {
 	dsb(ishst);
-	__tlbi(vae1is, va >> PAGE_SHIFT);
+	__tlbi(vaae1is, va >> PAGE_SHIFT);
 	dsb(ish);
 	isb();
 }
@@ -494,7 +494,8 @@ static int cb_mem_abort_do(unsigned long far, unsigned int esr)
 				return 0;
 			if (cb_try_bailout(cp))
 				return 1;
-			cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_SHADOW);
+			if (cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_SHADOW) < 0)
+				return 0;   /* 切页失败: 放行, 避免 IABT 死循环 */
 			cb_stat_inc(CLONEBP_ST_IFAULT_IN);
 			return 1;
 		}
@@ -505,7 +506,8 @@ static int cb_mem_abort_do(unsigned long far, unsigned int esr)
 		if (cp && atomic_read(&cp->state) == CLONEBP_STATE_SHADOW) {
 			if (cb_try_bailout(cp))
 				return 1;
-			cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_ORIG);
+			if (cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_ORIG) < 0)
+				return 0;   /* 切页失败: 放行, 避免 DABT 死循环 */
 			cb_stat_inc(CLONEBP_ST_DFAULT_IN);
 			return 1;
 		}

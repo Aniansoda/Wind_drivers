@@ -136,7 +136,7 @@ static pte_t *ph_pte_get(struct mm_struct *mm, unsigned long addr)
 static void ph_flush_va_local(unsigned long va)
 {
 	dsb(ishst);
-	__tlbi(vae1is, va >> PAGE_SHIFT);
+	__tlbi(vaae1is, va >> PAGE_SHIFT);
 	dsb(ish);
 	isb();
 }
@@ -261,7 +261,8 @@ static int ph_mem_abort_do(unsigned long far, unsigned int esr)
 			return 0;
 		if (ph_try_bailout(pp))
 			return 1;
-		ph_switch_raw(g_ph_mm, pp, PH_STATE_SHADOW);
+		if (ph_switch_raw(g_ph_mm, pp, PH_STATE_SHADOW) < 0)
+			return 0;   /* 切页失败: 放行, 避免 IABT 死循环 */
 		atomic64_inc(&pp->ifault);
 		atomic64_inc(&g_ph_ifault);
 		return 1;
@@ -273,7 +274,8 @@ static int ph_mem_abort_do(unsigned long far, unsigned int esr)
 			return 0;
 		if (ph_try_bailout(pp))
 			return 1;
-		ph_switch_raw(g_ph_mm, pp, PH_STATE_ORIG);
+		if (ph_switch_raw(g_ph_mm, pp, PH_STATE_ORIG) < 0)
+			return 0;   /* 切页失败: 放行, 避免 DABT 死循环 */
 		atomic64_inc(&pp->dfault);
 		atomic64_inc(&g_ph_dfault);
 		atomic64_inc(&g_ph_view_orig);
