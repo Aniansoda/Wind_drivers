@@ -404,6 +404,8 @@ static int ph_el0_inline_install(void)
 	wind_force_kernel_page_rw(addr, false);
 
 	ph_el0_inlined = true;
+	pr_info("[pagehook] inline hook ok: el0t=%lx orig=%08x bentry=%08x tramp=%lx\n",
+		addr, orig, bentry, (unsigned long)ph_el0_tramp);
 	return 0;
 }
 
@@ -677,10 +679,10 @@ int pagehook_install(struct mm_struct *mm, u64 addr, const u8 *patch, u32 patch_
 		g_ph_page_cnt = i + 1;
 
 	/* 原始页设为不可执行, 首次取指触发 IABT */
-	ph_switch(mm, pp, PH_STATE_ORIG);
+	ret = ph_switch(mm, pp, PH_STATE_ORIG);
 
-	pr_info("[pagehook] install va=%llx len=%u\n",
-		(unsigned long long)addr, patch_len);
+	pr_info("[pagehook] install va=%llx len=%u switch=%d\n",
+		(unsigned long long)addr, patch_len, ret);
 out:
 	mutex_unlock(&g_ph_lock);
 	return ret;

@@ -743,6 +743,8 @@ static int cb_el0_inline_install(void)
 	wind_force_kernel_page_rw(addr, false);
 
 	cb_el0_inlined = true;
+	pr_info("[clonebp] inline hook ok: el0t=%lx orig=%08x bentry=%08x tramp=%lx\n",
+		addr, orig, bentry, (unsigned long)cb_el0_tramp);
 	return 0;
 }
 
