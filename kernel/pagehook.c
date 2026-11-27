@@ -40,6 +40,8 @@ extern bool g_wind_unloading;
 
 #include "pagehook.h"
 #include "comm.h"
+#include "sym.h"    /* wind_kallsyms_lookup_name */
+#include "memory.h" /* wind_force_kernel_page_rw / wind_flush_code */
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0))
 #define ph_kmap(pg)      kmap_atomic(pg)
@@ -74,6 +76,13 @@ static DEFINE_MUTEX(g_ph_lock);
 static struct ph_page g_ph_pages[PH_MAX_PAGES];
 static int g_ph_page_cnt;
 static struct mm_struct *g_ph_mm;
+
+/* ---- inline hook el0t_64_sync_handler (NOKPROBE 黑名单绕过) ----
+ * kprobe 对该符号返回 -22(-EINVAL)/-19(-ENODEV) 黑名单, 只能 patch
+ * 函数第一条指令为 b ph_el0_tramp, 在跳板里复刻 ph_el0_sync_pre。 */
+static unsigned long ph_el0_addr;      /* el0t_64_sync_handler 地址 */
+static u32 ph_el0_orig_insn;           /* 被 patch 的原第一条指令 */
+static bool ph_el0_inlined;            /* inline hook 是否已生效 */
 
 static atomic64_t g_ph_ifault;
 static atomic64_t g_ph_dfault;
@@ -274,6 +283,143 @@ static int ph_mem_abort_do(unsigned long far, unsigned int esr)
 	return 0;
 }
 
+/* el0t_64_sync_handler 的 kprobe 无关核心 (供 inline hook 跳板调用)。
+ * uregs = el0t_64_sync_handler 第一个参数 (用户现场 pt_regs)。
+ * 返回 0=放行(照常走原函数), 非0=跳过(直接异常返回)。
+ * 必须非 static + noinline: 跳板里用 bl 引用它, 需要稳定的全局符号。 */
+noinline int ph_el0_sync_core(struct pt_regs *uregs)
+{
+	unsigned long esr, far;
+
+	if (READ_ONCE(g_wind_unloading))
+		return 0;
+	if (!g_ph_mm || g_ph_page_cnt == 0)
+		return 0;
+	if (!uregs || !user_mode(uregs))
+		return 0;
+
+	esr = read_sysreg(esr_el1);
+	if (!ph_esr_is_iabt(esr) && !ph_esr_is_dabt(esr))
+		return 0;
+
+	far = read_sysreg(far_el1);
+	return ph_mem_abort_do(far, (unsigned int)esr);
+}
+
+/* inline hook 跳板。patch el0t_64_sync_handler 第一条指令为
+ * b ph_el0_tramp (imm26)。布局同 clonebp 的 cb_el0_tramp (32 字节):
+ *   +0x00 stp x0,x30,[sp,#-16]!   保存 uregs 与返回地址
+ *   +0x04 bl  ph_el0_sync_core     w0 = ret (链接器填模块内偏移)
+ *   +0x08 cbnz w0, +4              ret!=0 -> 跳过 (跳到 +0x18)
+ *   +0x0c ldp x0,x30,[sp],#16      放行: 恢复
+ *   +0x10 <原指令>                 槽位A (运行时填原函数第一条指令)
+ *   +0x14 b  <addr+4>              槽位B (运行时填跳回原函数 +4)
+ *   +0x18 ldp x0,x30,[sp],#16      跳过: 恢复
+ *   +0x1c ret                      直接异常返回
+ */
+asm(
+	".pushsection .text\n"
+	".global ph_el0_tramp\n"
+	".align 4\n"
+	"ph_el0_tramp:\n"
+	"stp x0, x30, [sp, #-16]!\n"
+	"bl ph_el0_sync_core\n"
+	"cbnz w0, 2f\n"
+	"ldp x0, x30, [sp], #16\n"
+	".word 0x00000000\n"
+	".word 0x14000000\n"
+	"2:\n"
+	"ldp x0, x30, [sp], #16\n"
+	"ret\n"
+	".popsection\n"
+);
+extern void ph_el0_tramp(void);
+
+/* b imm26 编码。target/insn_addr 为绝对虚拟地址, 超出 ±128MB 返回 false。 */
+static inline bool ph_b_imm26(unsigned long target, unsigned long insn_addr,
+			      u32 *out)
+{
+	long off = (long)(target - insn_addr);
+
+	if (off & 3)
+		return false;
+	off >>= 2;
+	if (off < -(1L << 25) || off > ((1L << 25) - 1))
+		return false;
+	*out = 0x14000000u | ((u32)off & 0x03FFFFFF);
+	return true;
+}
+
+/* 装入 inline hook: patch el0t_64_sync_handler 首指令跳进跳板。 */
+static int ph_el0_inline_install(void)
+{
+	unsigned long addr, after;
+	u32 orig, bjmp, bentry;
+	u32 *tramp = (u32 *)ph_el0_tramp;
+	int r;
+
+	if (ph_el0_inlined)
+		return 0;
+
+	addr = wind_kallsyms_lookup_name("el0t_64_sync_handler");
+	if (!addr) {
+		pr_err("[pagehook] kallsyms 查不到 el0t_64_sync_handler\n");
+		return -ENOENT;
+	}
+
+	if (copy_from_kernel_nofault(&orig, (void *)addr, sizeof(orig))) {
+		pr_err("[pagehook] 读 el0t_64_sync_handler 首指令失败\n");
+		return -EFAULT;
+	}
+
+	after = addr + 4;
+	if (!ph_b_imm26(after, (unsigned long)&tramp[5], &bjmp)) {
+		pr_err("[pagehook] 跳板 -> 原函数+4 超出 ±128MB\n");
+		return -ERANGE;
+	}
+	if (!ph_b_imm26((unsigned long)ph_el0_tramp, addr, &bentry)) {
+		pr_err("[pagehook] 原函数 -> 跳板 超出 ±128MB\n");
+		return -ERANGE;
+	}
+
+	/* 先写跳板槽位 (模块 .text, 临时开写) */
+	r = wind_force_kernel_page_rw((unsigned long)ph_el0_tramp, true);
+	if (r)
+		return r;
+	tramp[4] = orig;   /* 槽位A: 原指令 */
+	tramp[5] = bjmp;   /* 槽位B: b <addr+4> */
+	wind_flush_code(&tramp[4], 8);
+	wind_force_kernel_page_rw((unsigned long)ph_el0_tramp, false);
+
+	/* 再 patch 原函数第一条指令 (内核镜像 .text) */
+	r = wind_force_kernel_page_rw(addr, true);
+	if (r)
+		return r;
+	ph_el0_orig_insn = orig;
+	ph_el0_addr = addr;
+	WRITE_ONCE(*(u32 *)addr, bentry);
+	wind_flush_code((void *)addr, 4);
+	wind_force_kernel_page_rw(addr, false);
+
+	ph_el0_inlined = true;
+	return 0;
+}
+
+/* 卸载 inline hook: 恢复原函数第一条指令。 */
+static void ph_el0_inline_uninstall(void)
+{
+	if (!ph_el0_inlined)
+		return;
+	if (ph_el0_addr && ph_el0_orig_insn &&
+	    !wind_force_kernel_page_rw(ph_el0_addr, true)) {
+		WRITE_ONCE(*(u32 *)ph_el0_addr, ph_el0_orig_insn);
+		wind_flush_code((void *)ph_el0_addr, 4);
+		wind_force_kernel_page_rw(ph_el0_addr, false);
+	}
+	ph_el0_inlined = false;
+	ph_el0_addr = 0;
+}
+
 /* el0t_64_sync_handler pre_handler: EL0 同步异常总入口。
  * x0 = kernel_entry 保存的用户现场 pt_regs。
  * far/esr 必须 read_sysreg, 不能从 regs->regs[] 取(那是用户 x0/x1)。 */
@@ -381,10 +527,18 @@ static int ph_install_hooks(void)
 	ph_el0_sync_kp.pre_handler = ph_el0_sync_pre;
 	ret = register_kprobe(&ph_el0_sync_kp);
 	if (ret) {
-		pr_warn("[pagehook] el0t_64_sync_handler probe failed: %d\n", ret);
-		return ret;
+		/* NOKPROBE 黑名单 (-19/-22): kprobe 挂不上, 降级 inline hook */
+		pr_warn("[pagehook] el0t_64_sync_handler kprobe 被黑名单挡住 %d, "
+			"改用 inline hook\n", ret);
+		ret = ph_el0_inline_install();
+		if (ret < 0) {
+			pr_err("[pagehook] inline hook 失败 %d\n", ret);
+			return ret;
+		}
+		ph_kp_el0_reg = 1;
+	} else {
+		ph_kp_el0_reg = 1;
 	}
-	ph_kp_el0_reg = 1;
 
 	ph_mprotect_kp.pre_handler = ph_mprotect_pre;
 	ret = register_kprobe(&ph_mprotect_kp);
@@ -414,7 +568,10 @@ static void ph_remove_hooks(void)
 		ph_kp_mprot_reg = 0;
 	}
 	if (ph_kp_el0_reg) {
-		unregister_kprobe(&ph_el0_sync_kp);
+		if (ph_el0_inlined)
+			ph_el0_inline_uninstall();
+		else
+			unregister_kprobe(&ph_el0_sync_kp);
 		ph_kp_el0_reg = 0;
 	}
 }
