@@ -324,8 +324,7 @@ static int cb_switch_page_raw(struct mm_struct *mm, struct clonebp_page *cp,
 	ptep = cb_pte_get(mm, cp->user_va, NULL);
 	if (!ptep) {
 		if (printk_ratelimit())
-			pr_warn("clonebp: 页 %llx pte_get NULL, 拒绝切换
-",
+			pr_warn("clonebp: 页 %llx pte_get NULL, 拒绝切换\n",
 				(unsigned long long)cp->user_va);
 		return -EFAULT;
 	}
