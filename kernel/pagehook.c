@@ -181,12 +181,20 @@ static int ph_switch_raw(struct mm_struct *mm, struct ph_page *pp, int to_shadow
 		return -EOPNOTSUPP;
 
 	ptep = ph_pte_get(mm, pp->va_page);
-	if (!ptep)
+	if (!ptep) {
+		if (printk_ratelimit())
+			pr_warn("[pagehook] switch_raw: pte_get NULL va=%llx\n",
+				(unsigned long long)pp->va_page);
 		return -EFAULT;
+	}
 
 	cur = READ_ONCE(*ptep);
-	if (pte_cont(cur))   /* 折叠 PTE 会连带改相邻页, 拒绝 */
+	if (pte_cont(cur)) {   /* 折叠 PTE 会连带改相邻页, 拒绝 */
+		if (printk_ratelimit())
+			pr_warn("[pagehook] switch_raw: pte_cont va=%llx\n",
+				(unsigned long long)pp->va_page);
 		return -EOPNOTSUPP;
+	}
 
 	local_irq_save(flags);
 	if (to_shadow == PH_STATE_SHADOW) {
@@ -261,8 +269,13 @@ static int ph_mem_abort_do(unsigned long far, unsigned int esr)
 			return 0;
 		if (ph_try_bailout(pp))
 			return 1;
-		if (ph_switch_raw(g_ph_mm, pp, PH_STATE_SHADOW) < 0)
+		if (ph_switch_raw(g_ph_mm, pp, PH_STATE_SHADOW) < 0) {
+			if (printk_ratelimit())
+				pr_warn("[pagehook] IABT 切影子页失败 va=%llx state=%d\n",
+					(unsigned long long)pp->va_page,
+					atomic_read(&pp->state));
 			return 0;   /* 切页失败: 放行, 避免 IABT 死循环 */
+		}
 		atomic64_inc(&pp->ifault);
 		atomic64_inc(&g_ph_ifault);
 		return 1;
@@ -274,8 +287,13 @@ static int ph_mem_abort_do(unsigned long far, unsigned int esr)
 			return 0;
 		if (ph_try_bailout(pp))
 			return 1;
-		if (ph_switch_raw(g_ph_mm, pp, PH_STATE_ORIG) < 0)
+		if (ph_switch_raw(g_ph_mm, pp, PH_STATE_ORIG) < 0) {
+			if (printk_ratelimit())
+				pr_warn("[pagehook] DABT 切原始页失败 va=%llx state=%d\n",
+					(unsigned long long)pp->va_page,
+					atomic_read(&pp->state));
 			return 0;   /* 切页失败: 放行, 避免 DABT 死循环 */
+		}
 		atomic64_inc(&pp->dfault);
 		atomic64_inc(&g_ph_dfault);
 		atomic64_inc(&g_ph_view_orig);

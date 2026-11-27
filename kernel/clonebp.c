@@ -322,8 +322,13 @@ static int cb_switch_page_raw(struct mm_struct *mm, struct clonebp_page *cp,
 	}
 
 	ptep = cb_pte_get(mm, cp->user_va, NULL);
-	if (!ptep)
+	if (!ptep) {
+		if (printk_ratelimit())
+			pr_warn("clonebp: 页 %llx pte_get NULL, 拒绝切换
+",
+				(unsigned long long)cp->user_va);
 		return -EFAULT;
+	}
 
 	/* 折叠 PTE (contiguous) 状态下改一项会连带改掉相邻 15 页,
 	 * 只读检查不写, 命中就拒绝这页。 */
@@ -494,8 +499,13 @@ static int cb_mem_abort_do(unsigned long far, unsigned int esr)
 				return 0;
 			if (cb_try_bailout(cp))
 				return 1;
-			if (cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_SHADOW) < 0)
+			if (cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_SHADOW) < 0) {
+				if (printk_ratelimit())
+					pr_warn("[clonebp] IABT 切影子页失败 va=%llx state=%d\n",
+						(unsigned long long)cp->user_va,
+						atomic_read(&cp->state));
 				return 0;   /* 切页失败: 放行, 避免 IABT 死循环 */
+			}
 			cb_stat_inc(CLONEBP_ST_IFAULT_IN);
 			return 1;
 		}
@@ -506,8 +516,13 @@ static int cb_mem_abort_do(unsigned long far, unsigned int esr)
 		if (cp && atomic_read(&cp->state) == CLONEBP_STATE_SHADOW) {
 			if (cb_try_bailout(cp))
 				return 1;
-			if (cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_ORIG) < 0)
+			if (cb_switch_page_raw(g_cb_mm, cp, CLONEBP_STATE_ORIG) < 0) {
+				if (printk_ratelimit())
+					pr_warn("[clonebp] DABT 切原始页失败 va=%llx state=%d\n",
+						(unsigned long long)cp->user_va,
+						atomic_read(&cp->state));
 				return 0;   /* 切页失败: 放行, 避免 DABT 死循环 */
+			}
 			cb_stat_inc(CLONEBP_ST_DFAULT_IN);
 			return 1;
 		}
