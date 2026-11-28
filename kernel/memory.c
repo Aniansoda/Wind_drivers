@@ -565,12 +565,15 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 
 		/* 回读自检: PTE 改了不代表 CPU 换了翻译。若 TLB 没刷干净,
 		 * 紧接着写内核文本就是 level 3 permission fault -> oops。
-		 * 宁可在这一步失败, 也不要把 oops 留给调用方。 */
+		 * 宁可在这一步失败, 也不要把 oops 留给调用方。
+		 *
+		 * 注意语义相反: is_ro=1 表示 AP_RO 置位(只读),
+		 * writable=1 表示要求可写, 故失配条件是 is_ro == writable。 */
 		{
 			bool is_ro = false;
 
 			if (wind_kernel_page_ro_state(va, &is_ro) == 0 &&
-			    is_ro != writable) {
+			    is_ro == writable) {
 				pr_err("wind: force_rw va=%lx 未生效 (writable=%d is_ro=%d)\n",
 				       va, (int)writable, (int)is_ro);
 				return -EPERM;
