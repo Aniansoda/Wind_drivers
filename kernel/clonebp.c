@@ -663,28 +663,38 @@ noinline int cb_el0_sync_core(struct pt_regs *uregs)
 
 /* inline hook 跳板。patch el0t_64_sync_handler 第一条指令为
  * b cb_el0_tramp (imm26)。跳板布局 (32 字节, 每条 4 字节):
- *   +0x00 stp x0,x30,[sp,#-16]!   保存 uregs 与返回地址
- *   +0x04 bl  cb_el0_sync_core     w0 = ret (链接器填模块内偏移)
- *   +0x08 cbnz w0, +4              ret!=0 -> 跳过 (跳到 +0x18)
- *   +0x0c ldp x0,x30,[sp],#16      放行: 恢复
- *   +0x10 <原指令>                 槽位A (运行时填原函数第一条指令)
- *   +0x14 b  <addr+4>              槽位B (运行时填跳回原函数 +4)
- *   +0x18 ldp x0,x30,[sp],#16      跳过: 恢复
- *   +0x1c ret                      直接异常返回
+ * 跳板内绝不动 sp: GKI 开了 CONFIG_SHADOW_CALL_STACK, 被调 C 函数
+ * 序言会用 x18 与 sp 交叉校验; 若在 bl 前 push sp 而不动 x18, 校验
+ * 必失败 -> panic -> 立刻重启。故用 x19/x20 暂存, 向量桩 el0t_64_sync
+ * 在 bl 之后只做 kernel_exit, x19/x20 由 pt_regs 恢复, 可安全占用。
+ *   +0x00 mov x19, x0              暂存 uregs
+ *   +0x04 mov x20, x30             暂存返回地址
+ *   +0x08 bl  cb_el0_sync_core     w0 = ret (链接器填模块内偏移)
+ *   +0x0c cbnz w0, 2f              ret!=0 -> 跳过 (跳到 +0x20)
+ *   +0x10 mov x0, x19              放行: 恢复 uregs
+ *   +0x14 mov x30, x20             放行: 恢复返回地址
+ *   +0x18 <原指令>                 槽位A (tramp[6], 运行时填)
+ *   +0x1c b  <addr+4>              槽位B (tramp[7], 运行时填)
+ *   +0x20 2: mov x0, x19           跳过: 恢复 uregs
+ *   +0x24 mov x30, x20             跳过: 恢复返回地址
+ *   +0x28 ret                      直接异常返回
  */
 asm(
 	".pushsection .text\n"
 	".global cb_el0_tramp\n"
 	".align 4\n"
 	"cb_el0_tramp:\n"
-	"stp x0, x30, [sp, #-16]!\n"
+	"mov x19, x0\n"
+	"mov x20, x30\n"
 	"bl cb_el0_sync_core\n"
 	"cbnz w0, 2f\n"
-	"ldp x0, x30, [sp], #16\n"
+	"mov x0, x19\n"
+	"mov x30, x20\n"
 	".word 0x00000000\n"
 	".word 0x14000000\n"
 	"2:\n"
-	"ldp x0, x30, [sp], #16\n"
+	"mov x0, x19\n"
+	"mov x30, x20\n"
 	"ret\n"
 	".popsection\n"
 );
@@ -728,7 +738,7 @@ static int cb_el0_inline_install(void)
 	}
 
 	after = addr + 4;
-	if (!cb_b_imm26(after, (unsigned long)&tramp[5], &bjmp)) {
+	if (!cb_b_imm26(after, (unsigned long)&tramp[7], &bjmp)) {
 		pr_err("[clonebp] 跳板 -> 原函数+4 超出 ±128MB\n");
 		return -ERANGE;
 	}
@@ -741,9 +751,9 @@ static int cb_el0_inline_install(void)
 	r = wind_force_kernel_page_rw((unsigned long)cb_el0_tramp, true);
 	if (r)
 		return r;
-	tramp[4] = orig;   /* 槽位A: 原指令 */
-	tramp[5] = bjmp;   /* 槽位B: b <addr+4> */
-	wind_flush_kernel_code(&tramp[4], 8);
+	tramp[6] = orig;   /* 槽位A: 原指令 */
+	tramp[7] = bjmp;   /* 槽位B: b <addr+4> */
+	wind_flush_kernel_code(&tramp[6], 8);
 	wind_force_kernel_page_rw((unsigned long)cb_el0_tramp, false);
 
 	/* 再 patch 原函数第一条指令 (内核镜像 .text) */
@@ -757,7 +767,7 @@ static int cb_el0_inline_install(void)
 	wind_force_kernel_page_rw(addr, false);
 
 	cb_el0_inlined = true;
-	pr_info("[clonebp] inline hook ok: el0t=%lx orig=%08x bentry=%08x tramp=%lx\n",
+	pr_err("[clonebp] inline hook ok: el0t=%lx orig=%08x bentry=%08x tramp=%lx\n",
 		addr, orig, bentry, (unsigned long)cb_el0_tramp);
 	return 0;
 }
