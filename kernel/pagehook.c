@@ -14,6 +14,7 @@
  * 只做「持续替换执行内容」。两者可同时存在, 各自按 page 命中分流。
  */
 #include <linux/module.h>
+#include <linux/kstrtox.h>
 
 /* 由 entry.c 定义: 卸载中标志 */
 extern bool g_wind_unloading;
@@ -451,6 +452,141 @@ static void ph_el0_inline_uninstall(void)
 	ph_el0_inlined = false;
 	ph_el0_addr = 0;
 }
+
+/* ============================================================
+ * el0t 探针 (module param ph_probe)
+ *
+ * 目的: 在不依赖 pagehook / netlink / 目标进程的前提下, 把
+ * "patch 内核 el0t 首指令" 这件事切成三段独立验证:
+ *
+ *   1 = 纯 asm 跳板: 只搬运原指令再 b 回, 全程不调用任何 C 函数,
+ *       也不碰 sp / x18。若此项稳, 说明 PTE 改写 + icache 刷新 + 跳回
+ *       这套机制没问题。
+ *   2 = SCS 安全跳板: mov x19/x20 + bl ph_el0_sync_core + 恢复。
+ *       与 1 只差一次 C 调用。若 1 稳 2 炸, 问题就在 C 调用侧
+ *       (SHADOW_CALL_STACK 校验 / noinstr / 被调函数自身)。
+ *   3 = 装完立刻摘除, 验证 patch/unpatch 往返不留脏指令。
+ *
+ * 用法: echo 1 > /sys/module/wind/parameters/ph_probe
+ * ============================================================ */
+static unsigned long ph_probe_addr;
+static u32 ph_probe_orig;
+static int ph_probe_state;	/* 0=未装 1=asm 探针已装 2=真实跳板已装 */
+
+/* 纯 asm 跳板: [0]=被搬走的原指令, [1]=b 回原函数+4 */
+asm(
+	".pushsection .text\n"
+	".global ph_probe_tramp\n"
+	".align 4\n"
+	"ph_probe_tramp:\n"
+	".word 0x00000000\n"
+	".word 0x14000000\n"
+	".popsection\n"
+);
+extern u32 ph_probe_tramp[2];
+
+static int ph_probe_install_asm(void)
+{
+	unsigned long addr, after;
+	u32 orig, bjmp, bentry;
+	int r;
+
+	addr = wind_kallsyms_lookup_name("el0t_64_sync_handler");
+	if (!addr) {
+		pr_err("[pagehook] probe1: 查不到 el0t_64_sync_handler\n");
+		return -ENOENT;
+	}
+	if (copy_from_kernel_nofault(&orig, (void *)addr, sizeof(orig))) {
+		pr_err("[pagehook] probe1: 读首指令失败\n");
+		return -EFAULT;
+	}
+
+	after = addr + 4;
+	if (!ph_b_imm26(after, (unsigned long)&ph_probe_tramp[1], &bjmp)) {
+		pr_err("[pagehook] probe1: 跳板->原函数+4 超范围\n");
+		return -ERANGE;
+	}
+	if (!ph_b_imm26((unsigned long)ph_probe_tramp, addr, &bentry)) {
+		pr_err("[pagehook] probe1: 原函数->跳板 超范围\n");
+		return -ERANGE;
+	}
+
+	r = wind_force_kernel_page_rw((unsigned long)ph_probe_tramp, true);
+	if (r) {
+		pr_err("[pagehook] probe1: 跳板开写失败 %d\n", r);
+		return r;
+	}
+	WRITE_ONCE(ph_probe_tramp[0], orig);
+	WRITE_ONCE(ph_probe_tramp[1], bjmp);
+	wind_flush_kernel_code(ph_probe_tramp, 8);
+	wind_force_kernel_page_rw((unsigned long)ph_probe_tramp, false);
+
+	r = wind_force_kernel_page_rw(addr, true);
+	if (r) {
+		pr_err("[pagehook] probe1: el0t 开写失败 %d\n", r);
+		return r;
+	}
+	ph_probe_addr = addr;
+	ph_probe_orig = orig;
+	WRITE_ONCE(*(u32 *)addr, bentry);
+	wind_flush_kernel_code((void *)addr, 4);
+	wind_force_kernel_page_rw(addr, false);
+
+	ph_probe_state = 1;
+	pr_err("[pagehook] probe1 装好: el0t=%lx orig=%08x bentry=%08x tramp=%lx\n",
+	       addr, orig, bentry, (unsigned long)ph_probe_tramp);
+	return 0;
+}
+
+static int ph_probe_set(const char *val, const struct kernel_param *kp)
+{
+	int v = 0, r;
+
+	r = kstrtoint(val, 0, &v);
+	if (r)
+		return r;
+	if (v == 0)
+		return 0;
+	if (ph_probe_state || ph_el0_inlined) {
+		pr_err("[pagehook] probe: 已有 hook 在装 (state=%d inlined=%d)\n",
+		       ph_probe_state, ph_el0_inlined);
+		return -EBUSY;
+	}
+
+	if (v == 1) {
+		r = ph_probe_install_asm();
+		return r;
+	}
+	if (v == 2) {
+		r = ph_el0_inline_install();
+		if (!r) {
+			ph_probe_state = 2;
+			pr_err("[pagehook] probe2 装好 (SCS 安全跳板)\n");
+		}
+		return r;
+	}
+	if (v == 3) {
+		r = ph_el0_inline_install();
+		if (r)
+			return r;
+		ph_el0_inline_uninstall();
+		pr_err("[pagehook] probe3 装/摘往返完成, el0t 已复原\n");
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int ph_probe_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%d\n", ph_probe_state);
+}
+
+static const struct kernel_param_ops ph_probe_ops = {
+	.set = ph_probe_set,
+	.get = ph_probe_get,
+};
+module_param_cb(ph_probe, &ph_probe_ops, NULL, 0644);
+MODULE_PARM_DESC(ph_probe, "1=纯asm跳板 2=SCS安全跳板 3=装后摘除");
 
 /* el0t_64_sync_handler pre_handler: EL0 同步异常总入口。
  * x0 = kernel_entry 保存的用户现场 pt_regs。
