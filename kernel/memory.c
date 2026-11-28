@@ -378,14 +378,19 @@ phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	return pa;
 }
 
+/* arm64 的 tlbi vaae1is / vale1is 操作数是 VA[55:12],
+ * 必须传 va >> PAGE_SHIFT。传原始 VA 会冲刷无效地址, 目标页的 TLB
+ * 条目保留旧属性 -> 改完 PTE 后立刻访问就是 permission fault。 */
 static inline void wind_flush_tlb_va(unsigned long va)
 {
 	asm volatile("dsb ishst\n"
 		     "\ttlbi vaae1is, %0\n"
 		     "\tdsb ish\n"
 		     "\tisb\n"
-		     : : "r" (va) : "memory");
+		     : : "r" (va >> PAGE_SHIFT) : "memory");
 }
+
+int wind_kernel_page_ro_state(unsigned long va, bool *is_ro);
 
 static bool allow_block_patch;
 module_param(allow_block_patch, bool, 0644);
@@ -557,6 +562,20 @@ int wind_force_kernel_page_rw(unsigned long va, bool writable)
 			pr_info("wind: kernel pgtables = %d level(s), leaf %s\n",
 				levels, leaf_block ? "block" : "page");
 		}
+
+		/* 回读自检: PTE 改了不代表 CPU 换了翻译。若 TLB 没刷干净,
+		 * 紧接着写内核文本就是 level 3 permission fault -> oops。
+		 * 宁可在这一步失败, 也不要把 oops 留给调用方。 */
+		{
+			bool is_ro = false;
+
+			if (wind_kernel_page_ro_state(va, &is_ro) == 0 &&
+			    is_ro != writable) {
+				pr_err("wind: force_rw va=%lx 未生效 (writable=%d is_ro=%d)\n",
+				       va, (int)writable, (int)is_ro);
+				return -EPERM;
+			}
+		}
 	}
 	return ret;
 }
@@ -646,7 +665,7 @@ int wind_shadow_pte_set(struct mm_struct *mm, unsigned long va, pteval_t mask, p
 		     "\ttlbi vale1is, %0\n"
 		     "\tdsb ish\n"
 		     "\tisb\n"
-		     : : "r" (va & PAGE_MASK) : "memory");
+		     : : "r" ((va & PAGE_MASK) >> PAGE_SHIFT) : "memory");
 
 	wind_unmap_phys(&m);
 	return 0;
@@ -886,7 +905,7 @@ void wind_pte_pin_write(struct wind_pte_pin *pin, unsigned long va,
 		     "\ttlbi vale1is, %0\n"
 		     "\tdsb ish\n"
 		     "\tisb\n"
-		     : : "r" (va & PAGE_MASK) : "memory");
+		     : : "r" ((va & PAGE_MASK) >> PAGE_SHIFT) : "memory");
 }
 
 /* 供 breakpoint.c 在影子页 / 跳板页里改完字节后刷 I/D cache */
